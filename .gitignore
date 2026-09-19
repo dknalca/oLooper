@@ -1,0 +1,15 @@
+# Deps & build outputs
+node_modules/
+dist/
+src-tauri/target/
+
+# Tauri generated (icons/ IS committed: required at compile time)
+src-tauri/gen/
+
+# Env & OS
+.env
+.env.local
+.DS_Store
+
+# Local dev inbox: real user samples, never committed (see ADR 0003)
+loopersFlash/
