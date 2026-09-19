@@ -19,6 +19,9 @@ normal files under a configurable library root. Covers import flows for
    imports or re-analysis.
 5. 4 loop slots (A–D) per track, stored in `loop_slots` table. Slots persist
    across sessions. Deleting a track cascades to delete its slots.
+6. The library presents each loop with its source looper, loop name, duration,
+   and BPM. Automatically analyzed BPM is normalized by octave into 65–150 BPM;
+   user-entered BPM is never changed.
 
 ## Supported inputs
 

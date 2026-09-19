@@ -81,7 +81,7 @@ export default function Waveform({ refreshKey, status }: Props) {
   };
 
   return (
-    <div className="flex h-full min-h-[200px] flex-col overflow-hidden rounded-lg border border-border bg-elevated">
+    <div className="flex h-full min-h-0 flex-col overflow-hidden rounded-lg border border-border bg-elevated">
       <div ref={wrapRef} className="relative min-h-0 flex-1">
         {!loadedPath && (
           <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 text-xs text-text-secondary/50 pointer-events-none">

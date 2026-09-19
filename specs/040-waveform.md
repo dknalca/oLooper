@@ -16,6 +16,9 @@ computation; rendering is canvas-only (no audio decoding per frame).
    enabled flag. Loop edits re-shade immediately.
 4. Tracks shorter than the view window render whole; longer tracks render a
    ~30 s window around the position.
+5. The waveform occupies the upper fifth of the workspace. The transport,
+   cue, loop and slot controls form a compact band immediately below it; the
+   loop library uses all remaining vertical space.
 
 ## Supported inputs
 
