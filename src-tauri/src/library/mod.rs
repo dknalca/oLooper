@@ -1,6 +1,6 @@
 //! Persistent library: SQLite catalog + audio as normal files.
 //!
-//! The database is metadata only. Every write path keeps `Loopers/` and
+//! The database is metadata only. Every write path keeps looper directories and
 //! `Custom Loops/` human-browsable; file copies go `tmp → validate → rename`
 //! and row writes are transactional. Removing a track deletes its row, never
 //! the user's audio.
@@ -14,7 +14,7 @@ use sha2::{Digest as _, Sha256};
 use crate::import::swf::Sound;
 
 /// Current schema version (`PRAGMA user_version`).
-const SCHEMA_VERSION: i32 = 1;
+const SCHEMA_VERSION: i32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Track {
@@ -93,20 +93,36 @@ pub fn sanitize_name(raw: &str) -> String {
     }
 }
 
+/// A named cue/loop slot (A-D) attached to a track.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LoopSlot {
+    pub id: i64,
+    pub track_id: i64,
+    pub slot: i64,
+    pub label: String,
+    pub cue_ms: i64,
+    pub loop_start_ms: i64,
+    pub loop_end_ms: i64,
+    pub enabled: bool,
+}
+
 pub struct Library {
     conn: Connection,
     pub root: PathBuf,
 }
 
 impl Library {
-    /// Open (creating) `root/olooper.db`, making library dirs, migrating.
+    /// Open (creating) `root/olooper.db`, making the library root, migrating.
     /// One transaction per migration step; version set only on success.
     pub fn open(root: &Path) -> Result<Self, String> {
-        std::fs::create_dir_all(root.join("Loopers"))
+        std::fs::create_dir_all(root)
             .and_then(|()| std::fs::create_dir_all(root.join("Custom Loops")))
             .map_err(|e| format!("cannot create library dirs: {e}"))?;
         let conn = Connection::open(root.join("olooper.db"))
             .map_err(|e| format!("cannot open library database: {e}"))?;
+        // Enable foreign key enforcement (off by default in SQLite).
+        conn.execute_batch("PRAGMA foreign_keys = ON;")
+            .map_err(|e| format!("cannot enable foreign keys: {e}"))?;
         migrate(&conn)?;
         Ok(Self {
             conn,
@@ -282,10 +298,94 @@ impl Library {
     }
 
     /// Deletes the row only. Audio files are never touched.
+    /// CASCADE deletes associated loop_slots.
     pub fn remove_track(&self, id: i64) -> Result<bool, String> {
         let n = self
             .conn
             .execute("DELETE FROM tracks WHERE id=?1", [id])
+            .map_err(|e| e.to_string())?;
+        Ok(n == 1)
+    }
+
+    // --- Loop slots ---
+
+    pub fn get_slots(&self, track_id: i64) -> Result<Vec<LoopSlot>, String> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id,track_id,slot,label,cue_ms,loop_start_ms,loop_end_ms,enabled \
+                 FROM loop_slots WHERE track_id=?1 ORDER BY slot",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([track_id], |r| {
+                Ok(LoopSlot {
+                    id: r.get(0)?,
+                    track_id: r.get(1)?,
+                    slot: r.get(2)?,
+                    label: r.get(3)?,
+                    cue_ms: r.get(4)?,
+                    loop_start_ms: r.get(5)?,
+                    loop_end_ms: r.get(6)?,
+                    enabled: r.get(7)?,
+                })
+            })
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+    }
+
+    pub fn set_slot(
+        &self,
+        track_id: i64,
+        slot: i64,
+        label: &str,
+        cue_ms: i64,
+        loop_start_ms: i64,
+        loop_end_ms: i64,
+        enabled: bool,
+    ) -> Result<LoopSlot, String> {
+        if !(1..=4).contains(&slot) {
+            return Err("slot must be 1–4".to_string());
+        }
+        self.get_track(track_id)?
+            .ok_or_else(|| format!("track {track_id} not found"))?;
+        self.conn
+            .execute(
+                "INSERT INTO loop_slots(track_id,slot,label,cue_ms,loop_start_ms,loop_end_ms,enabled) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7) \
+                 ON CONFLICT(track_id,slot) DO UPDATE SET \
+                 label=excluded.label,cue_ms=excluded.cue_ms,loop_start_ms=excluded.loop_start_ms,\
+                 loop_end_ms=excluded.loop_end_ms,enabled=excluded.enabled",
+                rusqlite::params![track_id, slot, label, cue_ms, loop_start_ms, loop_end_ms, enabled],
+            )
+            .map_err(|e| e.to_string())?;
+        let id: i64 = self
+            .conn
+            .query_row(
+                "SELECT id FROM loop_slots WHERE track_id=?1 AND slot=?2",
+                rusqlite::params![track_id, slot],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(LoopSlot {
+            id,
+            track_id,
+            slot,
+            label: label.to_string(),
+            cue_ms,
+            loop_start_ms,
+            loop_end_ms,
+            enabled,
+        })
+    }
+
+    pub fn delete_slot(&self, track_id: i64, slot: i64) -> Result<bool, String> {
+        let n = self
+            .conn
+            .execute(
+                "DELETE FROM loop_slots WHERE track_id=?1 AND slot=?2",
+                rusqlite::params![track_id, slot],
+            )
             .map_err(|e| e.to_string())?;
         Ok(n == 1)
     }
@@ -327,7 +427,7 @@ impl Library {
         out
     }
 
-    /// Persist extracted sounds: files under `Loopers/<looper>/` + rows.
+    /// Persist extracted sounds: files under `<looper>/` + rows.
     /// Idempotent on `(source_hash, source_sound_id)`.
     ///
     /// Note: every sound is fully decoded for duration/rate metadata, so
@@ -345,11 +445,38 @@ impl Library {
         exe_length: Option<i64>,
         sounds: &[Sound],
     ) -> Result<ImportReport, String> {
+        self.import_sounds_with_progress(
+            looper,
+            source_type,
+            source_path,
+            source_hash,
+            exe_offset,
+            exe_length,
+            sounds,
+            |_, _, _| {},
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn import_sounds_with_progress<F>(
+        &self,
+        looper: &str,
+        source_type: &str,
+        source_path: &str,
+        source_hash: &str,
+        exe_offset: Option<i64>,
+        exe_length: Option<i64>,
+        sounds: &[Sound],
+        mut progress: F,
+    ) -> Result<ImportReport, String>
+    where
+        F: FnMut(&str, usize, usize),
+    {
         if sounds.is_empty() {
             return Err("no extractable sounds".to_string());
         }
         let looper = sanitize_name(looper);
-        let dir = self.root.join("Loopers").join(&looper);
+        let dir = self.root.join(&looper);
         std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create looper dir: {e}"))?;
 
         let mut added = 0;
@@ -357,6 +484,8 @@ impl Library {
         let mut failed = Vec::new();
         let mut track_ids = Vec::new();
         for (i, s) in sounds.iter().enumerate() {
+            let current = i + 1;
+            let total = sounds.len();
             // Skip known rows before touching the filesystem.
             let known: Option<i64> = self
                 .conn
@@ -379,6 +508,7 @@ impl Library {
                 });
                 continue;
             }
+            progress("extracting", current, total);
             let buf = match crate::player::decode_bytes(&s.frames) {
                 Ok(b) => b,
                 Err(e) => {
@@ -390,9 +520,13 @@ impl Library {
                     continue;
                 }
             };
+            progress("adjusting BPM", current, total);
+            let estimate = crate::analysis::estimate(&buf);
+            progress("adjusting loops", current, total);
             let dest = dir.join(format!("{:02}_{}.mp3", i + 1, s.id));
             let final_path = self.atomic_write(&dest, &s.frames)?;
             let title = format!("{:02} · {}", i + 1, looper);
+            progress("inserting in library", current, total);
             match self.add_track(
                 &title,
                 &final_path,
@@ -408,6 +542,9 @@ impl Library {
                 s.trimmed_leading as i64,
             ) {
                 Ok((id, true)) => {
+                    if let Some(estimate) = estimate {
+                        self.update_bpm(id, estimate.bpm, Some(estimate.confidence), false)?;
+                    }
                     added += 1;
                     track_ids.push(id);
                 }
@@ -615,7 +752,25 @@ fn migrate(conn: &Connection) -> Result<(), String> {
              PRAGMA user_version = 1;
              COMMIT;",
         )
-        .map_err(|e| format!("migration 0→1 failed: {e}"))?;
+         .map_err(|e| format!("migration 0→1 failed: {e}"))?;
+    }
+    if v < 2 {
+        conn.execute_batch(
+            "BEGIN;
+             CREATE TABLE IF NOT EXISTS loop_slots(
+               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               track_id INTEGER NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
+               slot INTEGER NOT NULL CHECK (slot BETWEEN 1 AND 4),
+               label TEXT NOT NULL DEFAULT 'A',
+               cue_ms INTEGER NOT NULL DEFAULT 0,
+               loop_start_ms INTEGER NOT NULL DEFAULT 0,
+               loop_end_ms INTEGER NOT NULL DEFAULT 0,
+               enabled INTEGER NOT NULL DEFAULT 0,
+               UNIQUE(track_id, slot));
+             PRAGMA user_version = 2;
+             COMMIT;",
+        )
+        .map_err(|e| format!("migration 1→2 failed: {e}"))?;
     }
     Ok(())
 }

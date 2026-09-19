@@ -46,9 +46,9 @@ Locate an embedded SWF and reuse the `020` pipeline.
 
 ## Acceptance criteria
 
-- [ ] Reference `TheSeventeenthWaveLooper.exe` (~28.5 MB, SWF at offset
+- [x] Reference `TheSeventeenthWaveLooper.exe` (~28.5 MB, SWF at offset
   819200): extracts the same sounds as its SWF path (manual validation).
-- [ ] Synthetic CI fixtures: stub + appended SWF extracts; EXE without SWF →
+- [x] Synthetic CI fixtures: stub + appended SWF extracts; EXE without SWF →
   `UnsupportedExe`; truncated embedded SWF → safe error, no panic/partial write.
 
 ## Non-goals

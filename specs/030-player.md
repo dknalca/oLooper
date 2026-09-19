@@ -18,6 +18,10 @@ Waveform rendering and library integration are separate specs.
 5. Switch track → old audio stops hard, new track loads paused at its start.
 6. Volume 0–100%. Position display follows playback (~poll 4 Hz; native layer
    authoritative, UI only polls — buffer latency accepted in MVP).
+7. Keyboard shortcuts (spec 060): Space (play/pause), S (stop), arrows (seek),
+   L (loop toggle), [ / ] (set loop start/end).
+8. Loop slots (spec 070): A–D buttons in player; click empty to save, click
+   filled to load. Auto-loads slot A on track load.
 
 ## Supported inputs
 
@@ -54,12 +58,14 @@ Waveform rendering and library integration are separate specs.
 
 ## Acceptance criteria
 
-- [ ] Load → play → loop wraps N times with no reopen and no drift
+- [x] Load → play → loop wraps N times with no reopen and no drift
   (position advances monotonically modulo region).
-- [ ] Pause/resume keeps sample-accurate region position.
-- [ ] Loop edits clamp; start ≥ end rejected with message.
-- [ ] Unit tests cover wrap math + a synthetic WAV end-to-end (no hardware).
-- [ ] Manual: an extracted loop from `loopersFlash/` plays and loops audibly.
+- [x] Pause/resume keeps sample-accurate region position.
+- [x] Loop edits clamp; start ≥ end rejected with message.
+- [x] Unit tests cover wrap math + a synthetic WAV end-to-end (no hardware).
+- [x] Manual: an extracted loop from `loopersFlash/` plays and loops audibly.
+- [x] Keyboard shortcuts control transport without mouse.
+- [x] Loop slots A–D save/load correctly; auto-load slot A on track load.
 
 ## Non-goals
 

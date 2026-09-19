@@ -1,40 +1,30 @@
 import { useEffect, useRef, useState } from "react";
 import {
   playerSeek,
-  playerStatus,
   waveformPeaks,
   type PlayerStatus,
   type WaveformData,
 } from "../tauri";
+import Logo from "./Logo";
 
 const VIEW_MS = 30_000;
-const HEIGHT = 160;
 
-export default function Waveform() {
+interface Props {
+  refreshKey: number;
+  status: PlayerStatus | null;
+}
+
+export default function Waveform({ refreshKey, status }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const wrapRef = useRef<HTMLDivElement>(null);
   const statusRef = useRef<PlayerStatus | null>(null);
   const waveRef = useRef<WaveformData | null>(null);
-  const [loadedPath, setLoadedPath] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [, force] = useState(0);
+  const loadedPath = status?.path ?? null;
 
-  // Poll native position (authoritative) at 4 Hz.
   useEffect(() => {
-    const id = setInterval(() => {
-      playerStatus()
-        .then((s) => {
-          const prev = statusRef.current;
-          statusRef.current = s;
-          if (s.path !== prev?.path) {
-            setLoadedPath(s.path);
-          }
-          force((n) => n + 1);
-        })
-        .catch(() => {});
-    }, 250);
-    return () => clearInterval(id);
-  }, []);
+    statusRef.current = status;
+  }, [status]);
 
   // (Re)compute peaks once per loaded path.
   useEffect(() => {
@@ -50,7 +40,7 @@ export default function Waveform() {
         setError(null);
       })
       .catch((e) => setError(String(e)));
-  }, [loadedPath]);
+  }, [loadedPath, refreshKey]);
 
   // Render loop: interpolate between polls while playing.
   useEffect(() => {
@@ -91,18 +81,26 @@ export default function Waveform() {
   };
 
   return (
-    <section>
-      <h2>Waveform</h2>
-      <div ref={wrapRef}>
+    <div className="flex h-full min-h-[200px] flex-col overflow-hidden rounded-lg border border-border bg-elevated">
+      <div ref={wrapRef} className="relative min-h-0 flex-1">
+        {!loadedPath && (
+          <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 text-xs text-text-secondary/50 pointer-events-none">
+            <Logo className="h-12 w-12 opacity-50" />
+            <span>Double-click a track to see its waveform</span>
+          </div>
+        )}
         <canvas
           ref={canvasRef}
-          height={HEIGHT}
-          style={{ width: "100%", height: HEIGHT, background: "#161616", cursor: "crosshair" }}
           onClick={onClick}
+          className="h-full w-full cursor-crosshair bg-[#0e0e0e]"
         />
       </div>
-      {error && <p role="alert">{error}</p>}
-    </section>
+      {error && (
+        <div className="px-3 py-1 text-[10px] text-danger border-t border-border" role="alert">
+          {error}
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -119,14 +117,15 @@ function render(
 ) {
   const dpr = window.devicePixelRatio || 1;
   const width = canvas.clientWidth;
-  if (canvas.width !== width * dpr) {
+  const height = canvas.clientHeight;
+  if (canvas.width !== width * dpr || canvas.height !== height * dpr) {
     canvas.width = width * dpr;
-    canvas.height = HEIGHT * dpr;
+    canvas.height = height * dpr;
   }
   const ctx = canvas.getContext("2d");
   if (!ctx) return;
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-  ctx.clearRect(0, 0, width, HEIGHT);
+  ctx.clearRect(0, 0, width, height);
 
   const view = Math.min(wave.duration_ms, VIEW_MS);
   const start = windowStart(posMs, wave.duration_ms, view);
@@ -138,31 +137,45 @@ function render(
   if (st.loop_enabled) {
     const x0 = Math.max(0, xOf(st.loop_start_ms));
     const x1 = Math.min(width, xOf(st.loop_end_ms));
-    ctx.fillStyle = "rgba(80, 200, 120, 0.18)";
-    ctx.fillRect(x0, 0, Math.max(0, x1 - x0), HEIGHT);
+    ctx.fillStyle = "rgba(52, 211, 153, 0.12)";
+    ctx.fillRect(x0, 0, Math.max(0, x1 - x0), height);
+    // Loop edge lines
+    ctx.strokeStyle = "rgba(52, 211, 153, 0.3)";
+    ctx.lineWidth = 1;
+    if (x0 >= 0 && x0 <= width) {
+      ctx.beginPath();
+      ctx.moveTo(x0, 0);
+      ctx.lineTo(x0, height);
+      ctx.stroke();
+    }
+    if (x1 >= 0 && x1 <= width) {
+      ctx.beginPath();
+      ctx.moveTo(x1, 0);
+      ctx.lineTo(x1, height);
+      ctx.stroke();
+    }
   }
 
   // Bars.
-  const mid = HEIGHT / 2;
-  ctx.fillStyle = "#4aa3ff";
+  const mid = height / 2;
   const step = Math.max(1, Math.floor(width / wave.peaks.length / 2));
   for (let x = 0; x < width; x += step) {
     const t = start + (x / width) * view;
     const h = Math.max(1, peakAt(t) * (mid - 4));
     const played = t <= posMs;
-    ctx.fillStyle = played ? "#4aa3ff" : "#2a5a8f";
+    ctx.fillStyle = played ? "#4aa3ff" : "#1e3a54";
     ctx.fillRect(x, mid - h, Math.max(1, step - 1), h * 2);
   }
 
   // Cue marker.
   const cx = xOf(st.loop_start_ms);
   if (cx >= 0 && cx <= width) {
-    ctx.fillStyle = "#ffd23f";
-    ctx.fillRect(cx - 1, 0, 2, 12);
+    ctx.fillStyle = "#fbbf24";
+    ctx.fillRect(cx - 1, 0, 2, 16);
   }
 
   // Fixed playhead.
   const px = xOf(Math.min(posMs, wave.duration_ms));
   ctx.fillStyle = "#ffffff";
-  ctx.fillRect(px - 1, 0, 2, HEIGHT);
+  ctx.fillRect(px - 1, 0, 2, height);
 }

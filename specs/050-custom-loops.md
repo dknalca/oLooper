@@ -10,7 +10,9 @@ ready to practice immediately with the same player/waveform as extractions.
 
 1. User drops WAV/MP3 (one or many) onto the Library section → each file
    validates; valid ones copy in, appear in the list, playable at once.
-2. Each import gets: duration, waveform (on demand), BPM estimate + confidence,
+2. User can also click Browse buttons (SWF/EXE/Audio) which open native
+   OS file pickers via `tauri-plugin-dialog`. Selected files auto-import.
+3. Each import gets: duration, waveform (on demand), BPM estimate + confidence,
    default cue = 0, default loop = full track, loop enabled.
 3. Re-dropping the same file reports "already in library" (hash dedup), no copy.
 4. Name collisions (different audio, same filename) resolve as
@@ -50,11 +52,12 @@ ready to practice immediately with the same player/waveform as extractions.
 
 ## Acceptance criteria
 
-- [ ] Drop a WAV + an MP3 → both listed, playable, looped full-track.
-- [ ] Click-track fixture estimates BPM within ±1 (test, synthetic).
-- [ ] Silence/ambient yields no estimate (NULL), import still succeeds.
-- [ ] Same file twice → second is a no-op; same name different bytes → `(2)`.
-- [ ] Unit tests: estimator on synthetic clicks, collision naming, dedup.
+- [x] Drop a WAV + an MP3 → both listed, playable, looped full-track.
+- [x] Click-track fixture estimates BPM within ±1 (test, synthetic).
+- [x] Silence/ambient yields no estimate (NULL), import still succeeds.
+- [x] Same file twice → second is a no-op; same name different bytes → `(2)`.
+- [x] Unit tests: estimator on synthetic clicks, collision naming, dedup.
+- [x] Native file picker: Browse buttons open OS dialog, selected files import.
 
 ## Non-goals
 

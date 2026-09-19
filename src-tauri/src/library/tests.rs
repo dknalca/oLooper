@@ -40,11 +40,10 @@ fn wav_buf() -> crate::player::LoopBuffer {
 }
 
 #[test]
-fn migrate_starts_at_v1() {
+fn migrate_starts_at_current_schema() {
     let root = tmp_root("migrate");
     let lib = Library::open(&root).unwrap();
-    assert_eq!(lib.schema_version().unwrap(), 1);
-    assert!(root.join("Loopers").is_dir());
+    assert_eq!(lib.schema_version().unwrap(), 2);
     assert!(root.join("Custom Loops").is_dir());
     assert!(root.join("olooper.db").is_file());
     std::fs::remove_dir_all(&root).ok();
@@ -135,7 +134,31 @@ fn import_with_undecodable_sounds_fails_clean() {
         .unwrap_err();
     assert_eq!(err, "no sounds could be imported");
     assert!(lib.list_tracks().unwrap().is_empty());
-    assert!(!root.join("Loopers").join("Looper").exists());
+    assert!(!root.join("Looper").exists());
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn import_reports_extraction_stage_before_a_sound_failure() {
+    let root = tmp_root("import-progress");
+    let lib = Library::open(&root).unwrap();
+    let tags = define_sound_tag(1, FORMAT_MP3, &fake_mp3(0));
+    let swf = crate::import::swf::parse(&fws_file(5, &tags)).unwrap();
+    let mut stages = Vec::new();
+    let err = lib
+        .import_sounds_with_progress(
+            "Looper",
+            "swf",
+            "/src/l.swf",
+            "hash-progress",
+            None,
+            None,
+            &swf.sounds,
+            |stage, current, total| stages.push((stage.to_string(), current, total)),
+        )
+        .unwrap_err();
+    assert_eq!(err, "no sounds could be imported");
+    assert_eq!(stages, vec![("extracting".to_string(), 1, 1)]);
     std::fs::remove_dir_all(&root).ok();
 }
 
@@ -147,7 +170,7 @@ fn import_dedups_second_run() {
     // plus a manually-added row for the same identity.)
     let root = tmp_root("import-dedup");
     let lib = Library::open(&root).unwrap();
-    let audio = root.join("Loopers").join("L").join("01_1.mp3");
+    let audio = root.join("L").join("01_1.mp3");
     std::fs::create_dir_all(audio.parent().unwrap()).unwrap();
     std::fs::write(&audio, b"fake").unwrap();
     lib.add_track("01 · L", &audio, "swf", "/src/l.swf", "h2", 1, None, None, "wav", &wav_buf(), 0, 0)

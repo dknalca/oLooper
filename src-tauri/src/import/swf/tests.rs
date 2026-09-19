@@ -20,8 +20,15 @@ fn valid_fws_extracts_mp3_in_order() {
 
 #[test]
 fn valid_cws_extracts_mp3() {
-    let tags = define_sound_tag(1, FORMAT_MP3, &fake_mp3(0));
-    let r = parse(&cws_file(6, &tags)).unwrap();
+    // Compressible padding makes the on-disk CWS smaller than its declared
+    // uncompressed length, as real CWS files normally are.
+    let mut payload = vec![0; 4096];
+    payload.extend(fake_mp3(0));
+    let tags = define_sound_tag(1, FORMAT_MP3, &payload);
+    let file = cws_file(6, &tags);
+    let declared = u32::from_le_bytes(file[4..8].try_into().unwrap()) as usize;
+    assert!(file.len() < declared, "fixture must exercise compressed CWS sizing");
+    let r = parse(&file).unwrap();
     assert_eq!(r.sounds.len(), 1);
     assert_eq!(r.sounds[0].frames, fake_mp3(0)[2..]);
 }

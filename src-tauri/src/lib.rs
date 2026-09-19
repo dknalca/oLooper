@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use tauri::Emitter as _;
 
 pub mod analysis;
 pub mod import;
@@ -13,6 +14,152 @@ pub struct AppStatus {
     pub version: String,
     pub platform: String,
     pub library_set: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ImportProgress {
+    job_id: String,
+    stage: String,
+    current: usize,
+    total: usize,
+    detail: String,
+    done: bool,
+    error: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct SavedLibraryRoot {
+    root: String,
+}
+
+fn portable_root_for_executable(executable: &std::path::Path) -> Result<std::path::PathBuf, String> {
+    if let Some(bundle) = executable
+        .ancestors()
+        .find(|path| path.extension().is_some_and(|ext| ext == "app"))
+    {
+        return bundle
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .ok_or_else(|| "app bundle has no parent directory".to_string());
+    }
+    executable
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .ok_or_else(|| "executable has no parent directory".to_string())
+}
+
+fn portable_root() -> Result<std::path::PathBuf, String> {
+    let executable = std::env::current_exe().map_err(|e| format!("cannot locate executable: {e}"))?;
+    portable_root_for_executable(&executable)
+}
+
+fn portable_library_root() -> Result<std::path::PathBuf, String> {
+    Ok(portable_root()?.join("library"))
+}
+
+fn portable_sources_root() -> Result<std::path::PathBuf, String> {
+    Ok(portable_root()?.join("loopersFlash"))
+}
+
+fn library_selection_path() -> Result<std::path::PathBuf, String> {
+    Ok(portable_root()?.join("olooper-library.json"))
+}
+
+fn save_library_root(root: &str) -> Result<(), String> {
+    let path = library_selection_path()?;
+    let tmp = path.with_extension("json.tmp");
+    let data = serde_json::to_vec(&SavedLibraryRoot { root: root.to_string() })
+        .map_err(|e| format!("cannot serialize library selection: {e}"))?;
+    std::fs::write(&tmp, data).map_err(|e| format!("cannot save library selection: {e}"))?;
+    if let Err(e) = std::fs::rename(&tmp, &path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("cannot save library selection: {e}"));
+    }
+    Ok(())
+}
+
+fn saved_library_root() -> Result<Option<String>, String> {
+    let path = library_selection_path()?;
+    if !path.exists() {
+        return Ok(None);
+    }
+    let data = std::fs::read(&path).map_err(|e| format!("cannot read library selection: {e}"))?;
+    let saved: SavedLibraryRoot = serde_json::from_slice(&data)
+        .map_err(|e| format!("cannot read library selection: {e}"))?;
+    Ok(Some(saved.root))
+}
+
+fn emit_import_progress(
+    app: &tauri::AppHandle,
+    job_id: &str,
+    stage: &str,
+    current: usize,
+    total: usize,
+    detail: impl Into<String>,
+    done: bool,
+    error: Option<String>,
+) {
+    let _ = app.emit(
+        "olooper:import-progress",
+        ImportProgress {
+            job_id: job_id.to_string(),
+            stage: stage.to_string(),
+            current,
+            total,
+            detail: detail.into(),
+            done,
+            error,
+        },
+    );
+}
+
+fn copy_dropped_source(path: &str, data: &[u8]) -> Result<String, String> {
+    let source_dir = portable_sources_root()?;
+    std::fs::create_dir_all(&source_dir).map_err(|e| {
+        format!("cannot create loopersFlash beside the app; move the app to a writable folder: {e}")
+    })?;
+    copy_dropped_source_to(&source_dir, path, data)
+}
+
+fn copy_dropped_source_to(
+    source_dir: &std::path::Path,
+    path: &str,
+    data: &[u8],
+) -> Result<String, String> {
+    let source = std::path::Path::new(path);
+    let stem = source.file_stem().and_then(|s| s.to_str()).unwrap_or("looper");
+    let ext = source
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if !matches!(ext.as_str(), "swf" | "exe") {
+        return Err("only .swf and .exe files can be copied to loopersFlash".to_string());
+    }
+    let stem = library::sanitize_name(stem);
+    for n in 1..10_000 {
+        let suffix = if n == 1 { String::new() } else { format!(" ({n})") };
+        let dest = source_dir.join(format!("{stem}{suffix}.{ext}"));
+        if dest.exists() {
+            if std::fs::read(&dest).ok().as_deref() == Some(data) {
+                return Ok(dest.to_string_lossy().to_string());
+            }
+            continue;
+        }
+        let tmp = dest.with_extension(format!("{ext}.tmp"));
+        std::fs::write(&tmp, data).map_err(|e| format!("cannot copy source: {e}"))?;
+        let verified = std::fs::read(&tmp).map_err(|e| format!("cannot verify source copy: {e}"))?;
+        if verified != data {
+            let _ = std::fs::remove_file(&tmp);
+            return Err("cannot verify source copy".to_string());
+        }
+        if let Err(e) = std::fs::rename(&tmp, &dest) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(format!("cannot save source copy: {e}"));
+        }
+        return Ok(dest.to_string_lossy().to_string());
+    }
+    Err("too many files with the same source name".to_string())
 }
 
 pub fn app_status() -> AppStatus {
@@ -120,6 +267,7 @@ fn inspect_exe(path: String) -> Result<ExeReport, String> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .manage(player::spawn())
         .manage(std::sync::Mutex::new(None::<library::Library>))
         .invoke_handler(tauri::generate_handler![
@@ -136,16 +284,23 @@ pub fn run() {
             player_set_loop_enabled,
             player_status,
             player_seek,
+            library_default_root,
             library_init,
+            library_portable_init,
+            library_restore,
             library_status,
             library_list,
             library_update_cue_loop,
             library_update_bpm,
             library_remove,
+            library_get_slots,
+            library_set_slot,
+            library_delete_slot,
             import_swf,
             import_exe,
             import_custom,
-            waveform_peaks
+            waveform_peaks,
+            reveal_in_file_manager
         ])
         .run(tauri::generate_context!())
         .expect("error while running oLooper");
@@ -217,12 +372,72 @@ fn require_lib<'a>(
     guard.as_ref().ok_or_else(|| "library not initialized".to_string())
 }
 
+fn init_portable_library(db: &Db<'_>) -> Result<String, String> {
+    let root = portable_library_root()?;
+    let lib = library::Library::open(&root).map_err(|e| {
+        format!("cannot open library beside the app; move the app to a writable folder: {e}")
+    })?;
+    let canonical = lib.root.canonicalize().map_err(|e| e.to_string())?;
+    *db.lock().map_err(|e| e.to_string())? = Some(lib);
+    Ok(canonical.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+fn library_default_root() -> Result<String, String> {
+    Ok(portable_library_root()?.to_string_lossy().to_string())
+}
+
 #[tauri::command]
 fn library_init(root: String, db: Db<'_>) -> Result<String, String> {
     let lib = library::Library::open(std::path::Path::new(&root))?;
     let canonical = lib.root.canonicalize().map_err(|e| e.to_string())?;
+    let root = canonical.to_string_lossy().to_string();
+    save_library_root(&root)?;
     *db.lock().map_err(|e| e.to_string())? = Some(lib);
-    Ok(canonical.to_string_lossy().to_string())
+    Ok(root)
+}
+
+#[tauri::command]
+fn library_restore(db: Db<'_>) -> Result<Option<String>, String> {
+    let Some(root) = saved_library_root()? else {
+        return Ok(None);
+    };
+    let path = std::path::Path::new(&root);
+    if !path.is_dir() {
+        return Ok(None);
+    }
+    let lib = library::Library::open(path)?;
+    let canonical = lib.root.canonicalize().map_err(|e| e.to_string())?;
+    *db.lock().map_err(|e| e.to_string())? = Some(lib);
+    Ok(Some(canonical.to_string_lossy().to_string()))
+}
+
+#[tauri::command]
+fn library_portable_init(db: Db<'_>) -> Result<String, String> {
+    init_portable_library(&db)
+}
+
+#[tauri::command]
+fn reveal_in_file_manager(path: String) -> Result<(), String> {
+    let path = std::path::Path::new(&path);
+    if !path.exists() {
+        return Err("file no longer exists".to_string());
+    }
+    let mut command = if cfg!(target_os = "macos") {
+        let mut command = std::process::Command::new("open");
+        command.arg("-R").arg(path);
+        command
+    } else if cfg!(target_os = "windows") {
+        let mut command = std::process::Command::new("explorer.exe");
+        command.arg(format!("/select,{}", path.display()));
+        command
+    } else {
+        let mut command = std::process::Command::new("xdg-open");
+        command.arg(path.parent().unwrap_or(path));
+        command
+    };
+    command.spawn().map_err(|e| format!("cannot reveal file: {e}"))?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -276,6 +491,33 @@ fn library_remove(id: i64, db: Db<'_>) -> Result<bool, String> {
 }
 
 #[tauri::command]
+fn library_get_slots(track_id: i64, db: Db<'_>) -> Result<Vec<library::LoopSlot>, String> {
+    let g = self::db(&db)?;
+    require_lib(&g)?.get_slots(track_id)
+}
+
+#[tauri::command]
+fn library_set_slot(
+    track_id: i64,
+    slot: i64,
+    label: String,
+    cue_ms: i64,
+    loop_start_ms: i64,
+    loop_end_ms: i64,
+    enabled: bool,
+    db: Db<'_>,
+) -> Result<library::LoopSlot, String> {
+    let g = self::db(&db)?;
+    require_lib(&g)?.set_slot(track_id, slot, &label, cue_ms, loop_start_ms, loop_end_ms, enabled)
+}
+
+#[tauri::command]
+fn library_delete_slot(track_id: i64, slot: i64, db: Db<'_>) -> Result<bool, String> {
+    let g = self::db(&db)?;
+    require_lib(&g)?.delete_slot(track_id, slot)
+}
+
+#[tauri::command]
 fn import_custom(paths: Vec<String>, db: Db<'_>) -> Result<Vec<library::CustomReport>, String> {
     let g = self::db(&db)?;
     Ok(require_lib(&g)?.import_custom(&paths))
@@ -296,39 +538,101 @@ fn looper_name(path: &str) -> String {
 }
 
 #[tauri::command]
-fn import_swf(path: String, db: Db<'_>) -> Result<library::ImportReport, String> {
+fn import_swf(
+    path: String,
+    job_id: String,
+    app: tauri::AppHandle,
+    db: Db<'_>,
+) -> Result<library::ImportReport, String> {
+    emit_import_progress(&app, &job_id, "copying source", 0, 0, &path, false, None);
     let data = read_input(&path)?;
-    let sounds = import::swf::parse(&data).map_err(|e| import::swf::user_message(&e))?;
+    let copied_path = copy_dropped_source(&path, &data)?;
+    emit_import_progress(&app, &job_id, "analyzing", 0, 0, &copied_path, false, None);
+    let sounds = match import::swf::parse(&data) {
+        Ok(sounds) => sounds,
+        Err(e) => {
+            let error = import::swf::user_message(&e);
+            emit_import_progress(&app, &job_id, "failed", 0, 0, &copied_path, true, Some(error.clone()));
+            return Err(error);
+        }
+    };
     let g = self::db(&db)?;
     let lib = require_lib(&g)?;
-    lib.import_sounds(
-        &looper_name(&path),
+    let report = lib.import_sounds_with_progress(
+        &looper_name(&copied_path),
         "swf",
-        &path,
+        &copied_path,
         &library::sha256_hex(&data),
         None,
         None,
         &sounds.sounds,
-    )
+        |stage, current, total| {
+            emit_import_progress(&app, &job_id, stage, current, total, &copied_path, false, None);
+        },
+    );
+    match report {
+        Ok(report) => {
+            emit_import_progress(&app, &job_id, "complete", report.added + report.already_there, sounds.sounds.len(), &copied_path, true, None);
+            Ok(report)
+        }
+        Err(error) => {
+            emit_import_progress(&app, &job_id, "failed", 0, sounds.sounds.len(), &copied_path, true, Some(error.clone()));
+            Err(error)
+        }
+    }
 }
 
 #[tauri::command]
-fn import_exe(path: String, db: Db<'_>) -> Result<library::ImportReport, String> {
+fn import_exe(
+    path: String,
+    job_id: String,
+    app: tauri::AppHandle,
+    db: Db<'_>,
+) -> Result<library::ImportReport, String> {
+    emit_import_progress(&app, &job_id, "copying source", 0, 0, &path, false, None);
     let data = read_input(&path)?;
-    let found = import::exe::locate(&data).map_err(|e| import::exe::user_message(&e))?;
-    let sounds = import::swf::parse(&data[found.offset..found.offset + found.length])
-        .map_err(|e| import::swf::user_message(&e))?;
+    let copied_path = copy_dropped_source(&path, &data)?;
+    emit_import_progress(&app, &job_id, "analyzing", 0, 0, &copied_path, false, None);
+    let found = match import::exe::locate(&data) {
+        Ok(found) => found,
+        Err(e) => {
+            let error = import::exe::user_message(&e);
+            emit_import_progress(&app, &job_id, "failed", 0, 0, &copied_path, true, Some(error.clone()));
+            return Err(error);
+        }
+    };
+    let sounds = match import::swf::parse(&data[found.offset..found.offset + found.length]) {
+        Ok(sounds) => sounds,
+        Err(e) => {
+            let error = import::swf::user_message(&e);
+            emit_import_progress(&app, &job_id, "failed", 0, 0, &copied_path, true, Some(error.clone()));
+            return Err(error);
+        }
+    };
     let g = self::db(&db)?;
     let lib = require_lib(&g)?;
-    lib.import_sounds(
-        &looper_name(&path),
+    let report = lib.import_sounds_with_progress(
+        &looper_name(&copied_path),
         "exe",
-        &path,
+        &copied_path,
         &library::sha256_hex(&data),
         Some(found.offset as i64),
         Some(found.length as i64),
         &sounds.sounds,
-    )
+        |stage, current, total| {
+            emit_import_progress(&app, &job_id, stage, current, total, &copied_path, false, None);
+        },
+    );
+    match report {
+        Ok(report) => {
+            emit_import_progress(&app, &job_id, "complete", report.added + report.already_there, sounds.sounds.len(), &copied_path, true, None);
+            Ok(report)
+        }
+        Err(error) => {
+            emit_import_progress(&app, &job_id, "failed", 0, sounds.sounds.len(), &copied_path, true, Some(error.clone()));
+            Err(error)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -354,5 +658,50 @@ mod tests {
     fn greet_names_user_without_echoing_raw_input_twice() {
         let out = greet("DJ".to_string());
         assert!(out.contains("DJ"));
+    }
+
+    #[test]
+    fn portable_root_uses_parent_of_macos_app_bundle() {
+        let executable = std::path::Path::new(
+            "/Applications/oLooper.app/Contents/MacOS/oLooper",
+        );
+        assert_eq!(
+            portable_root_for_executable(executable).unwrap(),
+            std::path::PathBuf::from("/Applications"),
+        );
+    }
+
+    #[test]
+    fn portable_root_uses_executable_parent_outside_app_bundle() {
+        let executable = std::path::Path::new("/tmp/olooper/olooper");
+        assert_eq!(
+            portable_root_for_executable(executable).unwrap(),
+            std::path::PathBuf::from("/tmp/olooper"),
+        );
+    }
+
+    #[test]
+    fn source_copy_preserves_bytes_deduplicates_and_avoids_collisions() {
+        let root = std::env::temp_dir().join(format!(
+            "olooper-source-copy-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+
+        let first = copy_dropped_source_to(&root, "/drop/My Looper.swf", b"first").unwrap();
+        assert_eq!(std::fs::read(&first).unwrap(), b"first");
+
+        let repeated = copy_dropped_source_to(&root, "/drop/My Looper.swf", b"first").unwrap();
+        assert_eq!(repeated, first);
+
+        let collision = copy_dropped_source_to(&root, "/drop/My Looper.swf", b"second").unwrap();
+        assert_ne!(collision, first);
+        assert!(collision.ends_with("My Looper (2).swf"));
+        assert_eq!(std::fs::read(collision).unwrap(), b"second");
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

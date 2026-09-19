@@ -323,8 +323,28 @@ impl Player {
     }
 
     pub fn set_loop_enabled(&mut self, enabled: bool) -> Result<PlayerStatus, String> {
-        let t = self.track.as_mut().ok_or("nothing loaded")?;
-        t.enabled = enabled;
+        let was_playing = self.sink.as_ref().is_some_and(|s| !s.is_paused() && !s.empty());
+        if !was_playing {
+            self.track.as_mut().ok_or("nothing loaded")?.enabled = enabled;
+            return Ok(self.status());
+        }
+        let (src, volume) = {
+            let t = self.track.as_mut().ok_or("nothing loaded")?;
+            t.enabled = enabled;
+            // LoopRegion captures this flag when created, so rebuild the
+            // source immediately instead of waiting for another transport action.
+            let cursor = t.cursor.load(Ordering::Relaxed);
+            let (start, end) = region_frames(&t.buf, t.start_ms, t.end_ms);
+            t.resume_frame = cursor;
+            (
+                LoopRegion::new(t.buf.clone(), cursor, start, end, enabled, t.cursor.clone()),
+                t.volume,
+            )
+        };
+        let sink = self.fresh_sink(volume)?;
+        sink.append(src);
+        sink.play();
+        self.sink = Some(sink);
         Ok(self.status())
     }
 

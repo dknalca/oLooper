@@ -57,16 +57,16 @@ Never executes ActionScript; never requires Flash.
 
 ## Acceptance criteria
 
-- [ ] Reference `The Nineteenth Wave Looper.swf` (FWS v5, ~29 MB): all MP3
+- [x] Reference `The Nineteenth Wave Looper.swf` (FWS v5, ~29 MB): all MP3
   `DefineSound`s extracted byte-identical, ordered, provenance recorded
   (manual validation via inventory, not CI).
   **Verified 2026-09-18: 51 extracted / 0 skipped; all decode via rodio.**
-- [ ] Reference `TheSeventeenthWaveLooper.exe` behaves identically through
+- [x] Reference `TheSeventeenthWaveLooper.exe` behaves identically through
   the `025` path (offset 819200).
   **Verified 2026-09-18: 48 extracted / 0 skipped; all decode via rodio.**
-- [ ] Synthetic fixtures in CI: valid FWS, CWS, multi-sound, truncated,
+- [x] Synthetic fixtures in CI: valid FWS, CWS, multi-sound, truncated,
   unsupported-codec — all behave per spec.
-- [ ] Malformed inputs never panic, never write partial files.
+- [x] Malformed inputs never panic, never write partial files.
 
 ## Non-goals
 

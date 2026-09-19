@@ -2,6 +2,7 @@
 node_modules/
 dist/
 src-tauri/target/
+oLooper.app/
 
 # Tauri generated (icons/ IS committed: required at compile time)
 src-tauri/gen/
@@ -13,3 +14,10 @@ src-tauri/gen/
 
 # Local dev inbox: real user samples, never committed (see ADR 0003)
 loopersFlash/
+
+# Local library data (user-specific)
+audios/
+olooper-library.json
+
+# Scratch verification artifacts (dumps, screenshots, icons): project-local, never committed
+.dev/

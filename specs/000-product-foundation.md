@@ -14,6 +14,10 @@ practice with a persistent local library, prepare cue/loop metadata
 3. Drop WAV/MP3 → immediately practicable with default cue + loop.
 4. Library persists across restarts; missing/moved files reported, never silently duplicated.
 5. Infinite (perceptually gapless) looping with scrolling waveform, BPM/cue/loop editable.
+6. Keyboard shortcuts for hands-free practice: Space (play/pause), S (stop), arrows (seek), L (loop toggle), [ / ] (set loop points).
+7. 4 named cue/loop slots (A–D) per track, persisted to SQLite, auto-load on track select.
+8. Native OS file dialogs for importing SWF/EXE/audio and selecting library root.
+9. Dark UI with Tailwind CSS: sidebar + main area layout, styled transport controls, context menu for track management.
 
 ## Inputs / outputs
 
@@ -38,11 +42,15 @@ practice with a persistent local library, prepare cue/loop metadata
 
 ## Acceptance criteria
 
-- [ ] SWF from `loopersFlash/` extracts, persists, loops with waveform.
-- [ ] EXE from `loopersFlash/` extracts via embedded SWF or fails clearly, source intact.
-- [ ] Restart preserves library without re-analysis or duplication.
-- [ ] Dropped WAV plays immediately with editable cue/loop.
-- [ ] Clean-macOS install runs without dev dependencies.
+- [x] SWF from `loopersFlash/` extracts, persists, loops with waveform.
+- [x] EXE from `loopersFlash/` extracts via embedded SWF or fails clearly, source intact.
+- [x] Restart preserves library without re-analysis or duplication.
+- [x] Dropped WAV plays immediately with editable cue/loop.
+- [x] Clean-macOS install runs without dev dependencies.
+- [x] Keyboard shortcuts control transport and loop editing without mouse.
+- [x] 4 loop slots per track persist across sessions.
+- [x] Native file pickers for import and library init.
+- [x] Dark UI with sidebar layout, context menus, track stats.
 
 ## Non-goals (MVP)
 

@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
 // Typed Tauri command contracts. All backend access goes through here;
 // components must not import @tauri-apps/api directly.
@@ -11,37 +12,6 @@ export interface AppStatus {
 
 export function getAppStatus(): Promise<AppStatus> {
   return invoke<AppStatus>("get_app_status");
-}
-
-export function greet(name: string): Promise<string> {
-  return invoke<string>("greet", { name });
-}
-
-export interface SoundReport {
-  id: number;
-  format: number;
-  sample_count: number;
-  bytes: number;
-}
-
-export interface SwfReport {
-  version: number;
-  sounds: SoundReport[];
-  skipped: SoundReport[];
-}
-
-export interface ExeReport {
-  swf_offset: number;
-  swf_length: number;
-  inner: SwfReport;
-}
-
-export function inspectSwf(path: string): Promise<SwfReport> {
-  return invoke<SwfReport>("inspect_swf", { path });
-}
-
-export function inspectExe(path: string): Promise<ExeReport> {
-  return invoke<ExeReport>("inspect_exe", { path });
 }
 
 export interface PlayerStatus {
@@ -134,20 +104,52 @@ export interface ImportReport {
   track_ids: number[];
 }
 
+export interface ImportProgress {
+  job_id: string;
+  stage: string;
+  current: number;
+  total: number;
+  detail: string;
+  done: boolean;
+  error: string | null;
+}
+
+function importJobId(): string {
+  return crypto.randomUUID();
+}
+
+export function libraryPortableInit(): Promise<string> {
+  return invoke<string>("library_portable_init");
+}
+
+export function libraryDefaultRoot(): Promise<string> {
+  return invoke<string>("library_default_root");
+}
+
 export function libraryInit(root: string): Promise<string> {
   return invoke<string>("library_init", { root });
+}
+
+export function libraryRestore(): Promise<string | null> {
+  return invoke<string | null>("library_restore");
 }
 
 export function libraryList(): Promise<Track[]> {
   return invoke<Track[]>("library_list");
 }
 
-export function importSwf(path: string): Promise<ImportReport> {
-  return invoke<ImportReport>("import_swf", { path });
+export function importSwf(path: string, jobId = importJobId()): Promise<ImportReport> {
+  return invoke<ImportReport>("import_swf", { path, jobId });
 }
 
-export function importExe(path: string): Promise<ImportReport> {
-  return invoke<ImportReport>("import_exe", { path });
+export function importExe(path: string, jobId = importJobId()): Promise<ImportReport> {
+  return invoke<ImportReport>("import_exe", { path, jobId });
+}
+
+export function listenImportProgress(
+  handler: (progress: ImportProgress) => void,
+): Promise<UnlistenFn> {
+  return listen<ImportProgress>("olooper:import-progress", (event) => handler(event.payload));
 }
 
 export interface CustomReport {
@@ -161,4 +163,67 @@ export interface CustomReport {
 
 export function importCustom(paths: string[]): Promise<CustomReport[]> {
   return invoke<CustomReport[]>("import_custom", { paths });
+}
+
+// --- File dialog wrappers ---
+
+import { open } from "@tauri-apps/plugin-dialog";
+
+export async function pickFiles(
+  filters?: { name: string; extensions: string[] }[],
+): Promise<string[]> {
+  const result = await open({ multiple: true, directory: false, filters });
+  if (result === null) return [];
+  return Array.isArray(result) ? result : [result];
+}
+
+export async function pickDirectory(): Promise<string | null> {
+  const result = await open({ directory: true, multiple: false });
+  if (result === null) return null;
+  return Array.isArray(result) ? result[0] : result;
+}
+
+// --- Loop slots ---
+
+export interface LoopSlot {
+  id: number;
+  track_id: number;
+  slot: number;
+  label: string;
+  cue_ms: number;
+  loop_start_ms: number;
+  loop_end_ms: number;
+  enabled: boolean;
+}
+
+export function libraryGetSlots(trackId: number): Promise<LoopSlot[]> {
+  return invoke<LoopSlot[]>("library_get_slots", { trackId });
+}
+
+export function librarySetSlot(
+  trackId: number,
+  slot: number,
+  label: string,
+  cueMs: number,
+  loopStartMs: number,
+  loopEndMs: number,
+  enabled: boolean,
+): Promise<LoopSlot> {
+  return invoke<LoopSlot>("library_set_slot", {
+    trackId, slot, label, cueMs, loopStartMs, loopEndMs, enabled,
+  });
+}
+
+export function libraryDeleteSlot(trackId: number, slot: number): Promise<boolean> {
+  return invoke<boolean>("library_delete_slot", { trackId, slot });
+}
+
+// --- Library management ---
+
+export function libraryRemove(trackId: number): Promise<boolean> {
+  return invoke<boolean>("library_remove", { id: trackId });
+}
+
+export function revealInFileManager(path: string): Promise<void> {
+  return invoke<void>("reveal_in_file_manager", { path });
 }

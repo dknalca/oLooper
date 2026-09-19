@@ -17,6 +17,8 @@ normal files under a configurable library root. Covers import flows for
    flagged per-track (`exists: false`), never silently dropped or duplicated.
 4. Cue/loop/BPM edits persist per track and are never overwritten by later
    imports or re-analysis.
+5. 4 loop slots (A–D) per track, stored in `loop_slots` table. Slots persist
+   across sessions. Deleting a track cascades to delete its slots.
 
 ## Supported inputs
 
@@ -28,6 +30,8 @@ normal files under a configurable library root. Covers import flows for
 - `ImportReport { looper, added, already_there, sounds }` per import.
 - `Track { id, title, file_path, exists, duration_ms, bpm?, cue/loop…,
   provenance… }` for UI and player handoff (`player_load(track.file_path)`).
+- `LoopSlot { id, track_id, slot, label, cue_ms, loop_start_ms, loop_end_ms, enabled }`
+  for loop slot CRUD.
 
 ## Failure behavior
 
@@ -40,9 +44,11 @@ normal files under a configurable library root. Covers import flows for
 
 ## Persistence behavior
 
-- Schema versioned via `PRAGMA user_version`; migrations 0→1→… explicit,
+- Schema versioned via `PRAGMA user_version`; migrations 0→1→2 explicit,
   forward-only, tested on a temp DB. Downgrades unsupported (clear error).
+- v1→v2 adds `loop_slots` table with `ON DELETE CASCADE`.
 - `updated_at` bumps on every user edit; `imported_at` never changes.
+- Foreign keys enforced via `PRAGMA foreign_keys = ON`.
 
 ## Platform considerations
 
@@ -58,11 +64,12 @@ normal files under a configurable library root. Covers import flows for
 
 ## Acceptance criteria
 
-- [ ] Import `.swf` real → rows + files; re-import → 0 added, same ids.
-- [ ] Import `.exe` real → identical sounds via `source_type=exe` + offsets.
-- [ ] Restart → list intact; rename a file → `exists: false` shown.
-- [ ] Cue/loop edit → restart → edit preserved.
-- [ ] Temp-DB tests: migrate, CRUD, dedup conflict, atomicity (no partial rows).
+- [x] Import `.swf` real → rows + files; re-import → 0 added, same ids.
+- [x] Import `.exe` real → identical sounds via `source_type=exe` + offsets.
+- [x] Restart → list intact; rename a file → `exists: false` shown.
+- [x] Cue/loop edit → restart → edit preserved.
+- [x] Temp-DB tests: migrate, CRUD, dedup conflict, atomicity (no partial rows).
+- [x] Loop slots: CRUD works, cascade delete on track removal, schema migration v1→v2.
 
 ## Non-goals
 

@@ -162,21 +162,27 @@ fn body_bytes(data: &[u8]) -> Result<(u8, Vec<u8>), SwfError> {
     if declared > MAX_SWF_LEN {
         return Err(SwfError::DeclaredTooLarge(declared));
     }
-    if (data.len() as u64) < u64::from(declared) {
-        return Err(SwfError::Truncated {
-            declared,
-            actual: data.len(),
-        });
-    }
-
     match &magic {
-        b"FWS" => Ok((version, data[8..declared as usize].to_vec())),
+        b"FWS" => {
+            if data.len() < declared as usize {
+                return Err(SwfError::Truncated {
+                    declared,
+                    actual: data.len(),
+                });
+            }
+            Ok((version, data[8..declared as usize].to_vec()))
+        }
         b"CWS" => {
-            let mut dec = flate2::read::ZlibDecoder::new(&data[8..]);
+            // The header length is for the decompressed FWS image. A valid
+            // compressed stream is normally much smaller, so do not compare
+            // the on-disk length with `declared` before decompression.
+            let expected = declared as usize - 8;
+            let dec = flate2::read::ZlibDecoder::new(&data[8..]);
             let mut out = Vec::new();
-            dec.read_to_end(&mut out)
+            dec.take((expected + 1) as u64)
+                .read_to_end(&mut out)
                 .map_err(|e| SwfError::Decompress(e.to_string()))?;
-            if out.len() + 8 != declared as usize {
+            if out.len() != expected {
                 return Err(SwfError::LengthMismatch {
                     declared,
                     actual: out.len() + 8,

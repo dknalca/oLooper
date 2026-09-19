@@ -1,0 +1,86 @@
+@import "tailwindcss";
+
+@theme {
+  --color-app: #0a0a0a;
+  --color-surface: #141414;
+  --color-surface-hover: #1e1e1e;
+  --color-elevated: #1a1a1a;
+  --color-border: #2a2a2a;
+  --color-text: #e8e8e8;
+  --color-text-secondary: #888;
+  --color-accent: #4aa3ff;
+  --color-accent-hover: #5bb3ff;
+  --color-success: #34d399;
+  --color-warning: #fbbf24;
+  --color-danger: #f87171;
+}
+
+html, body, #root {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  overflow: hidden;
+  background: var(--color-app);
+  color: var(--color-text);
+  font-family: "Inter", system-ui, -apple-system, sans-serif;
+  font-size: 13px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Scrollbar styling */
+::-webkit-scrollbar {
+  width: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--color-border);
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #3a3a3a;
+}
+
+/* Range input styling */
+input[type="range"] {
+  -webkit-appearance: none;
+  appearance: none;
+  background: transparent;
+  cursor: pointer;
+  height: 16px;
+}
+input[type="range"]::-webkit-slider-runnable-track {
+  background: var(--color-border);
+  height: 3px;
+  border-radius: 2px;
+}
+input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: var(--color-accent);
+  margin-top: -4.5px;
+  transition: transform 0.1s;
+}
+input[type="range"]::-webkit-slider-thumb:hover {
+  transform: scale(1.2);
+}
+input[type="range"]:hover::-webkit-slider-runnable-track {
+  background: #3a3a3a;
+}
+
+/* Focus ring */
+:focus-visible {
+  outline: 1px solid var(--color-accent);
+  outline-offset: 1px;
+}
+
+/* Button base */
+button {
+  font-family: inherit;
+  font-size: inherit;
+}

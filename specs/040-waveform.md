@@ -46,12 +46,12 @@ computation; rendering is canvas-only (no audio decoding per frame).
 
 ## Acceptance criteria
 
-- [ ] Extracted loop shows shaped waveform (not flat, not noise) with loop
+- [x] Extracted loop shows shaped waveform (not flat, not noise) with loop
   overlay; playhead advances; scroll follows.
-- [ ] Click seeks within ±1 bucket of the target; loop wrap keeps shading.
-- [ ] Unit tests: synthetic WAV yields exact expected buckets; invalid input
+- [x] Click seeks within ±1 bucket of the target; loop wrap keeps shading.
+- [x] Unit tests: synthetic WAV yields exact expected buckets; invalid input
   errors; bucket clamp holds.
-- [ ] No per-frame decode: peaks computed once per path+bucket-count.
+- [x] No per-frame decode: peaks computed once per path+bucket-count.
 
 ## Non-goals
 
