@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 const HOP: usize = 512;
 const MIN_BPM: f64 = 60.0;
 const MAX_BPM: f64 = 200.0;
+const DISPLAY_MIN_BPM: f64 = 65.0;
+const DISPLAY_MAX_BPM: f64 = 150.0;
 /// Below this normalized autocorrelation peak there is no estimate.
 const MIN_PEAK: f64 = 0.15;
 
@@ -61,6 +63,21 @@ fn autocorr(env: &[f32], lag: usize) -> f64 {
     }
 }
 
+/// Move an automatically detected tempo by octaves into the DJ-facing range.
+/// The autocorrelation remains broad so it can recognize double/half-time
+/// material before this presentation normalization is applied.
+fn normalize_bpm(mut bpm: f64) -> Option<f64> {
+    while bpm < DISPLAY_MIN_BPM {
+        bpm *= 2.0;
+    }
+    while bpm > DISPLAY_MAX_BPM {
+        bpm /= 2.0;
+    }
+    (DISPLAY_MIN_BPM..=DISPLAY_MAX_BPM)
+        .contains(&bpm)
+        .then(|| (bpm * 10.0).round() / 10.0)
+}
+
 pub fn estimate(buf: &crate::player::LoopBuffer) -> Option<BpmEstimate> {
     if buf.rate == 0 || buf.frames() < buf.rate as usize {
         return None; // need ~1 s minimum
@@ -98,12 +115,12 @@ pub fn estimate(buf: &crate::player::LoopBuffer) -> Option<BpmEstimate> {
     } else {
         lag
     };
-    let bpm = (60.0 * env_rate / refined * 10.0).round() / 10.0;
+    let bpm = 60.0 * env_rate / refined;
     if !(MIN_BPM..=MAX_BPM).contains(&bpm) {
         return None;
     }
     Some(BpmEstimate {
-        bpm,
+        bpm: normalize_bpm(bpm)?,
         confidence: peak.clamp(0.0, 1.0),
     })
 }

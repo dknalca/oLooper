@@ -38,6 +38,13 @@ fn click_90bpm_44100_estimated() {
 }
 
 #[test]
+fn detected_double_or_half_time_is_normalized_to_library_range() {
+    assert_eq!(normalize_bpm(60.0), Some(120.0));
+    assert_eq!(normalize_bpm(180.0), Some(90.0));
+    assert_eq!(normalize_bpm(128.0), Some(128.0));
+}
+
+#[test]
 fn silence_yields_none() {
     assert!(estimate(&buf_from_mono(vec![0; 44100 * 2], 44100)).is_none());
 }
