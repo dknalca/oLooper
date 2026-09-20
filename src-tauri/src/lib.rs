@@ -1,5 +1,13 @@
 use serde::{Deserialize, Serialize};
 use tauri::Emitter as _;
+use std::sync::{Mutex, OnceLock};
+
+static CANCELLED_IMPORTS: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+
+fn import_cancelled(job_id: &str) -> bool {
+    CANCELLED_IMPORTS.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+        .lock().map(|jobs| jobs.contains(job_id)).unwrap_or(false)
+}
 
 pub mod analysis;
 pub mod import;
@@ -32,7 +40,9 @@ struct SavedLibraryRoot {
     root: String,
 }
 
-fn portable_root_for_executable(executable: &std::path::Path) -> Result<std::path::PathBuf, String> {
+fn portable_root_for_executable(
+    executable: &std::path::Path,
+) -> Result<std::path::PathBuf, String> {
     if let Some(bundle) = executable
         .ancestors()
         .find(|path| path.extension().is_some_and(|ext| ext == "app"))
@@ -49,7 +59,8 @@ fn portable_root_for_executable(executable: &std::path::Path) -> Result<std::pat
 }
 
 fn portable_root() -> Result<std::path::PathBuf, String> {
-    let executable = std::env::current_exe().map_err(|e| format!("cannot locate executable: {e}"))?;
+    let executable =
+        std::env::current_exe().map_err(|e| format!("cannot locate executable: {e}"))?;
     portable_root_for_executable(&executable)
 }
 
@@ -68,8 +79,10 @@ fn library_selection_path() -> Result<std::path::PathBuf, String> {
 fn save_library_root(root: &str) -> Result<(), String> {
     let path = library_selection_path()?;
     let tmp = path.with_extension("json.tmp");
-    let data = serde_json::to_vec(&SavedLibraryRoot { root: root.to_string() })
-        .map_err(|e| format!("cannot serialize library selection: {e}"))?;
+    let data = serde_json::to_vec(&SavedLibraryRoot {
+        root: root.to_string(),
+    })
+    .map_err(|e| format!("cannot serialize library selection: {e}"))?;
     std::fs::write(&tmp, data).map_err(|e| format!("cannot save library selection: {e}"))?;
     if let Err(e) = std::fs::rename(&tmp, &path) {
         let _ = std::fs::remove_file(&tmp);
@@ -84,8 +97,8 @@ fn saved_library_root() -> Result<Option<String>, String> {
         return Ok(None);
     }
     let data = std::fs::read(&path).map_err(|e| format!("cannot read library selection: {e}"))?;
-    let saved: SavedLibraryRoot = serde_json::from_slice(&data)
-        .map_err(|e| format!("cannot read library selection: {e}"))?;
+    let saved: SavedLibraryRoot =
+        serde_json::from_slice(&data).map_err(|e| format!("cannot read library selection: {e}"))?;
     Ok(Some(saved.root))
 }
 
@@ -127,7 +140,10 @@ fn copy_dropped_source_to(
     data: &[u8],
 ) -> Result<String, String> {
     let source = std::path::Path::new(path);
-    let stem = source.file_stem().and_then(|s| s.to_str()).unwrap_or("looper");
+    let stem = source
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("looper");
     let ext = source
         .extension()
         .and_then(|s| s.to_str())
@@ -138,7 +154,11 @@ fn copy_dropped_source_to(
     }
     let stem = library::sanitize_name(stem);
     for n in 1..10_000 {
-        let suffix = if n == 1 { String::new() } else { format!(" ({n})") };
+        let suffix = if n == 1 {
+            String::new()
+        } else {
+            format!(" ({n})")
+        };
         let dest = source_dir.join(format!("{stem}{suffix}.{ext}"));
         if dest.exists() {
             if std::fs::read(&dest).ok().as_deref() == Some(data) {
@@ -148,7 +168,8 @@ fn copy_dropped_source_to(
         }
         let tmp = dest.with_extension(format!("{ext}.tmp"));
         std::fs::write(&tmp, data).map_err(|e| format!("cannot copy source: {e}"))?;
-        let verified = std::fs::read(&tmp).map_err(|e| format!("cannot verify source copy: {e}"))?;
+        let verified =
+            std::fs::read(&tmp).map_err(|e| format!("cannot verify source copy: {e}"))?;
         if verified != data {
             let _ = std::fs::remove_file(&tmp);
             return Err("cannot verify source copy".to_string());
@@ -280,9 +301,12 @@ pub fn run() {
             player_pause,
             player_stop,
             player_set_volume,
+            player_set_speed,
+            player_set_pitch_lock,
             player_set_loop,
             player_set_loop_enabled,
             player_status,
+            player_waveform_peaks,
             player_seek,
             library_default_root,
             library_init,
@@ -293,12 +317,20 @@ pub fn run() {
             library_update_cue_loop,
             library_update_bpm,
             library_remove,
+            library_set_favorite,
+            library_update_metadata,
+            library_mark_played,
+            library_export_tracks,
+            library_rename_looper,
+            library_remove_looper,
+            library_group_directory,
             library_get_slots,
             library_set_slot,
             library_delete_slot,
             import_swf,
             import_exe,
             import_custom,
+            cancel_import,
             waveform_peaks,
             reveal_in_file_manager
         ])
@@ -331,6 +363,16 @@ fn player_stop(audio: Audio<'_>) -> Result<player::PlayerStatus, String> {
 #[tauri::command]
 fn player_set_volume(volume_pct: f32, audio: Audio<'_>) -> Result<player::PlayerStatus, String> {
     audio.set_volume(volume_pct)
+}
+
+#[tauri::command]
+fn player_set_speed(speed_pct: f32, audio: Audio<'_>) -> Result<player::PlayerStatus, String> {
+    audio.set_speed(speed_pct)
+}
+
+#[tauri::command]
+fn player_set_pitch_lock(enabled: bool, audio: Audio<'_>) -> Result<player::PlayerStatus, String> {
+    audio.set_pitch_lock(enabled)
 }
 
 #[tauri::command]
@@ -369,7 +411,9 @@ fn db<'a>(db: &'a Db<'_>) -> Result<std::sync::MutexGuard<'a, Option<library::Li
 fn require_lib<'a>(
     guard: &'a std::sync::MutexGuard<'a, Option<library::Library>>,
 ) -> Result<&'a library::Library, String> {
-    guard.as_ref().ok_or_else(|| "library not initialized".to_string())
+    guard
+        .as_ref()
+        .ok_or_else(|| "library not initialized".to_string())
 }
 
 fn init_portable_library(db: &Db<'_>) -> Result<String, String> {
@@ -436,7 +480,9 @@ fn reveal_in_file_manager(path: String) -> Result<(), String> {
         command.arg(path.parent().unwrap_or(path));
         command
     };
-    command.spawn().map_err(|e| format!("cannot reveal file: {e}"))?;
+    command
+        .spawn()
+        .map_err(|e| format!("cannot reveal file: {e}"))?;
     Ok(())
 }
 
@@ -491,6 +537,48 @@ fn library_remove(id: i64, db: Db<'_>) -> Result<bool, String> {
 }
 
 #[tauri::command]
+fn library_set_favorite(id: i64, favorite: bool, db: Db<'_>) -> Result<library::Track, String> {
+    let g = self::db(&db)?;
+    require_lib(&g)?.set_favorite(id, favorite)
+}
+
+#[tauri::command]
+fn library_update_metadata(id: i64, title: String, bpm: Option<f64>, tags: String, database: Db<'_>) -> Result<library::Track, String> {
+    require_lib(&db(&database)? )?.update_metadata(id, &title, bpm, &tags)
+}
+
+#[tauri::command]
+fn library_mark_played(id: i64, database: Db<'_>) -> Result<(), String> {
+    require_lib(&db(&database)? )?.mark_played(id)
+}
+
+#[tauri::command]
+fn library_export_tracks(ids: Vec<i64>, destination: String, database: Db<'_>) -> Result<usize, String> {
+    require_lib(&db(&database)? )?.export_tracks(&ids, std::path::Path::new(&destination))
+}
+
+#[tauri::command]
+fn library_rename_looper(source_hash: String, name: String, db: Db<'_>) -> Result<(), String> {
+    let g = self::db(&db)?;
+    require_lib(&g)?.rename_looper(&source_hash, &name)
+}
+
+#[tauri::command]
+fn library_remove_looper(source_hash: String, db: Db<'_>) -> Result<usize, String> {
+    let g = self::db(&db)?;
+    require_lib(&g)?.remove_looper(&source_hash)
+}
+
+#[tauri::command]
+fn library_group_directory(source_hash: String, db: Db<'_>) -> Result<String, String> {
+    let g = self::db(&db)?;
+    Ok(require_lib(&g)?
+        .group_directory(&source_hash)?
+        .to_string_lossy()
+        .to_string())
+}
+
+#[tauri::command]
 fn library_get_slots(track_id: i64, db: Db<'_>) -> Result<Vec<library::LoopSlot>, String> {
     let g = self::db(&db)?;
     require_lib(&g)?.get_slots(track_id)
@@ -508,7 +596,15 @@ fn library_set_slot(
     db: Db<'_>,
 ) -> Result<library::LoopSlot, String> {
     let g = self::db(&db)?;
-    require_lib(&g)?.set_slot(track_id, slot, &label, cue_ms, loop_start_ms, loop_end_ms, enabled)
+    require_lib(&g)?.set_slot(
+        track_id,
+        slot,
+        &label,
+        cue_ms,
+        loop_start_ms,
+        loop_end_ms,
+        enabled,
+    )
 }
 
 #[tauri::command]
@@ -529,6 +625,19 @@ fn waveform_peaks(path: String, buckets: usize) -> Result<waveform::WaveformData
     waveform::compute(&data, buckets)
 }
 
+#[tauri::command]
+fn player_waveform_peaks(
+    path: String,
+    buckets: usize,
+    audio: Audio<'_>,
+    db: Db<'_>,
+) -> Result<waveform::WaveformData, String> {
+    let cache_dir = require_lib(&self::db(&db)?)?
+        .root
+        .join(".olooper-cache/waveforms");
+    audio.waveform_peaks(&path, buckets, &cache_dir)
+}
+
 fn looper_name(path: &str) -> String {
     std::path::Path::new(path)
         .file_stem()
@@ -538,12 +647,20 @@ fn looper_name(path: &str) -> String {
 }
 
 #[tauri::command]
+fn cancel_import(job_id: String) -> Result<(), String> {
+    CANCELLED_IMPORTS.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+        .lock().map_err(|e| e.to_string())?.insert(job_id);
+    Ok(())
+}
+
+#[tauri::command]
 fn import_swf(
     path: String,
     job_id: String,
     app: tauri::AppHandle,
     db: Db<'_>,
 ) -> Result<library::ImportReport, String> {
+    if import_cancelled(&job_id) { return Err("import cancelled".to_string()); }
     emit_import_progress(&app, &job_id, "copying source", 0, 0, &path, false, None);
     let data = read_input(&path)?;
     let copied_path = copy_dropped_source(&path, &data)?;
@@ -552,7 +669,16 @@ fn import_swf(
         Ok(sounds) => sounds,
         Err(e) => {
             let error = import::swf::user_message(&e);
-            emit_import_progress(&app, &job_id, "failed", 0, 0, &copied_path, true, Some(error.clone()));
+            emit_import_progress(
+                &app,
+                &job_id,
+                "failed",
+                0,
+                0,
+                &copied_path,
+                true,
+                Some(error.clone()),
+            );
             return Err(error);
         }
     };
@@ -567,16 +693,44 @@ fn import_swf(
         None,
         &sounds.sounds,
         |stage, current, total| {
-            emit_import_progress(&app, &job_id, stage, current, total, &copied_path, false, None);
+            if import_cancelled(&job_id) { return Err("import cancelled".to_string()); }
+            emit_import_progress(
+                &app,
+                &job_id,
+                stage,
+                current,
+                total,
+                &copied_path,
+                false,
+                None,
+            ); Ok(())
         },
     );
     match report {
         Ok(report) => {
-            emit_import_progress(&app, &job_id, "complete", report.added + report.already_there, sounds.sounds.len(), &copied_path, true, None);
+            emit_import_progress(
+                &app,
+                &job_id,
+                "complete",
+                report.added + report.already_there,
+                sounds.sounds.len(),
+                &copied_path,
+                true,
+                None,
+            );
             Ok(report)
         }
         Err(error) => {
-            emit_import_progress(&app, &job_id, "failed", 0, sounds.sounds.len(), &copied_path, true, Some(error.clone()));
+            emit_import_progress(
+                &app,
+                &job_id,
+                "failed",
+                0,
+                sounds.sounds.len(),
+                &copied_path,
+                true,
+                Some(error.clone()),
+            );
             Err(error)
         }
     }
@@ -589,6 +743,7 @@ fn import_exe(
     app: tauri::AppHandle,
     db: Db<'_>,
 ) -> Result<library::ImportReport, String> {
+    if import_cancelled(&job_id) { return Err("import cancelled".to_string()); }
     emit_import_progress(&app, &job_id, "copying source", 0, 0, &path, false, None);
     let data = read_input(&path)?;
     let copied_path = copy_dropped_source(&path, &data)?;
@@ -597,7 +752,16 @@ fn import_exe(
         Ok(found) => found,
         Err(e) => {
             let error = import::exe::user_message(&e);
-            emit_import_progress(&app, &job_id, "failed", 0, 0, &copied_path, true, Some(error.clone()));
+            emit_import_progress(
+                &app,
+                &job_id,
+                "failed",
+                0,
+                0,
+                &copied_path,
+                true,
+                Some(error.clone()),
+            );
             return Err(error);
         }
     };
@@ -605,7 +769,16 @@ fn import_exe(
         Ok(sounds) => sounds,
         Err(e) => {
             let error = import::swf::user_message(&e);
-            emit_import_progress(&app, &job_id, "failed", 0, 0, &copied_path, true, Some(error.clone()));
+            emit_import_progress(
+                &app,
+                &job_id,
+                "failed",
+                0,
+                0,
+                &copied_path,
+                true,
+                Some(error.clone()),
+            );
             return Err(error);
         }
     };
@@ -620,16 +793,44 @@ fn import_exe(
         Some(found.length as i64),
         &sounds.sounds,
         |stage, current, total| {
-            emit_import_progress(&app, &job_id, stage, current, total, &copied_path, false, None);
+            if import_cancelled(&job_id) { return Err("import cancelled".to_string()); }
+            emit_import_progress(
+                &app,
+                &job_id,
+                stage,
+                current,
+                total,
+                &copied_path,
+                false,
+                None,
+            ); Ok(())
         },
     );
     match report {
         Ok(report) => {
-            emit_import_progress(&app, &job_id, "complete", report.added + report.already_there, sounds.sounds.len(), &copied_path, true, None);
+            emit_import_progress(
+                &app,
+                &job_id,
+                "complete",
+                report.added + report.already_there,
+                sounds.sounds.len(),
+                &copied_path,
+                true,
+                None,
+            );
             Ok(report)
         }
         Err(error) => {
-            emit_import_progress(&app, &job_id, "failed", 0, sounds.sounds.len(), &copied_path, true, Some(error.clone()));
+            emit_import_progress(
+                &app,
+                &job_id,
+                "failed",
+                0,
+                sounds.sounds.len(),
+                &copied_path,
+                true,
+                Some(error.clone()),
+            );
             Err(error)
         }
     }
@@ -662,9 +863,7 @@ mod tests {
 
     #[test]
     fn portable_root_uses_parent_of_macos_app_bundle() {
-        let executable = std::path::Path::new(
-            "/Applications/oLooper.app/Contents/MacOS/oLooper",
-        );
+        let executable = std::path::Path::new("/Applications/oLooper.app/Contents/MacOS/oLooper");
         assert_eq!(
             portable_root_for_executable(executable).unwrap(),
             std::path::PathBuf::from("/Applications"),

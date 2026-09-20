@@ -122,8 +122,11 @@ impl rodio::Source for LoopRegion {
 
 /// Decode any rodio-supported bytes into a buffer. Hardware-free.
 pub fn decode_bytes(data: &[u8]) -> Result<LoopBuffer, String> {
-    let dec = Decoder::new(Cursor::new(data.to_vec()))
-        .map_err(|e| format!("cannot decode audio: {e}"))?;
+    decode_owned(data.to_vec())
+}
+
+fn decode_owned(data: Vec<u8>) -> Result<LoopBuffer, String> {
+    let dec = Decoder::new(Cursor::new(data)).map_err(|e| format!("cannot decode audio: {e}"))?;
     let (channels, rate) = (dec.channels(), dec.sample_rate());
     if channels == 0 || rate == 0 {
         return Err("decoded stream has no channels or rate".to_string());
@@ -162,7 +165,9 @@ pub fn frames_to_ms(frames: usize, rate: u32) -> u64 {
 /// Validated loop region in milliseconds.
 pub fn check_region(start_ms: u64, end_ms: u64, duration_ms: u64) -> Result<(), String> {
     if end_ms > duration_ms {
-        return Err(format!("loop end {end_ms} ms exceeds duration {duration_ms} ms"));
+        return Err(format!(
+            "loop end {end_ms} ms exceeds duration {duration_ms} ms"
+        ));
     }
     if start_ms >= end_ms {
         return Err("loop start must be before loop end".to_string());
@@ -173,12 +178,15 @@ pub fn check_region(start_ms: u64, end_ms: u64, duration_ms: u64) -> Result<(), 
 struct Loaded {
     path: String,
     buf: Arc<LoopBuffer>,
+    original_buf: Arc<LoopBuffer>,
     start_ms: u64,
     end_ms: u64,
     enabled: bool,
     resume_frame: usize,
     cursor: Arc<AtomicUsize>,
     volume: f32,
+    speed: f32,
+    pitch_lock: bool,
 }
 
 pub struct Player {
@@ -208,24 +216,27 @@ impl Player {
     }
 
     pub fn load(&mut self, path: String) -> Result<PlayerStatus, String> {
-        let meta =
-            std::fs::metadata(&path).map_err(|e| format!("cannot open file: {e}"))?;
+        let meta = std::fs::metadata(&path).map_err(|e| format!("cannot open file: {e}"))?;
         if meta.len() > MAX_INPUT_LEN {
             return Err("file exceeds the 512 MiB limit".to_string());
         }
         let data = std::fs::read(&path).map_err(|e| format!("cannot read file: {e}"))?;
-        let buf = Arc::new(decode_bytes(&data)?);
+        let buf = Arc::new(decode_owned(data)?);
         let duration_ms = buf.duration_ms();
         self.sink = None; // hard stop of previous audio
+        let original_buf = buf.clone();
         self.track = Some(Loaded {
             path,
             buf,
+            original_buf,
             start_ms: 0,
             end_ms: duration_ms,
             enabled: true,
             resume_frame: 0,
             cursor: Arc::new(AtomicUsize::new(0)),
             volume: self.track.as_ref().map(|t| t.volume).unwrap_or(0.8),
+            speed: 1.0,
+            pitch_lock: false,
         });
         Ok(self.status())
     }
@@ -236,6 +247,17 @@ fn region_frames(buf: &LoopBuffer, start_ms: u64, end_ms: u64) -> (usize, usize)
     let s = ms_to_frames(start_ms, buf.rate).min(total);
     let e = ms_to_frames(end_ms, buf.rate).clamp(1, total.max(1));
     (s.min(e.saturating_sub(1)), e)
+}
+
+fn stretch_buffer(buffer: &LoopBuffer, tempo: f32) -> Result<LoopBuffer, String> {
+    let samples: Vec<f32> = buffer.samples.iter().map(|sample| *sample as f32 / 32768.0).collect();
+    let stretched = wsola::stretch(&samples, buffer.rate, buffer.channels, tempo)
+        .map_err(|error| format!("cannot preserve pitch: {error}"))?;
+    Ok(LoopBuffer {
+        samples: stretched.into_iter().map(|sample| (sample.clamp(-1.0, 1.0) * 32767.0) as i16).collect(),
+        channels: buffer.channels,
+        rate: buffer.rate,
+    })
 }
 
 impl Player {
@@ -251,7 +273,14 @@ impl Player {
         }
         let (s, e) = region_frames(&t.buf, t.start_ms, t.end_ms);
         let volume = t.volume;
-        let src = LoopRegion::new(t.buf.clone(), t.resume_frame, s, e, t.enabled, t.cursor.clone());
+        let src = LoopRegion::new(
+            t.buf.clone(),
+            t.resume_frame,
+            s,
+            e,
+            t.enabled,
+            t.cursor.clone(),
+        );
         let sink = self.fresh_sink(volume)?;
         sink.append(src);
         sink.play();
@@ -293,23 +322,51 @@ impl Player {
         Ok(self.status())
     }
 
-    pub fn set_loop(
-        &mut self,
-        start_ms: u64,
-        end_ms: u64,
-    ) -> Result<PlayerStatus, String> {
+    pub fn set_speed(&mut self, speed_pct: f32) -> Result<PlayerStatus, String> {
+        if !(50.0..=200.0).contains(&speed_pct) {
+            return Err("speed must be 50–200".to_string());
+        }
+        let speed = speed_pct / 100.0;
+        let track = self.track.as_mut().ok_or("nothing loaded")?;
+        track.speed = speed;
+        if track.pitch_lock {
+            track.buf = Arc::new(stretch_buffer(&track.original_buf, speed)?);
+        }
+        if let Some(sink) = &self.sink {
+            sink.set_speed(if track.pitch_lock { 1.0 } else { speed });
+        }
+        Ok(self.status())
+    }
+
+    pub fn set_pitch_lock(&mut self, enabled: bool) -> Result<PlayerStatus, String> {
+        let track = self.track.as_mut().ok_or("nothing loaded")?;
+        track.pitch_lock = enabled;
+        track.buf = if enabled && (track.speed - 1.0).abs() > f32::EPSILON {
+            Arc::new(stretch_buffer(&track.original_buf, track.speed)?)
+        } else {
+            track.original_buf.clone()
+        };
+        if let Some(sink) = &self.sink {
+            sink.set_speed(if enabled { 1.0 } else { track.speed });
+        }
+        Ok(self.status())
+    }
+
+    pub fn set_loop(&mut self, start_ms: u64, end_ms: u64) -> Result<PlayerStatus, String> {
         let t = self.track.as_mut().ok_or("nothing loaded")?;
         check_region(start_ms, end_ms, t.buf.duration_ms())?;
         t.start_ms = start_ms;
         t.end_ms = end_ms;
-        let was_playing = self.sink.as_ref().is_some_and(|s| !s.is_paused() && !s.empty());
+        let was_playing = self
+            .sink
+            .as_ref()
+            .is_some_and(|s| !s.is_paused() && !s.empty());
         if was_playing {
             // Restart the region from the new start for sample-accurate behavior.
             let (s, e) = region_frames(&t.buf, t.start_ms, t.end_ms);
             t.resume_frame = s;
             let volume = t.volume;
-            let src =
-                LoopRegion::new(t.buf.clone(), s, s, e, t.enabled, t.cursor.clone());
+            let src = LoopRegion::new(t.buf.clone(), s, s, e, t.enabled, t.cursor.clone());
             let sink = self.fresh_sink(volume)?;
             sink.append(src);
             sink.play();
@@ -323,7 +380,10 @@ impl Player {
     }
 
     pub fn set_loop_enabled(&mut self, enabled: bool) -> Result<PlayerStatus, String> {
-        let was_playing = self.sink.as_ref().is_some_and(|s| !s.is_paused() && !s.empty());
+        let was_playing = self
+            .sink
+            .as_ref()
+            .is_some_and(|s| !s.is_paused() && !s.empty());
         if !was_playing {
             self.track.as_mut().ok_or("nothing loaded")?.enabled = enabled;
             return Ok(self.status());
@@ -354,21 +414,17 @@ impl Player {
         let t = self.track.as_mut().ok_or("nothing loaded")?;
         let total = t.buf.frames();
         let from = ms_to_frames(position_ms.min(t.buf.duration_ms()), t.buf.rate).min(total);
-        let was_playing = self.sink.as_ref().is_some_and(|s| !s.is_paused() && !s.empty());
+        let was_playing = self
+            .sink
+            .as_ref()
+            .is_some_and(|s| !s.is_paused() && !s.empty());
         t.resume_frame = from;
         t.cursor.store(from, Ordering::Relaxed);
         if was_playing {
             let (s, e) = region_frames(&t.buf, t.start_ms, t.end_ms);
             let volume = t.volume;
             let enabled = t.enabled;
-            let src = LoopRegion::new(
-                t.buf.clone(),
-                from,
-                s,
-                e,
-                enabled,
-                t.cursor.clone(),
-            );
+            let src = LoopRegion::new(t.buf.clone(), from, s, e, enabled, t.cursor.clone());
             let sink = self.fresh_sink(volume)?;
             sink.append(src);
             sink.play();
@@ -395,6 +451,8 @@ impl Player {
                     loop_end_ms: t.end_ms,
                     loop_enabled: t.enabled,
                     volume_pct: t.volume * 100.0,
+                    speed_pct: t.speed * 100.0,
+                    pitch_lock: t.pitch_lock,
                 }
             }
         }
@@ -412,6 +470,8 @@ pub struct PlayerStatus {
     pub loop_end_ms: u64,
     pub loop_enabled: bool,
     pub volume_pct: f32,
+    pub speed_pct: f32,
+    pub pitch_lock: bool,
 }
 
 impl PlayerStatus {
@@ -426,6 +486,8 @@ impl PlayerStatus {
             loop_end_ms: 0,
             loop_enabled: true,
             volume_pct: 80.0,
+            speed_pct: 100.0,
+            pitch_lock: false,
         }
     }
 }
@@ -439,27 +501,57 @@ impl PlayerStatus {
 pub struct Engine {
     player: Option<Player>,
     pending_volume: f32,
+    loaded_buffer: std::sync::Arc<std::sync::RwLock<Option<(String, Arc<LoopBuffer>)>>>,
 }
 
 type Reply = std::sync::mpsc::Sender<Result<PlayerStatus, String>>;
 
 enum EngineCmd {
-    Load { path: String, reply: Reply },
-    Play { reply: Reply },
-    Pause { reply: Reply },
-    Stop { reply: Reply },
-    SetVolume { volume_pct: f32, reply: Reply },
-    SetLoop { start_ms: u64, end_ms: u64, reply: Reply },
-    SetLoopEnabled { enabled: bool, reply: Reply },
-    Seek { position_ms: u64, reply: Reply },
-    Status { reply: Reply },
+    Load {
+        path: String,
+        reply: Reply,
+    },
+    Play {
+        reply: Reply,
+    },
+    Pause {
+        reply: Reply,
+    },
+    Stop {
+        reply: Reply,
+    },
+    SetVolume {
+        volume_pct: f32,
+        reply: Reply,
+    },
+    SetSpeed { speed_pct: f32, reply: Reply },
+    SetPitchLock { enabled: bool, reply: Reply },
+    SetLoop {
+        start_ms: u64,
+        end_ms: u64,
+        reply: Reply,
+    },
+    SetLoopEnabled {
+        enabled: bool,
+        reply: Reply,
+    },
+    Seek {
+        position_ms: u64,
+        reply: Reply,
+    },
+    Status {
+        reply: Reply,
+    },
 }
 
 impl Engine {
-    pub fn new() -> Self {
+    pub fn new(
+        loaded_buffer: std::sync::Arc<std::sync::RwLock<Option<(String, Arc<LoopBuffer>)>>>,
+    ) -> Self {
         Self {
             player: None,
             pending_volume: 0.8,
+            loaded_buffer,
         }
     }
 
@@ -487,14 +579,17 @@ impl Engine {
                 EngineCmd::Play { reply } => (self.ensure().and_then(|p| p.play()), reply),
                 EngineCmd::Pause { reply } => (self.ensure().and_then(|p| p.pause()), reply),
                 EngineCmd::Stop { reply } => (self.ensure().and_then(|p| p.stop()), reply),
-                EngineCmd::SetVolume { volume_pct, reply } => {
-                    (self.cmd_volume(volume_pct), reply)
-                }
+                EngineCmd::SetVolume { volume_pct, reply } => (self.cmd_volume(volume_pct), reply),
+                EngineCmd::SetSpeed { speed_pct, reply } => (self.ensure().and_then(|p| p.set_speed(speed_pct)), reply),
+                EngineCmd::SetPitchLock { enabled, reply } => (self.ensure().and_then(|p| p.set_pitch_lock(enabled)), reply),
                 EngineCmd::SetLoop {
                     start_ms,
                     end_ms,
                     reply,
-                } => (self.ensure().and_then(|p| p.set_loop(start_ms, end_ms)), reply),
+                } => (
+                    self.ensure().and_then(|p| p.set_loop(start_ms, end_ms)),
+                    reply,
+                ),
                 EngineCmd::SetLoopEnabled { enabled, reply } => (
                     self.ensure().and_then(|p| p.set_loop_enabled(enabled)),
                     reply,
@@ -510,15 +605,24 @@ impl Engine {
 
     fn cmd_load(&mut self, path: String) -> Result<PlayerStatus, String> {
         let vol = self.pending_volume;
-        let p = self.ensure()?;
-        p.load(path)?;
-        if let Some(t) = &mut p.track {
-            t.volume = vol;
-            if let Some(s) = &p.sink {
-                s.set_volume(vol);
+        let (status, loaded) = {
+            let p = self.ensure()?;
+            p.load(path)?;
+            if let Some(t) = &mut p.track {
+                t.volume = vol;
+                if let Some(s) = &p.sink {
+                    s.set_volume(vol);
+                }
             }
-        }
-        Ok(p.status())
+            (
+                p.status(),
+                p.track
+                    .as_ref()
+                    .map(|track| (track.path.clone(), track.buf.clone())),
+            )
+        };
+        *self.loaded_buffer.write().map_err(|e| e.to_string())? = loaded;
+        Ok(status)
     }
 
     fn cmd_volume(&mut self, volume_pct: f32) -> Result<PlayerStatus, String> {
@@ -538,13 +642,14 @@ impl Engine {
 
 impl Default for Engine {
     fn default() -> Self {
-        Self::new()
+        Self::new(std::sync::Arc::new(std::sync::RwLock::new(None)))
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct EngineClient {
     tx: std::sync::mpsc::Sender<EngineCmd>,
+    loaded_buffer: std::sync::Arc<std::sync::RwLock<Option<(String, Arc<LoopBuffer>)>>>,
 }
 
 impl EngineClient {
@@ -576,6 +681,14 @@ impl EngineClient {
         self.call(|reply| EngineCmd::SetVolume { volume_pct, reply })
     }
 
+    pub fn set_speed(&self, speed_pct: f32) -> Result<PlayerStatus, String> {
+        self.call(|reply| EngineCmd::SetSpeed { speed_pct, reply })
+    }
+
+    pub fn set_pitch_lock(&self, enabled: bool) -> Result<PlayerStatus, String> {
+        self.call(|reply| EngineCmd::SetPitchLock { enabled, reply })
+    }
+
     pub fn set_loop(&self, start_ms: u64, end_ms: u64) -> Result<PlayerStatus, String> {
         self.call(|reply| EngineCmd::SetLoop {
             start_ms,
@@ -595,17 +708,33 @@ impl EngineClient {
     pub fn status(&self) -> Result<PlayerStatus, String> {
         self.call(|reply| EngineCmd::Status { reply })
     }
+
+    pub fn waveform_peaks(
+        &self,
+        path: &str,
+        buckets: usize,
+        cache_dir: &std::path::Path,
+    ) -> Result<crate::waveform::WaveformData, String> {
+        let guard = self.loaded_buffer.read().map_err(|e| e.to_string())?;
+        let (loaded_path, buffer) = guard.as_ref().ok_or("nothing loaded")?;
+        if loaded_path != path {
+            return Err("track changed before waveform analysis".to_string());
+        }
+        crate::waveform::cached_from_buffer(cache_dir, std::path::Path::new(path), buckets, buffer)
+    }
 }
 
 /// Spawn the audio thread and return its client. Hardware-free until the
 /// first `load`/`play`.
 pub fn spawn() -> EngineClient {
     let (tx, rx) = std::sync::mpsc::channel();
+    let loaded_buffer = std::sync::Arc::new(std::sync::RwLock::new(None));
+    let engine_buffer = loaded_buffer.clone();
     std::thread::Builder::new()
         .name("olooper-audio".to_string())
-        .spawn(move || Engine::new().run(rx))
+        .spawn(move || Engine::new(engine_buffer).run(rx))
         .expect("cannot spawn audio thread");
-    EngineClient { tx }
+    EngineClient { tx, loaded_buffer }
 }
 
 #[cfg(test)]

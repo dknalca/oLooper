@@ -5,15 +5,16 @@
 - This repository contains a working Tauri 2 desktop application with React/TypeScript frontend and Rust core.
 - Build: `pnpm install && pnpm run tauri build` (or `./scripts/build.sh`).
 - Typecheck: `pnpm run typecheck`. Lint: not yet configured.
-- Tests: Rust unit tests via `cargo test` in `src-tauri/`. Frontend tests via `pnpm test` (Vitest).
+- Tests: Rust unit tests via `cargo test` in `src-tauri/` (60 tests). Frontend tests via `pnpm test` (Vitest).
 
 ## Tech stack
 
 - **Frontend**: React 18, TypeScript (strict), Tailwind CSS v4, Vite 6.
-- **Backend**: Rust, Tauri 2, rodio (audio), rusqlite (bundled SQLite), sha2, flate2.
+- **Backend**: Rust (edition 2021, MSRV 1.87), Tauri 2, rodio (audio), rusqlite (bundled SQLite), sha2, flate2, wsola (time-stretching).
 - **Plugins**: `tauri-plugin-dialog` (file pickers), `tauri-plugin-shell` (Show in Finder).
 - **Icons**: Generated via `scripts/generate-icons.mjs` (sharp + SVG source in `.dev/icon-source.svg`).
 - **Frontend tests**: Vitest (configured in `package.json`, run via `pnpm test`).
+- **macOS release**: `scripts/build.sh` → `scripts/package-dmg.sh` for unsigned DMG.
 
 ## Product boundaries
 
@@ -43,3 +44,5 @@
 - Keyboard shortcuts in `src/hooks/useKeyboardShortcuts.ts`.
 - Scratch verification artifacts go in `.dev/` (gitignored).
 - Real samples in `loopersFlash/` (gitignored, never in CI).
+- SQLite schema versioned via `PRAGMA user_version`; all migrations in `library/mod.rs`.
+- Waveform cache stored under `<library>/.olooper-cache/waveforms/`.

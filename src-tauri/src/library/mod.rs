@@ -14,12 +14,13 @@ use sha2::{Digest as _, Sha256};
 use crate::import::swf::Sound;
 
 /// Current schema version (`PRAGMA user_version`).
-const SCHEMA_VERSION: i32 = 2;
+const SCHEMA_VERSION: i32 = 5;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Track {
     pub id: i64,
     pub title: String,
+    pub looper_name: String,
     pub file_path: String,
     /// False when the file was moved/deleted outside the app.
     pub exists: bool,
@@ -40,6 +41,9 @@ pub struct Track {
     pub loop_enabled: bool,
     pub imported_at: i64,
     pub updated_at: i64,
+    pub favorite: bool,
+    pub tags: String,
+    pub last_played_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -80,7 +84,7 @@ pub fn sanitize_name(raw: &str) -> String {
             }
         })
         .collect();
-        // Collapse repeats of the replacement without allocating per char.
+    // Collapse repeats of the replacement without allocating per char.
     while s.contains("__") {
         s = s.replace("__", "_");
     }
@@ -140,42 +144,47 @@ impl Library {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT id,title,file_path,source_type,source_path,source_hash,\
+                "SELECT id,title,looper_name,file_path,source_type,source_path,source_hash,\
                  source_sound_id,codec,sample_rate,channels,duration_ms,\
                  bpm,bpm_confidence,bpm_source,primary_cue_ms,loop_start_ms,\
-                 loop_end_ms,loop_enabled,imported_at,updated_at \
+                   loop_end_ms,loop_enabled,imported_at,updated_at,favorite,tags,last_played_at \
                  FROM tracks ORDER BY id",
             )
             .map_err(|e| e.to_string())?;
         let rows = stmt
             .query_map([], |r| {
-                let file_path: String = r.get(2)?;
+                let file_path: String = r.get(3)?;
                 Ok(Track {
                     id: r.get(0)?,
                     title: r.get(1)?,
+                    looper_name: r.get(2)?,
                     file_path: file_path.clone(),
                     exists: Path::new(&file_path).is_file(),
-                    source_type: r.get(3)?,
-                    source_path: r.get(4)?,
-                    source_hash: r.get(5)?,
-                    source_sound_id: r.get(6)?,
-                    codec: r.get(7)?,
-                    sample_rate: r.get(8)?,
-                    channels: r.get(9)?,
-                    duration_ms: r.get(10)?,
-                    bpm: r.get(11)?,
-                    bpm_confidence: r.get(12)?,
-                    bpm_source: r.get(13)?,
-                    primary_cue_ms: r.get(14)?,
-                    loop_start_ms: r.get(15)?,
-                    loop_end_ms: r.get(16)?,
-                    loop_enabled: r.get(17)?,
-                    imported_at: r.get(18)?,
-                    updated_at: r.get(19)?,
+                    source_type: r.get(4)?,
+                    source_path: r.get(5)?,
+                    source_hash: r.get(6)?,
+                    source_sound_id: r.get(7)?,
+                    codec: r.get(8)?,
+                    sample_rate: r.get(9)?,
+                    channels: r.get(10)?,
+                    duration_ms: r.get(11)?,
+                    bpm: r.get(12)?,
+                    bpm_confidence: r.get(13)?,
+                    bpm_source: r.get(14)?,
+                    primary_cue_ms: r.get(15)?,
+                    loop_start_ms: r.get(16)?,
+                    loop_end_ms: r.get(17)?,
+                    loop_enabled: r.get(18)?,
+                    imported_at: r.get(19)?,
+                    updated_at: r.get(20)?,
+                    favorite: r.get(21)?,
+                    tags: r.get(22)?,
+                    last_played_at: r.get(23)?,
                 })
             })
             .map_err(|e| e.to_string())?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())
     }
 
     pub fn get_track(&self, id: i64) -> Result<Option<Track>, String> {
@@ -187,6 +196,7 @@ impl Library {
     pub fn add_track(
         &self,
         title: &str,
+        looper_name: &str,
         file_path: &Path,
         source_type: &str,
         source_path: &str,
@@ -205,16 +215,17 @@ impl Library {
             .conn
             .execute(
                 "INSERT INTO tracks(\
-                 title,file_path,source_type,source_path,source_hash,source_sound_id,\
+                 title,looper_name,file_path,source_type,source_path,source_hash,source_sound_id,\
                  exe_offset,exe_length,codec,sample_rate,channels,duration_ms,\
                  seek_samples,trimmed_leading,\
                  primary_cue_ms,loop_start_ms,loop_end_ms,loop_enabled,\
                  imported_at,updated_at) \
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,\
-                 0,0,?12,1,?15,?15) \
+                  VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,\
+                  0,0,?13,1,?16,?16) \
                  ON CONFLICT(source_hash,source_sound_id) DO NOTHING",
                 rusqlite::params![
                     title,
+                    looper_name,
                     file_path.to_str().ok_or("non-UTF8 path")?,
                     source_type,
                     source_path,
@@ -307,6 +318,145 @@ impl Library {
         Ok(n == 1)
     }
 
+    pub fn set_favorite(&self, id: i64, favorite: bool) -> Result<Track, String> {
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE tracks SET favorite=?1,updated_at=?2 WHERE id=?3",
+                rusqlite::params![favorite, now_secs(), id],
+            )
+            .map_err(|e| e.to_string())?;
+        if changed == 0 {
+            return Err(format!("track {id} not found"));
+        }
+        self.get_track(id)?
+            .ok_or_else(|| format!("track {id} vanished"))
+    }
+
+    pub fn update_metadata(&self, id: i64, title: &str, bpm: Option<f64>, tags: &str) -> Result<Track, String> {
+        let title = sanitize_name(title);
+        if let Some(bpm) = bpm {
+            if !(20.0..=300.0).contains(&bpm) { return Err("bpm outside 20–300".to_string()); }
+        }
+        let tags = tags.split(',').map(sanitize_name).filter(|tag| tag != "untitled").collect::<Vec<_>>().join(", ");
+        let changed = self.conn.execute("UPDATE tracks SET title=?1,bpm=?2,bpm_source=CASE WHEN ?2 IS NULL THEN bpm_source ELSE 'manual' END,tags=?3,updated_at=?4 WHERE id=?5", rusqlite::params![title, bpm, tags, now_secs(), id]).map_err(|e| e.to_string())?;
+        if changed == 0 { return Err(format!("track {id} not found")); }
+        self.get_track(id)?.ok_or_else(|| format!("track {id} vanished"))
+    }
+
+    pub fn mark_played(&self, id: i64) -> Result<(), String> {
+        let changed = self.conn.execute("UPDATE tracks SET last_played_at=?1 WHERE id=?2", rusqlite::params![now_secs(), id]).map_err(|e| e.to_string())?;
+        if changed == 0 { return Err(format!("track {id} not found")); }
+        Ok(())
+    }
+
+    /// Copy selected audio to a user-owned directory. Never overwrite or move a source.
+    pub fn export_tracks(&self, ids: &[i64], destination: &Path) -> Result<usize, String> {
+        if ids.is_empty() { return Err("select at least one loop to export".to_string()); }
+        let destination = destination.canonicalize().map_err(|e| format!("cannot use export folder: {e}"))?;
+        if !destination.is_dir() { return Err("export destination is not a folder".to_string()); }
+        let mut exported = 0;
+        for id in ids {
+            let track = self.get_track(*id)?.ok_or_else(|| format!("track {id} not found"))?;
+            let source = Path::new(&track.file_path);
+            if !source.is_file() { return Err(format!("audio for '{}' is missing", track.title)); }
+            let extension = source.extension().and_then(|value| value.to_str()).unwrap_or("wav");
+            let stem = sanitize_name(&track.title);
+            let mut target = destination.join(format!("{stem}.{extension}"));
+            for suffix in 2..=10_000 {
+                if !target.exists() { break; }
+                target = destination.join(format!("{stem} ({suffix}).{extension}"));
+            }
+            if target.exists() { return Err(format!("too many files named '{stem}' in export folder")); }
+            std::fs::copy(source, &target).map_err(|e| format!("cannot export '{}': {e}", track.title))?;
+            exported += 1;
+        }
+        Ok(exported)
+    }
+
+    fn group_tracks(&self, source_hash: &str) -> Result<Vec<Track>, String> {
+        let tracks: Vec<_> = self
+            .list_tracks()?
+            .into_iter()
+            .filter(|track| track.source_hash == source_hash)
+            .collect();
+        if tracks.is_empty() {
+            return Err("looper group not found".to_string());
+        }
+        Ok(tracks)
+    }
+
+    pub fn group_directory(&self, source_hash: &str) -> Result<PathBuf, String> {
+        let track = self.group_tracks(source_hash)?.into_iter().next().unwrap();
+        let dir = PathBuf::from(track.file_path)
+            .parent()
+            .ok_or("track has no parent directory")?
+            .to_path_buf();
+        let root = self
+            .root
+            .canonicalize()
+            .map_err(|e| format!("cannot resolve library root: {e}"))?;
+        let canonical = dir
+            .canonicalize()
+            .map_err(|e| format!("looper folder is missing: {e}"))?;
+        if !canonical.starts_with(&root) {
+            return Err("looper folder is outside the library".to_string());
+        }
+        Ok(canonical)
+    }
+
+    /// Rename the derived-audio folder and its catalog label. Source files stay untouched.
+    pub fn rename_looper(&self, source_hash: &str, new_name: &str) -> Result<(), String> {
+        let tracks = self.group_tracks(source_hash)?;
+        if tracks[0].source_type == "custom" {
+            return Err("custom loops cannot be renamed as a group".to_string());
+        }
+        let new_name = sanitize_name(new_name);
+        let old_dir = self.group_directory(source_hash)?;
+        let new_dir = self.root.join(&new_name);
+        if old_dir == new_dir {
+            return Ok(());
+        }
+        if new_dir.exists() {
+            return Err("a looper folder with that name already exists".to_string());
+        }
+        std::fs::rename(&old_dir, &new_dir)
+            .map_err(|e| format!("cannot rename looper folder: {e}"))?;
+        let old_prefix = old_dir.to_string_lossy();
+        let new_prefix = new_dir.to_string_lossy();
+        let old_name = &tracks[0].looper_name;
+        let result = self.conn.execute(
+            "UPDATE tracks SET looper_name=?1,file_path=REPLACE(file_path,?2,?3),\
+             title=REPLACE(title,?4,?5),updated_at=?6 WHERE source_hash=?7",
+            rusqlite::params![
+                new_name,
+                old_prefix,
+                new_prefix,
+                old_name,
+                new_name,
+                now_secs(),
+                source_hash
+            ],
+        );
+        if let Err(error) = result {
+            let _ = std::fs::rename(&new_dir, &old_dir);
+            return Err(error.to_string());
+        }
+        Ok(())
+    }
+
+    /// Remove metadata and slots only; preserved sources and audio stay on disk.
+    pub fn remove_looper(&self, source_hash: &str) -> Result<usize, String> {
+        let n = self
+            .conn
+            .execute("DELETE FROM tracks WHERE source_hash=?1", [source_hash])
+            .map_err(|e| e.to_string())?;
+        if n == 0 {
+            return Err("looper group not found".to_string());
+        }
+        Ok(n)
+    }
+
     // --- Loop slots ---
 
     pub fn get_slots(&self, track_id: i64) -> Result<Vec<LoopSlot>, String> {
@@ -331,7 +481,8 @@ impl Library {
                 })
             })
             .map_err(|e| e.to_string())?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())
     }
 
     pub fn set_slot(
@@ -453,7 +604,7 @@ impl Library {
             exe_offset,
             exe_length,
             sounds,
-            |_, _, _| {},
+            |_, _, _| Ok(()),
         )
     }
 
@@ -470,7 +621,7 @@ impl Library {
         mut progress: F,
     ) -> Result<ImportReport, String>
     where
-        F: FnMut(&str, usize, usize),
+        F: FnMut(&str, usize, usize) -> Result<(), String>,
     {
         if sounds.is_empty() {
             return Err("no extractable sounds".to_string());
@@ -501,14 +652,14 @@ impl Library {
                 track_ids.push(id);
                 continue;
             }
-            if s.format != crate::import::swf::FORMAT_MP3 || s.frames.is_empty() {
+            if s.frames.is_empty() {
                 failed.push(FailedSound {
                     id: s.id as i64,
                     reason: "unsupported or empty sound".to_string(),
                 });
                 continue;
             }
-            progress("extracting", current, total);
+            progress("extracting", current, total)?;
             let buf = match crate::player::decode_bytes(&s.frames) {
                 Ok(b) => b,
                 Err(e) => {
@@ -520,15 +671,16 @@ impl Library {
                     continue;
                 }
             };
-            progress("adjusting BPM", current, total);
+            progress("adjusting BPM", current, total)?;
             let estimate = crate::analysis::estimate(&buf);
-            progress("adjusting loops", current, total);
-            let dest = dir.join(format!("{:02}_{}.mp3", i + 1, s.id));
+            progress("adjusting loops", current, total)?;
+            let dest = dir.join(format!("{:02}_{}.{}", i + 1, s.id, s.codec));
             let final_path = self.atomic_write(&dest, &s.frames)?;
             let title = format!("{:02} · {}", i + 1, looper);
-            progress("inserting in library", current, total);
+            progress("inserting in library", current, total)?;
             match self.add_track(
                 &title,
+                &looper,
                 &final_path,
                 source_type,
                 source_path,
@@ -536,7 +688,7 @@ impl Library {
                 s.id as i64,
                 exe_offset,
                 exe_length,
-                "mp3",
+                &s.codec,
                 &buf,
                 s.seek_samples as i64,
                 s.trimmed_leading as i64,
@@ -637,10 +789,7 @@ impl Library {
                 error: Some("already in library".to_string()),
             };
         }
-        let stem = src
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("loop");
+        let stem = src.file_stem().and_then(|s| s.to_str()).unwrap_or("loop");
         let ext = src
             .extension()
             .and_then(|s| s.to_str())
@@ -667,6 +816,7 @@ impl Library {
             .to_string();
         match self.add_track(
             &title,
+            "Custom Loops",
             &final_path,
             "custom",
             path,
@@ -716,7 +866,9 @@ fn migrate(conn: &Connection) -> Result<(), String> {
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .map_err(|e| e.to_string())?;
     if v > SCHEMA_VERSION {
-        return Err(format!("database schema v{v} is newer than supported v{SCHEMA_VERSION}"));
+        return Err(format!(
+            "database schema v{v} is newer than supported v{SCHEMA_VERSION}"
+        ));
     }
     if v == 0 {
         conn.execute_batch(
@@ -752,7 +904,7 @@ fn migrate(conn: &Connection) -> Result<(), String> {
              PRAGMA user_version = 1;
              COMMIT;",
         )
-         .map_err(|e| format!("migration 0→1 failed: {e}"))?;
+        .map_err(|e| format!("migration 0→1 failed: {e}"))?;
     }
     if v < 2 {
         conn.execute_batch(
@@ -771,6 +923,59 @@ fn migrate(conn: &Connection) -> Result<(), String> {
              COMMIT;",
         )
         .map_err(|e| format!("migration 1→2 failed: {e}"))?;
+    }
+    if v < 3 {
+        conn.execute_batch(
+            "BEGIN;
+             ALTER TABLE tracks ADD COLUMN looper_name TEXT NOT NULL DEFAULT 'Imported Looper';
+             PRAGMA user_version = 3;
+             COMMIT;",
+        )
+        .map_err(|e| format!("migration 2→3 failed: {e}"))?;
+        let mut stmt = conn
+            .prepare("SELECT id,source_type,source_path FROM tracks")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(|e| e.to_string())?;
+        let rows = rows
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        for (id, source_type, source_path) in rows {
+            let name = if source_type == "custom" {
+                "Custom Loops".to_string()
+            } else {
+                Path::new(&source_path)
+                    .file_stem()
+                    .and_then(|name| name.to_str())
+                    .map(sanitize_name)
+                    .unwrap_or_else(|| "Imported Looper".to_string())
+            };
+            conn.execute(
+                "UPDATE tracks SET looper_name=?1 WHERE id=?2",
+                rusqlite::params![name, id],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+    }
+    if v < 4 {
+        conn.execute_batch(
+            "BEGIN;
+             ALTER TABLE tracks ADD COLUMN favorite INTEGER NOT NULL DEFAULT 0;
+             PRAGMA user_version = 4;
+             COMMIT;",
+        )
+        .map_err(|e| format!("migration 3→4 failed: {e}"))?;
+    }
+    if v < 5 {
+        conn.execute_batch("BEGIN; ALTER TABLE tracks ADD COLUMN tags TEXT NOT NULL DEFAULT ''; ALTER TABLE tracks ADD COLUMN last_played_at INTEGER; PRAGMA user_version = 5; COMMIT;")
+            .map_err(|e| format!("migration 4→5 failed: {e}"))?;
     }
     Ok(())
 }

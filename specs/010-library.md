@@ -22,6 +22,12 @@ normal files under a configurable library root. Covers import flows for
 6. The library presents each loop with its source looper, loop name, duration,
    and BPM. Automatically analyzed BPM is normalized by octave into 65–150 BPM;
    user-entered BPM is never changed.
+7. A source-looper group can be renamed, revealed in the file manager, or
+   removed from the catalog. Removing a group removes its tracks and loop slots
+   only; extracted audio and the preserved source file remain on disk.
+8. Each loop can be marked as a persistent favorite. The visible per-loop
+   trash control removes that loop from the catalog after confirmation; it does
+   not delete the derived audio or preserved source file.
 
 ## Supported inputs
 
@@ -44,12 +50,16 @@ normal files under a configurable library root. Covers import flows for
   left behind (empty dirs removed).
 - DB open/migration failure → app starts with library disabled + message,
   never with a half-migrated schema (migrations run in one transaction).
+- Group rename rejects an empty name or a destination folder that already
+  exists; the filesystem rename and catalog update are rolled back on failure.
 
 ## Persistence behavior
 
 - Schema versioned via `PRAGMA user_version`; migrations 0→1→2 explicit,
   forward-only, tested on a temp DB. Downgrades unsupported (clear error).
 - v1→v2 adds `loop_slots` table with `ON DELETE CASCADE`.
+- v2→v3 adds the editable `looper_name` catalog field.
+- v3→v4 adds the persistent `favorite` flag.
 - `updated_at` bumps on every user edit; `imported_at` never changes.
 - Foreign keys enforced via `PRAGMA foreign_keys = ON`.
 

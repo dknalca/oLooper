@@ -1,7 +1,8 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import {
   importCustom,
+  cancelImport,
   importExe,
   importSwf,
   listenImportProgress,
@@ -33,6 +34,7 @@ export default function ImportBar({ onImported }: Props) {
   const [startedAt, setStartedAt] = useState<number | null>(null);
   const [elapsed, setElapsed] = useState(0);
   const [notice, setNotice] = useState<string | null>(null);
+  const cancelQueue = useRef(false);
 
   const startProgress = (detail: string) => setProgress({
     job_id: "pending",
@@ -45,10 +47,17 @@ export default function ImportBar({ onImported }: Props) {
   });
 
   const beginImport = (paths: string[]) => {
+    cancelQueue.current = false;
     setFiles(paths.map((path) => ({ path, stage: "Queued", done: false, error: null })));
     setStartedAt(Date.now());
     setElapsed(0);
     startProgress(`${paths.length} file(s) ready`);
+  };
+
+  const requestCancel = () => {
+    cancelQueue.current = true;
+    if (progress?.job_id && progress.job_id !== "pending") cancelImport(progress.job_id).catch((e) => setError(String(e)));
+    setFiles((current) => current.map((file) => file.stage === "Queued" ? { ...file, stage: "Cancelled", done: true } : file));
   };
 
   const finishProgress = (error: string | null = null) => {
@@ -92,13 +101,19 @@ export default function ImportBar({ onImported }: Props) {
           beginImport(paths);
           setError(null);
           setReport(null);
-          Promise.allSettled(paths.map(async (path) => {
-            const kind = importKindForPath(path);
-            if (kind === "swf") return importSwf(path);
-            if (kind === "exe") return importExe(path);
-            return importCustom([path]);
-          }))
-            .then((results) => {
+          (async () => {
+            const results: PromiseSettledResult<ImportReport | Awaited<ReturnType<typeof importCustom>>>[] = [];
+            for (const path of paths) {
+              if (cancelQueue.current) break;
+              setFiles((current) => current.map((file) => file.path === path ? { ...file, stage: "Preparing", done: false } : file));
+              try {
+                const kind = importKindForPath(path);
+                const value = kind === "swf" ? await importSwf(path) : kind === "exe" ? await importExe(path) : await importCustom([path]);
+                results.push({ status: "fulfilled", value });
+              } catch (reason) {
+                results.push({ status: "rejected", reason });
+              }
+            }
               const reports = results
                 .filter((result): result is PromiseFulfilledResult<ImportReport | Awaited<ReturnType<typeof importCustom>>> => result.status === "fulfilled")
                 .map((result) => result.value);
@@ -122,8 +137,8 @@ export default function ImportBar({ onImported }: Props) {
                 setTimeout(() => setDragCount(null), 3000);
               }
               onImported();
-            })
-            .finally(() => setBusy(false));
+            setBusy(false);
+          })();
         } else {
           setDragging(false);
         }
@@ -218,7 +233,7 @@ export default function ImportBar({ onImported }: Props) {
         </div>
       )}
 
-      {progress && <ImportProgressModal progress={progress} files={files} elapsed={elapsed} onClose={() => setProgress(null)} />}
+      {progress && <ImportProgressModal progress={progress} files={files} elapsed={elapsed} onClose={() => setProgress(null)} onCancel={busy ? requestCancel : null} />}
       {notice && <div className="fixed right-4 top-14 z-[80] rounded border border-success/40 bg-surface px-4 py-3 text-xs text-success shadow-xl" role="status">{notice}</div>}
 
       <div className="flex items-center gap-2 px-4 py-2 bg-surface border-t border-border">
@@ -270,11 +285,13 @@ function ImportProgressModal({
   files,
   elapsed,
   onClose,
+  onCancel,
 }: {
   progress: ImportProgress;
   files: ImportFileState[];
   elapsed: number;
   onClose: () => void;
+  onCancel: (() => void) | null;
 }) {
   const progressText = progress.total > 0 ? `${progress.current} / ${progress.total}` : "";
   const fraction = progress.total > 0 ? Math.min(1, progress.current / progress.total) : 0;
@@ -317,6 +334,9 @@ function ImportProgressModal({
           <div className="mt-5 flex justify-end">
             <button onClick={onClose} className="rounded bg-border px-3 py-1.5 text-xs text-text hover:bg-surface-hover">Close</button>
           </div>
+        )}
+        {!progress.done && onCancel && (
+          <div className="mt-5 flex justify-end"><button onClick={onCancel} className="rounded border border-danger/50 px-3 py-1.5 text-xs text-danger hover:bg-danger/10">Cancel queue</button></div>
         )}
       </div>
     </div>

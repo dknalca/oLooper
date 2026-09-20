@@ -1,12 +1,33 @@
-#!/bin/bash
-# Build oLooper.app for local testing
+#!/usr/bin/env bash
+# Build a self-contained oLooper.app for local testing.
 # Usage: ./scripts/build.sh [--dev]
 
-set -e
+set -euo pipefail
 
-export PATH="$HOME/.nvm/versions/node/v22.23.2/bin:$PATH"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT"
 
-if [ "$1" = "--dev" ]; then
+case "${1:-}" in
+  "") BUILD_MODE="release" ;;
+  --dev) BUILD_MODE="debug" ;;
+  *)
+    echo "Usage: ./scripts/build.sh [--dev]" >&2
+    exit 2
+    ;;
+esac
+
+command -v node >/dev/null || { echo "Node.js is required." >&2; exit 1; }
+command -v pnpm >/dev/null || { echo "pnpm is required." >&2; exit 1; }
+
+echo "Installing locked dependencies..."
+pnpm install --frozen-lockfile
+
+echo "Generating application icons..."
+node scripts/generate-icons.mjs
+test -s src-tauri/icons/icon.icns
+test -s src-tauri/icons/icon.png
+
+if [ "$BUILD_MODE" = "debug" ]; then
   echo "Building dev bundle..."
   pnpm run tauri build --debug
   SRC="src-tauri/target/debug/bundle/macos/oLooper.app"
@@ -16,7 +37,9 @@ else
   SRC="src-tauri/target/release/bundle/macos/oLooper.app"
 fi
 
-cp -R "$SRC" ./oLooper.app
+test -d "$SRC"
+rm -rf ./oLooper.app
+ditto "$SRC" ./oLooper.app
 
 echo ""
 echo "Done! App at:"

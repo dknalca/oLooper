@@ -4,22 +4,29 @@ A desktop app for DJs and turntablists to extract and practice with audio loops 
 
 ## Features
 
-- **SWF extraction** — drop a `.swf`, get all embedded MP3 loops as practice tracks
+- **SWF extraction** — drop a `.swf`, get all embedded MP3 and ADPCM loops as practice tracks
 - **EXE projector extraction** — drop a projector `.exe`, locate the embedded SWF, same pipeline
-- **Custom audio import** — WAV/MP3 drop or browse, instantly playable with BPM detection
-- **Persistent library** — SQLite catalog survives restarts, deduplicates on import
+- **Custom audio import** — WAV/MP3 drop or browse, instantly playable
+- **Persistent library** — SQLite catalog (schema v5) survives restarts, deduplicates on import
 - **Practice player** — play/pause/stop, gapless region looping, volume, seek
-- **Waveform display** — scrolling DJ-style waveform with loop overlay and click-to-seek
+- **Speed control** — 50–200% playback speed in 5% steps, with optional pitch lock (WSOLA time-stretching)
+- **BPM detection** — automatic energy-flux onset analysis, normalized to 65–150 BPM; manual BPM overrides are preserved
+- **Waveform display** — scrolling DJ-style waveform with loop overlay, click-to-seek, and persistent disk cache
 - **4 cue/loop slots** — A-D slots per track, persisted to SQLite, auto-load on select
-- **Keyboard shortcuts** — Space, S, arrows, L, [, ], Cmd+O for hands-free practice
+- **Favorites** — mark loops as favorites for quick access
+- **Keyboard shortcuts** — Space, S, arrows, L, [, ], +, -, Cmd+O for hands-free practice
+- **Library management** — search, filter (source/BPM/duration), sort, favorites-only, context menus (reveal in Finder, edit metadata, remove)
+- **Looper groups** — rename source folders, remove groups (preserves audio on disk)
+- **Import modal** — staged progress UI with per-file status, elapsed time, and cancel support
 - **Native file dialogs** — OS-native file pickers for import and library setup
 - **Dark UI** — Tailwind CSS v4, sidebar layout, context menus, track stats
-- **Custom icon** — waveform loop "O" design in Dock and Finder
+- **Custom icon** — waveform loop "O" design with large "O" background in Dock and Finder
+- **macOS release** — build script produces `.app`; optional DMG packaging via `package-dmg.sh`
 
 ## Requirements
 
 - macOS 12+ (primary target; architecture is cross-platform)
-- Rust 1.77+
+- Rust 1.87+
 - Node.js 22+
 - pnpm 9+
 
@@ -32,12 +39,30 @@ pnpm install
 # Development mode (hot-reload)
 pnpm tauri dev
 
-# Production build
+# Production build (generates icons + .app)
 ./scripts/build.sh           # release, copies .app to project root
 ./scripts/build.sh --dev     # debug (faster, with logs)
+
+# Optional: package as DMG
+./scripts/package-dmg.sh     # produces dist/oLooper-<version>-unsigned.dmg
 ```
 
 The built `.app` bundle will be at `./oLooper.app` in the project root.
+
+## Testing
+
+```bash
+# Rust unit tests (60 tests: parser, player, library, waveform, analysis)
+cd src-tauri && cargo test
+
+# Frontend tests (Vitest)
+pnpm test
+
+# Typecheck
+pnpm run typecheck
+```
+
+Real SWF/EXE fixtures in `loopersFlash/` (gitignored) are used for manual validation via `#[ignore]` tests.
 
 ## Keyboard shortcuts
 
@@ -49,6 +74,7 @@ The built `.app` bundle will be at `./oLooper.app` in the project root.
 | `L` | Toggle loop on/off |
 | `[` | Set loop start = current position |
 | `]` | Set loop end = current position |
+| `+` `-` | Change playback speed (5% steps, 50–200%) |
 | `Cmd+O` | Open file picker for import |
 
 Shortcuts are disabled while typing in text fields.
@@ -61,27 +87,29 @@ src/                     Frontend (React + TypeScript + Tailwind)
 ├── main.tsx             Entry point (CSS import)
 ├── index.css            Tailwind + design tokens
 ├── tauri.ts             Typed Tauri command bridge + dialog wrappers
+├── importFlow.ts        Import routing helpers
 ├── hooks/               React hooks
 │   └── useKeyboardShortcuts.ts
 └── components/          UI components
     ├── TopBar.tsx       Header with version + library init + folder picker
-    ├── Sidebar.tsx      Track list with search + context menu + stats
-    ├── Player.tsx       Transport + scrub + loop + A-D slot selector
+    ├── Sidebar.tsx      Track list with search/filter/sort + context menus
+    ├── Player.tsx       Transport + scrub + loop + speed + A-D slot selector
     ├── Waveform.tsx     Canvas waveform with playhead + loop overlay
-    ├── ImportBar.tsx    File import with native browse buttons + drag-drop
+    ├── ImportBar.tsx    File import with browse buttons + drag-drop + progress modal
     └── Logo.tsx         Waveform loop "O" logo component
 
 src-tauri/               Backend (Rust)
-├── src/lib.rs           Tauri commands + app builder
-├── src/player/mod.rs    Audio engine (rodio, region loop)
-├── src/library/mod.rs   SQLite catalog + file management + loop slots
-├── src/import/          SWF/EXE parsers
-├── src/waveform.rs      Peak computation
-└── src/analysis.rs      BPM estimator
+├── src/lib.rs           Tauri commands + app builder + portable storage
+├── src/player/mod.rs    Audio engine (rodio, region loop, speed, pitch lock)
+├── src/library/mod.rs   SQLite catalog (schema v5) + file management + loop slots
+├── src/import/          SWF/EXE parsers (MP3 + ADPCM + SoundStreamBlock)
+├── src/waveform.rs      Peak computation + persistent disk cache
+└── src/analysis.rs      BPM estimator (energy-flux autocorrelation)
 
 scripts/                 Build & utility scripts
-├── build.sh             Build .app bundle (release or debug)
-└── generate-icons.mjs   SVG → PNG + icns icon generation
+├── build.sh             Generate icons + build .app bundle (release or debug)
+├── generate-icons.mjs   SVG → PNG + icns icon generation
+└── package-dmg.sh       Package .app as unsigned DMG
 
 specs/                   Feature specifications
 ├── 000-product-foundation.md
@@ -94,15 +122,12 @@ specs/                   Feature specifications
 ├── 060-keyboard-shortcuts.md
 ├── 060-reliability-hardening.md
 ├── 070-loop-slots.md
-└── 080-portable-drop-import.md
+├── 080-portable-drop-import.md
+└── 090-library-workflow-completion.md
 
-docs/adr/                Architecture decision records
-├── 0001-tauri-react-rust-sqlite.md
-├── 0002-audio-backend-rodio.md
-├── 0003-loopersflash-local-inbox.md
-├── 0004-ui-redesign-tailwind.md
-├── 0005-dialog-plugin.md
-└── 0006-portable-storage-and-bundle-id.md
+docs/                    Documentation
+├── adr/                 Architecture decision records (0001–0006)
+└── macos-release.md     macOS signing and notarization guide
 ```
 
 ## License

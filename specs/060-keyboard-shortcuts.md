@@ -24,6 +24,8 @@ No global shortcuts plugin; listener runs only while the app window is focused.
 | `←` (Left arrow) | Seek -5 seconds | Track loaded |
 | `→` (Right arrow) | Seek +5 seconds | Track loaded |
 | `L` | Toggle loop on/off | Track loaded |
+| `+` | Increase speed by 5% (50–200%) | Track loaded |
+| `-` | Decrease speed by 5% (50–200%) | Track loaded |
 | `[` | Set loop start = current position | Track loaded, loop enabled |
 | `]` | Set loop end = current position | Track loaded, loop enabled |
 | `Cmd+O` / `Ctrl+O` | Open file picker for import | Library initialized |
@@ -59,6 +61,7 @@ No global shortcuts plugin; listener runs only while the app window is focused.
 - [x] S stops playback and returns to loop start.
 - [x] Arrow keys seek ±5s, clamped to track bounds.
 - [x] L toggles loop enabled flag.
+- [x] `+` and `-` change playback speed in 5% steps (50–200%).
 - [x] `[` and `]` set loop start/end to current position and update the player.
 - [x] `Cmd+O` opens native file picker; selected files import automatically.
 - [x] No shortcuts fire when typing in an input field.

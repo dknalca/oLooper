@@ -4,6 +4,7 @@
 //! No per-frame decoding: rendering works purely from this aggregate.
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 
 /// Bounds for client-requested bucket counts (allocation safety).
 pub const MIN_BUCKETS: usize = 64;
@@ -64,6 +65,64 @@ pub fn from_buffer(buf: &crate::player::LoopBuffer, buckets: usize) -> WaveformD
 pub fn compute(data: &[u8], buckets: usize) -> Result<WaveformData, String> {
     let buf = crate::player::decode_bytes(data)?;
     Ok(from_buffer(&buf, buckets))
+}
+
+fn cache_key(path: &std::path::Path, buckets: usize) -> Result<String, String> {
+    let canonical = path
+        .canonicalize()
+        .map_err(|e| format!("cannot resolve audio path: {e}"))?;
+    let meta = canonical
+        .metadata()
+        .map_err(|e| format!("cannot inspect audio path: {e}"))?;
+    let modified = meta
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|time| time.as_nanos())
+        .unwrap_or(0);
+    Ok(format!(
+        "{:x}",
+        Sha256::digest(
+            format!(
+                "{}:{}:{modified}:{}",
+                canonical.display(),
+                meta.len(),
+                clamp_buckets(buckets)
+            )
+            .as_bytes()
+        )
+    ))
+}
+
+/// Read a derived waveform cache entry or calculate and atomically store it.
+pub fn cached_from_buffer(
+    cache_dir: &std::path::Path,
+    path: &std::path::Path,
+    buckets: usize,
+    buffer: &crate::player::LoopBuffer,
+) -> Result<WaveformData, String> {
+    let buckets = clamp_buckets(buckets);
+    let key = cache_key(path, buckets)?;
+    let target = cache_dir.join(format!("{key}.json"));
+    if let Ok(data) = std::fs::read(&target) {
+        if let Ok(cached) = serde_json::from_slice::<WaveformData>(&data) {
+            if cached.buckets == buckets && cached.peaks.len() == buckets {
+                return Ok(cached);
+            }
+        }
+    }
+    let waveform = from_buffer(buffer, buckets);
+    if std::fs::create_dir_all(cache_dir).is_ok() {
+        if let Ok(data) = serde_json::to_vec(&waveform) {
+            let tmp = target.with_extension("json.tmp");
+            if std::fs::write(&tmp, data).is_ok() {
+                if std::fs::rename(&tmp, &target).is_err() {
+                    let _ = std::fs::remove_file(&tmp);
+                }
+            }
+        }
+    }
+    Ok(waveform)
 }
 
 #[cfg(test)]

@@ -22,6 +22,9 @@ Waveform rendering and library integration are separate specs.
    L (loop toggle), [ / ] (set loop start/end).
 8. Loop slots (spec 070): A–D buttons in player; click empty to save, click
    filled to load. Auto-loads slot A on track load.
+9. `+` and `-` change playback speed in 5% steps from 50% to 200%. This is
+   vinyl-style playback, so pitch changes with speed. The visible pitch-lock
+   control is disabled until the audio engine gains portable time-stretching.
 
 ## Supported inputs
 

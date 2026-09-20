@@ -28,6 +28,19 @@ pub fn define_sound_tag(id: u16, format: u8, payload: &[u8]) -> Vec<u8> {
     tag
 }
 
+#[cfg(test)]
+pub fn swf_tag(code: u16, body: &[u8]) -> Vec<u8> {
+    let mut tag = Vec::new();
+    if body.len() < 0x3F {
+        tag.extend_from_slice(&((code << 6) | body.len() as u16).to_le_bytes());
+    } else {
+        tag.extend_from_slice(&((code << 6) | 0x3F).to_le_bytes());
+        tag.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    }
+    tag.extend_from_slice(body);
+    tag
+}
+
 /// Minimal body: empty RECT + rate + count + tags + End.
 #[cfg(test)]
 pub fn swf_body(tags: &[u8]) -> Vec<u8> {

@@ -24,6 +24,7 @@
   "bundle": {
     "active": true,
     "category": "Music",
+    "icon": ["icons/icon.icns", "icons/icon.png"],
     "targets": ["app"]
   }
 }

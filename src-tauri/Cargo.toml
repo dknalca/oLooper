@@ -2,7 +2,7 @@
 name = "olooper"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.77"
+rust-version = "1.87"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -16,5 +16,6 @@ flate2 = "1"
 rodio = "0.20"
 rusqlite = { version = "0.32", features = ["bundled"] }
 sha2 = "0.10"
+wsola = "0.1"
 
 [dev-dependencies]

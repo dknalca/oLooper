@@ -13,8 +13,12 @@ pub const MAX_SWF_LEN: u32 = 256 * 1024 * 1024;
 
 /// `DefineSound` tag id.
 const TAG_DEFINE_SOUND: u16 = 14;
+const TAG_SOUND_STREAM_HEAD: u16 = 18;
+const TAG_SOUND_STREAM_BLOCK: u16 = 19;
+const TAG_SOUND_STREAM_HEAD2: u16 = 45;
 /// `DefineSound` format id for MP3.
 pub const FORMAT_MP3: u8 = 2;
+pub const FORMAT_ADPCM: u8 = 1;
 /// Highest SWF version we accept.
 pub(crate) const MAX_VERSION: u8 = 40;
 
@@ -71,6 +75,8 @@ pub fn user_message(e: &SwfError) -> String {
 pub struct Sound {
     pub id: u16,
     pub format: u8,
+    /// Container produced for the library. ADPCM is decoded to WAV; MP3 stays raw.
+    pub codec: String,
     /// Raw sample count from `DefineSound`.
     pub sample_count: u32,
     /// MP3 `SeekSamples` prefix (not audio); frames exclude it.
@@ -117,6 +123,15 @@ impl<'a> BitReader<'a> {
             self.bit += 1;
         }
         Ok(out)
+    }
+
+    fn read_signed(&mut self, n: usize) -> Result<i32, SwfError> {
+        let value = self.read_bits(n)? as i32;
+        Ok(if value & (1 << (n - 1)) != 0 {
+            value - (1 << n)
+        } else {
+            value
+        })
     }
 }
 
@@ -221,6 +236,90 @@ fn mp3_frame_start(data: &[u8]) -> Option<usize> {
     None
 }
 
+fn wav_from_adpcm(payload: &[u8], flags: u8, sample_count: u32) -> Option<Vec<u8>> {
+    if payload.is_empty() || sample_count == 0 || sample_count > 15 * 60 * 44_100 {
+        return None;
+    }
+    let rate = match (flags >> 2) & 0x03 {
+        0 => 5_512,
+        1 => 11_025,
+        2 => 22_050,
+        _ => 44_100,
+    };
+    let channels = if flags & 0x01 != 0 { 2usize } else { 1usize };
+    let mut bits = BitReader::new(payload);
+    let code_bits = bits.read_bits(2).ok()? as usize + 2;
+    let steps: [i32; 89] = [
+        7, 8, 9, 10, 11, 12, 13, 14, 16, 17, 19, 21, 23, 25, 28, 31, 34, 37, 41, 45, 50, 55, 60,
+        66, 73, 80, 88, 97, 107, 118, 130, 143, 157, 173, 190, 209, 230, 253, 279, 307, 337, 371,
+        408, 449, 494, 544, 598, 658, 724, 796, 876, 963, 1060, 1166, 1282, 1411, 1552, 1707, 1878,
+        2066, 2272, 2499, 2749, 3024, 3327, 3660, 4026, 4428, 4871, 5358, 5894, 6484, 7132, 7845,
+        8630, 9493, 10442, 11487, 12635, 13899, 15289, 16818, 18500, 20350, 22385, 24623, 27086,
+        29794, 32767,
+    ];
+    let index_adjust: &[i32] = match code_bits {
+        2 => &[-1, 2],
+        3 => &[-1, -1, 2, 4],
+        4 => &[-1, -1, -1, -1, 2, 4, 6, 8],
+        5 => &[-1, -1, -1, -1, -1, -1, -1, -1, 1, 2, 4, 6, 8, 10, 13, 16],
+        _ => return None,
+    };
+    let mut sample = Vec::with_capacity(channels);
+    let mut index = Vec::with_capacity(channels);
+    let total = sample_count as usize;
+    let mut pcm = Vec::with_capacity(total.checked_mul(channels)?.checked_mul(2)?);
+    for frame in 0..total {
+        // Flash ADPCM stores a fresh predictor and step index every 4095
+        // samples. ADPCMCodeSize is only present once at the stream start.
+        if frame % 4095 == 0 {
+            sample.clear();
+            index.clear();
+            for _ in 0..channels {
+                sample.push(bits.read_signed(16).ok()?);
+                index.push(bits.read_bits(6).ok()?.min(88) as usize);
+            }
+        }
+        for channel in 0..channels {
+            if frame % 4095 != 0 {
+                let code = bits.read_bits(code_bits).ok()? as usize;
+                let step = steps[index[channel]];
+                let mut diff = step >> (code_bits - 1);
+                for bit in 0..code_bits - 1 {
+                    if code & (1 << bit) != 0 {
+                        diff += step >> (code_bits - 2 - bit);
+                    }
+                }
+                if code & (1 << (code_bits - 1)) != 0 {
+                    sample[channel] -= diff;
+                } else {
+                    sample[channel] += diff;
+                }
+                sample[channel] = sample[channel].clamp(i16::MIN as i32, i16::MAX as i32);
+                index[channel] = (index[channel] as i32
+                    + index_adjust[code & (index_adjust.len() - 1)])
+                    .clamp(0, 88) as usize;
+            }
+            pcm.extend_from_slice(&(sample[channel] as i16).to_le_bytes());
+        }
+    }
+    let byte_rate = rate * channels as u32 * 2;
+    let mut wav = Vec::with_capacity(44 + pcm.len());
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&(36 + pcm.len() as u32).to_le_bytes());
+    wav.extend_from_slice(b"WAVEfmt ");
+    wav.extend_from_slice(&16u32.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes());
+    wav.extend_from_slice(&(channels as u16).to_le_bytes());
+    wav.extend_from_slice(&rate.to_le_bytes());
+    wav.extend_from_slice(&byte_rate.to_le_bytes());
+    wav.extend_from_slice(&((channels * 2) as u16).to_le_bytes());
+    wav.extend_from_slice(&16u16.to_le_bytes());
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&(pcm.len() as u32).to_le_bytes());
+    wav.extend_from_slice(&pcm);
+    Some(wav)
+}
+
 fn parse_define_sound(tag: &[u8]) -> Result<Sound, SkippedSound> {
     let bad = |reason: &'static str| SkippedSound {
         id: tag.first().copied().unwrap_or(0) as u16
@@ -234,11 +333,29 @@ fn parse_define_sound(tag: &[u8]) -> Result<Sound, SkippedSound> {
     let id = u16::from_le_bytes([tag[0], tag[1]]);
     let format = tag[2] >> 4;
     let sample_count = u32::from_le_bytes([tag[3], tag[4], tag[5], tag[6]]);
-    if format != FORMAT_MP3 {
+    if format != FORMAT_MP3 && format != FORMAT_ADPCM {
         return Err(SkippedSound {
             id,
             format,
             reason: "non-MP3 sound codec not supported yet",
+        });
+    }
+    if format == FORMAT_ADPCM {
+        let Some(frames) = wav_from_adpcm(&tag[7..], tag[2], sample_count) else {
+            return Err(SkippedSound {
+                id,
+                format,
+                reason: "malformed or oversized ADPCM sound",
+            });
+        };
+        return Ok(Sound {
+            id,
+            format,
+            codec: "wav".to_string(),
+            sample_count,
+            seek_samples: 0,
+            trimmed_leading: 0,
+            frames,
         });
     }
     if tag.len() < 9 {
@@ -259,11 +376,39 @@ fn parse_define_sound(tag: &[u8]) -> Result<Sound, SkippedSound> {
     Ok(Sound {
         id,
         format,
+        codec: "mp3".to_string(),
         sample_count,
         seek_samples: u16::from_le_bytes([tag[7], tag[8]]),
         trimmed_leading: start,
         frames: payload[start..].to_vec(),
     })
+}
+
+struct StreamSound {
+    id: u16,
+    sample_count: u32,
+    seek_samples: u16,
+    frames: Vec<u8>,
+}
+
+fn finish_stream(stream: StreamSound, sounds: &mut Vec<Sound>, skipped: &mut Vec<SkippedSound>) {
+    if stream.frames.is_empty() {
+        skipped.push(SkippedSound {
+            id: stream.id,
+            format: FORMAT_MP3,
+            reason: "MP3 stream contains no frame sync",
+        });
+        return;
+    }
+    sounds.push(Sound {
+        id: stream.id,
+        format: FORMAT_MP3,
+        codec: "mp3".to_string(),
+        sample_count: stream.sample_count,
+        seek_samples: stream.seek_samples,
+        trimmed_leading: 0,
+        frames: stream.frames,
+    });
 }
 
 /// Parse a SWF file image, extracting MP3 `DefineSound`s in file order.
@@ -279,6 +424,8 @@ pub fn parse(data: &[u8]) -> Result<SwfSounds, SwfError> {
 
     let mut sounds = Vec::new();
     let mut skipped = Vec::new();
+    let mut stream: Option<StreamSound> = None;
+    let mut next_stream_id = 0x8000u16;
     let mut ended = false;
     while off < body.len() {
         if body.len() - off < 2 {
@@ -298,16 +445,58 @@ pub fn parse(data: &[u8]) -> Result<SwfSounds, SwfError> {
             ended = true;
             break; // End tag
         }
-        if code == TAG_DEFINE_SOUND {
-            match parse_define_sound(tag) {
+        match code {
+            TAG_DEFINE_SOUND => match parse_define_sound(tag) {
                 Ok(s) => sounds.push(s),
                 Err(sk) => skipped.push(sk),
+            },
+            TAG_SOUND_STREAM_HEAD | TAG_SOUND_STREAM_HEAD2 => {
+                if let Some(previous) = stream.take() {
+                    finish_stream(previous, &mut sounds, &mut skipped);
+                }
+                // StreamSoundCompression is the upper nibble of byte 1.
+                let format = tag.get(1).copied().unwrap_or(0) >> 4;
+                if format == FORMAT_MP3 && tag.len() >= 6 {
+                    stream = Some(StreamSound {
+                        id: next_stream_id,
+                        sample_count: 0,
+                        seek_samples: u16::from_le_bytes([tag[4], tag[5]]),
+                        frames: Vec::new(),
+                    });
+                    next_stream_id = next_stream_id.wrapping_add(1);
+                } else {
+                    skipped.push(SkippedSound {
+                        id: next_stream_id,
+                        format,
+                        reason: "non-MP3 or malformed streaming sound",
+                    });
+                    next_stream_id = next_stream_id.wrapping_add(1);
+                }
             }
+            TAG_SOUND_STREAM_BLOCK => {
+                if let Some(active) = stream.as_mut() {
+                    // MP3 blocks start with sample count and seek samples; the
+                    // remaining bytes are one or more MPEG frames.
+                    if tag.len() >= 4 {
+                        active.sample_count = active
+                            .sample_count
+                            .saturating_add(u16::from_le_bytes([tag[0], tag[1]]) as u32);
+                        let payload = &tag[4..];
+                        if let Some(start) = mp3_frame_start(payload) {
+                            active.frames.extend_from_slice(&payload[start..]);
+                        }
+                    }
+                }
+            }
+            _ => {}
         }
         off = end;
     }
     if !ended {
         return Err(SwfError::TagOverrun);
+    }
+    if let Some(stream) = stream {
+        finish_stream(stream, &mut sounds, &mut skipped);
     }
 
     Ok(SwfSounds {

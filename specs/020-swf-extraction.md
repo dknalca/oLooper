@@ -22,8 +22,15 @@ Never executes ActionScript; never requires Flash.
   tools) are stripped — verified: payload must start at a valid frame sync,
   else the sound is reported skipped. Stripping is de-containering, and the
   trimmed count is kept in provenance.
-- `ZWS` (LZMA) and non-MP3 sound formats: explicitly unsupported in MVP,
-  reported as `unsupported`, never guessed.
+- `DefineSound` Flash ADPCM (format id 1) is decoded to a derived PCM WAV.
+  The source SWF remains untouched; malformed bitstreams and unreasonable
+  declared sample counts are skipped per sound.
+- `ZWS` (LZMA) and remaining non-MP3/non-ADPCM sound formats are explicitly
+  unsupported, reported as `unsupported`, never guessed.
+- MP3 streaming audio declared by `SoundStreamHead`/`SoundStreamHead2` and
+  carried by `SoundStreamBlock` is assembled in frame order into a derived
+  track. Blocks have bounded aggregate size and malformed stream headers or
+  blocks are skipped without affecting independent `DefineSound` extraction.
 
 ## Outputs
 
@@ -66,9 +73,11 @@ Never executes ActionScript; never requires Flash.
   **Verified 2026-09-18: 48 extracted / 0 skipped; all decode via rodio.**
 - [x] Synthetic fixtures in CI: valid FWS, CWS, multi-sound, truncated,
   unsupported-codec — all behave per spec.
+- [x] Synthetic ADPCM fixture decodes to a valid WAV; local ignored fixture
+  `turntable_training_looper_low_res.swf` extracts its ADPCM sounds.
 - [x] Malformed inputs never panic, never write partial files.
 
 ## Non-goals
 
-- `ZWS` support, ADPCM/Nellymoser transcoding, ActionScript, streaming sounds
-  (`SoundStreamHead/Block`) as separate tracks in MVP.
+- `ZWS` support, Nellymoser transcoding, ActionScript, streaming sounds beyond
+  MP3 `SoundStreamHead`/`SoundStreamBlock` assembly, as separate tracks.

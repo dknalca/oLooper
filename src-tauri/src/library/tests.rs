@@ -43,7 +43,7 @@ fn wav_buf() -> crate::player::LoopBuffer {
 fn migrate_starts_at_current_schema() {
     let root = tmp_root("migrate");
     let lib = Library::open(&root).unwrap();
-    assert_eq!(lib.schema_version().unwrap(), 2);
+    assert_eq!(lib.schema_version().unwrap(), 5);
     assert!(root.join("Custom Loops").is_dir());
     assert!(root.join("olooper.db").is_file());
     std::fs::remove_dir_all(&root).ok();
@@ -57,19 +57,114 @@ fn add_list_get_dedup() {
     std::fs::write(&audio, b"fake").unwrap();
     let buf = wav_buf();
     let (id, added) = lib
-        .add_track("t", &audio, "custom", "/src/x.wav", "hash1", 0, None, None, "wav", &buf, 0, 0)
+        .add_track(
+            "t",
+            "Custom Loops",
+            &audio,
+            "custom",
+            "/src/x.wav",
+            "hash1",
+            0,
+            None,
+            None,
+            "wav",
+            &buf,
+            0,
+            0,
+        )
         .unwrap();
     assert!(added);
     // Same source identity → same id, no duplicate row.
     let (id2, added2) = lib
-        .add_track("t", &audio, "custom", "/src/x.wav", "hash1", 0, None, None, "wav", &buf, 0, 0)
+        .add_track(
+            "t",
+            "Custom Loops",
+            &audio,
+            "custom",
+            "/src/x.wav",
+            "hash1",
+            0,
+            None,
+            None,
+            "wav",
+            &buf,
+            0,
+            0,
+        )
         .unwrap();
     assert!(!added2 && id2 == id);
     let tracks = lib.list_tracks().unwrap();
     assert_eq!(tracks.len(), 1);
     assert!(tracks[0].exists);
+    assert!(!tracks[0].favorite);
     assert_eq!(tracks[0].duration_ms, 100);
     assert_eq!(lib.get_track(id).unwrap().unwrap().title, "t");
+    assert!(lib.set_favorite(id, true).unwrap().favorite);
+    assert!(!lib.set_favorite(id, false).unwrap().favorite);
+    assert!(lib.set_favorite(999, true).is_err());
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn looper_group_rename_and_remove_keep_audio() {
+    let root = tmp_root("group-management");
+    let lib = Library::open(&root).unwrap();
+    let old_dir = root.join("Old Looper");
+    std::fs::create_dir_all(&old_dir).unwrap();
+    let first = old_dir.join("01_1.mp3");
+    let second = old_dir.join("02_2.mp3");
+    std::fs::write(&first, b"first").unwrap();
+    std::fs::write(&second, b"second").unwrap();
+    let buf = wav_buf();
+    let (first_id, _) = lib
+        .add_track(
+            "01 · Old Looper",
+            "Old Looper",
+            &first,
+            "swf",
+            "/src/old.swf",
+            "group-hash",
+            1,
+            None,
+            None,
+            "mp3",
+            &buf,
+            0,
+            0,
+        )
+        .unwrap();
+    lib.add_track(
+        "02 · Old Looper",
+        "Old Looper",
+        &second,
+        "swf",
+        "/src/old.swf",
+        "group-hash",
+        2,
+        None,
+        None,
+        "mp3",
+        &buf,
+        0,
+        0,
+    )
+    .unwrap();
+    lib.set_slot(first_id, 1, "A", 0, 0, 90, true).unwrap();
+
+    lib.rename_looper("group-hash", "Renamed Looper").unwrap();
+    let renamed_dir = root.join("Renamed Looper");
+    assert!(renamed_dir.join("01_1.mp3").is_file());
+    assert!(!old_dir.exists());
+    assert!(lib
+        .list_tracks()
+        .unwrap()
+        .iter()
+        .all(|track| track.looper_name == "Renamed Looper"));
+
+    assert_eq!(lib.remove_looper("group-hash").unwrap(), 2);
+    assert!(lib.list_tracks().unwrap().is_empty());
+    assert!(lib.get_slots(first_id).unwrap().is_empty());
+    assert!(renamed_dir.join("01_1.mp3").is_file());
     std::fs::remove_dir_all(&root).ok();
 }
 
@@ -80,14 +175,31 @@ fn edits_persist_across_reopen() {
     {
         let lib = Library::open(&root).unwrap();
         std::fs::write(&audio, b"fake").unwrap();
-        lib.add_track("t", &audio, "custom", "s", "h", 0, None, None, "wav", &wav_buf(), 0, 0)
-            .unwrap();
+        lib.add_track(
+            "t",
+            "Custom Loops",
+            &audio,
+            "custom",
+            "s",
+            "h",
+            0,
+            None,
+            None,
+            "wav",
+            &wav_buf(),
+            0,
+            0,
+        )
+        .unwrap();
         lib.update_cue_loop(1, 10, 10, 90, true).unwrap();
         lib.update_bpm(1, 128.0, None, true).unwrap();
     }
     let lib = Library::open(&root).unwrap();
     let t = lib.get_track(1).unwrap().unwrap();
-    assert_eq!((t.primary_cue_ms, t.loop_start_ms, t.loop_end_ms), (10, 10, 90));
+    assert_eq!(
+        (t.primary_cue_ms, t.loop_start_ms, t.loop_end_ms),
+        (10, 10, 90)
+    );
     assert_eq!(t.bpm, Some(128.0));
     assert_eq!(t.bpm_source.as_deref(), Some("manual"));
     assert!(lib.update_cue_loop(1, 0, 90, 10, true).is_err()); // start >= end
@@ -106,8 +218,22 @@ fn missing_files_are_flagged() {
     let lib = Library::open(&root).unwrap();
     let audio = root.join("Custom Loops").join("gone.wav");
     std::fs::write(&audio, b"fake").unwrap();
-    lib.add_track("t", &audio, "custom", "s", "h", 0, None, None, "wav", &wav_buf(), 0, 0)
-        .unwrap();
+    lib.add_track(
+        "t",
+        "Custom Loops",
+        &audio,
+        "custom",
+        "s",
+        "h",
+        0,
+        None,
+        None,
+        "wav",
+        &wav_buf(),
+        0,
+        0,
+    )
+    .unwrap();
     std::fs::remove_file(&audio).unwrap();
     let t = lib.list_tracks().unwrap();
     assert!(!t[0].exists);
@@ -115,10 +241,16 @@ fn missing_files_are_flagged() {
 }
 
 #[test]
-fn sanitize_confines_names() {    assert_eq!(sanitize_name("../../etc/passwd"), "etc_passwd");
+fn sanitize_confines_names() {
+    assert_eq!(sanitize_name("../../etc/passwd"), "etc_passwd");
     assert_eq!(sanitize_name(""), "untitled");
-    assert_eq!(sanitize_name("The Seventeenth (Wave) 01"), "The Seventeenth (Wave) 01");
-    assert!(!sanitize_name("a/b\\c").chars().any(|c| c == '/' || c == '\\'));
+    assert_eq!(
+        sanitize_name("The Seventeenth (Wave) 01"),
+        "The Seventeenth (Wave) 01"
+    );
+    assert!(!sanitize_name("a/b\\c")
+        .chars()
+        .any(|c| c == '/' || c == '\\'));
 }
 
 #[test]
@@ -130,7 +262,15 @@ fn import_with_undecodable_sounds_fails_clean() {
     let tags = define_sound_tag(1, FORMAT_MP3, &fake_mp3(0));
     let swf = crate::import::swf::parse(&fws_file(5, &tags)).unwrap();
     let err = lib
-        .import_sounds("Looper", "swf", "/src/l.swf", "hashx", None, None, &swf.sounds)
+        .import_sounds(
+            "Looper",
+            "swf",
+            "/src/l.swf",
+            "hashx",
+            None,
+            None,
+            &swf.sounds,
+        )
         .unwrap_err();
     assert_eq!(err, "no sounds could be imported");
     assert!(lib.list_tracks().unwrap().is_empty());
@@ -154,7 +294,7 @@ fn import_reports_extraction_stage_before_a_sound_failure() {
             None,
             None,
             &swf.sounds,
-            |stage, current, total| stages.push((stage.to_string(), current, total)),
+            |stage, current, total| { stages.push((stage.to_string(), current, total)); Ok(()) },
         )
         .unwrap_err();
     assert_eq!(err, "no sounds could be imported");
@@ -173,14 +313,36 @@ fn import_dedups_second_run() {
     let audio = root.join("L").join("01_1.mp3");
     std::fs::create_dir_all(audio.parent().unwrap()).unwrap();
     std::fs::write(&audio, b"fake").unwrap();
-    lib.add_track("01 · L", &audio, "swf", "/src/l.swf", "h2", 1, None, None, "wav", &wav_buf(), 0, 0)
-        .unwrap();
+    lib.add_track(
+        "01 · L",
+        "L",
+        &audio,
+        "swf",
+        "/src/l.swf",
+        "h2",
+        1,
+        None,
+        None,
+        "wav",
+        &wav_buf(),
+        0,
+        0,
+    )
+    .unwrap();
     let tags = define_sound_tag(1, FORMAT_MP3, &fake_mp3(0));
     let swf = crate::import::swf::parse(&fws_file(5, &tags)).unwrap();
     // Sound id 1 is already known for hash h2... different hash here, so it
     // goes to decode and fails; assert bookkeeping rather than success.
     let err = lib
-        .import_sounds("L", "swf", "/src/l.swf", "other-hash", None, None, &swf.sounds)
+        .import_sounds(
+            "L",
+            "swf",
+            "/src/l.swf",
+            "other-hash",
+            None,
+            None,
+            &swf.sounds,
+        )
         .unwrap_err();
     assert_eq!(err, "no sounds could be imported");
     assert_eq!(lib.list_tracks().unwrap().len(), 1);
@@ -196,8 +358,7 @@ fn import_real_loopers() {
         eprintln!("set OLOOPER_FIXTURES=1 to run");
         return;
     }
-    let fixtures =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../loopersFlash");
+    let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../loopersFlash");
     let swf_path = fixtures.join("The Nineteenth Wave Looper.swf");
     let exe_path = fixtures.join("TheSeventeenthWaveLooper.exe");
     if !swf_path.is_file() || !exe_path.is_file() {

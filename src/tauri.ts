@@ -24,6 +24,8 @@ export interface PlayerStatus {
   loop_end_ms: number;
   loop_enabled: boolean;
   volume_pct: number;
+  speed_pct: number;
+  pitch_lock: boolean;
 }
 
 export function playerLoad(path: string): Promise<PlayerStatus> {
@@ -44,6 +46,14 @@ export function playerStop(): Promise<PlayerStatus> {
 
 export function playerSetVolume(volumePct: number): Promise<PlayerStatus> {
   return invoke<PlayerStatus>("player_set_volume", { volumePct });
+}
+
+export function playerSetSpeed(speedPct: number): Promise<PlayerStatus> {
+  return invoke<PlayerStatus>("player_set_speed", { speedPct });
+}
+
+export function playerSetPitchLock(enabled: boolean): Promise<PlayerStatus> {
+  return invoke<PlayerStatus>("player_set_pitch_lock", { enabled });
 }
 
 export function playerSetLoop(startMs: number, endMs: number): Promise<PlayerStatus> {
@@ -72,9 +82,14 @@ export function waveformPeaks(path: string, buckets: number): Promise<WaveformDa
   return invoke<WaveformData>("waveform_peaks", { path, buckets });
 }
 
+export function playerWaveformPeaks(path: string, buckets: number): Promise<WaveformData> {
+  return invoke<WaveformData>("player_waveform_peaks", { path, buckets });
+}
+
 export interface Track {
   id: number;
   title: string;
+  looper_name: string;
   file_path: string;
   exists: boolean;
   source_type: string;
@@ -94,6 +109,9 @@ export interface Track {
   loop_enabled: boolean;
   imported_at: number;
   updated_at: number;
+  favorite: boolean;
+  tags: string;
+  last_played_at: number | null;
 }
 
 export interface ImportReport {
@@ -144,6 +162,10 @@ export function importSwf(path: string, jobId = importJobId()): Promise<ImportRe
 
 export function importExe(path: string, jobId = importJobId()): Promise<ImportReport> {
   return invoke<ImportReport>("import_exe", { path, jobId });
+}
+
+export function cancelImport(jobId: string): Promise<void> {
+  return invoke<void>("cancel_import", { jobId });
 }
 
 export function listenImportProgress(
@@ -222,6 +244,34 @@ export function libraryDeleteSlot(trackId: number, slot: number): Promise<boolea
 
 export function libraryRemove(trackId: number): Promise<boolean> {
   return invoke<boolean>("library_remove", { id: trackId });
+}
+
+export function librarySetFavorite(trackId: number, favorite: boolean): Promise<Track> {
+  return invoke<Track>("library_set_favorite", { id: trackId, favorite });
+}
+
+export function libraryUpdateMetadata(trackId: number, title: string, bpm: number | null, tags: string): Promise<Track> {
+  return invoke<Track>("library_update_metadata", { id: trackId, title, bpm, tags });
+}
+
+export function libraryMarkPlayed(trackId: number): Promise<void> {
+  return invoke<void>("library_mark_played", { id: trackId });
+}
+
+export function libraryExportTracks(trackIds: number[], destination: string): Promise<number> {
+  return invoke<number>("library_export_tracks", { ids: trackIds, destination });
+}
+
+export function libraryRenameLooper(sourceHash: string, name: string): Promise<void> {
+  return invoke<void>("library_rename_looper", { sourceHash, name });
+}
+
+export function libraryRemoveLooper(sourceHash: string): Promise<number> {
+  return invoke<number>("library_remove_looper", { sourceHash });
+}
+
+export function libraryGroupDirectory(sourceHash: string): Promise<string> {
+  return invoke<string>("library_group_directory", { sourceHash });
 }
 
 export function revealInFileManager(path: string): Promise<void> {

@@ -89,6 +89,10 @@ const svg = `<?xml version="1.0" encoding="UTF-8"?>
       <stop offset="0%" stop-color="#5bb3ff"/>
       <stop offset="100%" stop-color="#3a8de8"/>
     </linearGradient>
+    <linearGradient id="oGrad" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#1a1a1a"/>
+      <stop offset="100%" stop-color="#111111"/>
+    </linearGradient>
     <filter id="glow">
       <feGaussianBlur stdDeviation="3" result="blur"/>
       <feMerge>
@@ -99,6 +103,8 @@ const svg = `<?xml version="1.0" encoding="UTF-8"?>
   </defs>
   <!-- Background: rounded dark square -->
   <rect width="1024" height="1024" rx="180" ry="180" fill="#0a0a0a"/>
+  <!-- Large "O" behind the waveform -->
+  <text x="512" y="580" text-anchor="middle" font-family="Helvetica Neue, Arial, sans-serif" font-weight="700" font-size="520" fill="url(#oGrad)" opacity="0.35">O</text>
   <!-- Subtle ring guide -->
   <circle cx="${CX}" cy="${CY}" r="${R}" fill="none" stroke="#1a1a1a" stroke-width="1"/>
   <!-- Waveform peaks -->
@@ -111,6 +117,8 @@ const svg = `<?xml version="1.0" encoding="UTF-8"?>
 `;
 
 const svgPath = join(ROOT, ".dev", "icon-source.svg");
+mkdirSync(dirname(svgPath), { recursive: true });
+mkdirSync(ICONS_DIR, { recursive: true });
 writeFileSync(svgPath, svg);
 console.log(`✓ SVG written to ${svgPath}`);
 
@@ -161,7 +169,8 @@ try {
   execSync(`iconutil -c icns "${tmpDir}" -o "${icnsPath}"`);
   console.log(`✓ icon.icns (macOS)`);
 } catch (e) {
-  console.error(`⚠ icns generation failed: ${e.message}`);
+  console.error(`icns generation failed: ${e.message}`);
+  process.exit(1);
 }
 
 console.log("\nDone! All icons generated in src-tauri/icons/");

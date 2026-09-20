@@ -44,10 +44,7 @@ fn stub_with_appended_swf_locates_and_extracts() {
 #[test]
 fn exe_without_swf_is_unsupported() {
     let exe = b"MZSTUB".to_vec();
-    assert!(matches!(
-        locate(&exe),
-        Err(ExeError::UnsupportedExe { .. })
-    ));
+    assert!(matches!(locate(&exe), Err(ExeError::UnsupportedExe { .. })));
 }
 
 #[test]
@@ -61,10 +58,7 @@ fn truncated_embedded_swf_is_skipped_safely() {
     let mut swf = fws_payload(1);
     swf.truncate(swf.len() - 12); // declared length no longer fits in the file
     let exe = projector_stub(&swf);
-    assert!(matches!(
-        locate(&exe),
-        Err(ExeError::UnsupportedExe { .. })
-    ));
+    assert!(matches!(locate(&exe), Err(ExeError::UnsupportedExe { .. })));
 }
 
 #[test]

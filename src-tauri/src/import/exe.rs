@@ -10,7 +10,10 @@ const MAX_CANDIDATES: usize = 4096;
 pub enum ExeError {
     TooSmall,
     NotAnExe,
-    UnsupportedExe { candidates: usize, detail: &'static str },
+    UnsupportedExe {
+        candidates: usize,
+        detail: &'static str,
+    },
     Swf(super::swf::SwfError),
 }
 
@@ -78,13 +81,21 @@ pub fn scan(data: &[u8]) -> Vec<EmbeddedSwf> {
             continue;
         }
         let len = length as usize;
-        if len < 8 || off.checked_add(len).map(|end| end > data.len()).unwrap_or(true) {
+        if len < 8
+            || off
+                .checked_add(len)
+                .map(|end| end > data.len())
+                .unwrap_or(true)
+        {
             continue;
         }
         // Skip candidates fully inside an already-accepted larger one? No:
         // keep it simple, prefer largest valid later.
         if out.len() < MAX_CANDIDATES {
-            out.push(EmbeddedSwf { offset: off, length: len });
+            out.push(EmbeddedSwf {
+                offset: off,
+                length: len,
+            });
         }
     }
     out

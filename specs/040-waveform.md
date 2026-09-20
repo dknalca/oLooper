@@ -19,6 +19,11 @@ computation; rendering is canvas-only (no audio decoding per frame).
 5. The waveform occupies the upper fifth of the workspace. The transport,
    cue, loop and slot controls form a compact band immediately below it; the
    loop library uses all remaining vertical space.
+6. Selecting a track loads playback first. Waveform analysis starts after a
+   short idle delay, is cancelled when another track is selected, and must not
+   delay selection or playback controls.
+7. Waveform peaks reuse the PCM buffer decoded by the player. A track switch
+   must not reread or decode the same audio file solely for waveform display.
 
 ## Supported inputs
 
@@ -36,8 +41,12 @@ computation; rendering is canvas-only (no audio decoding per frame).
 
 ## Persistence behavior
 
-- None in MVP: peaks recompute per load and live in frontend memory keyed by
-  file path. Disk cache is explicit future work (format reserved, not built).
+- Peaks are cached under the selected library's `.olooper-cache/waveforms/`
+  directory. Cache keys include canonical path, file size, modification time,
+  and bucket count, so replacing a track invalidates its prior waveform.
+- Cache entries are derived data only, written atomically and capped by the
+  existing bucket limit. Missing, corrupt, or unwritable cache entries fall
+  back to peak computation without affecting playback or source audio.
 
 ## Platform considerations
 

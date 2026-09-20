@@ -82,3 +82,33 @@ fn empty_buffer_is_flat() {
     assert_eq!(w.duration_ms, 0);
     assert!(w.peaks.iter().all(|&p| p == 0.0));
 }
+
+#[test]
+fn persistent_cache_reuses_peaks_for_unchanged_audio() {
+    let root = std::env::temp_dir().join(format!(
+        "olooper-waveform-cache-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let source = root.join("loop.wav");
+    let cache = root.join("cache");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(&source, b"source fingerprint").unwrap();
+    let first_buffer = LoopBuffer {
+        samples: vec![0, 20_000, 0, 10_000],
+        channels: 1,
+        rate: 8_000,
+    };
+    let first = cached_from_buffer(&cache, &source, 64, &first_buffer).unwrap();
+    let changed_buffer = LoopBuffer {
+        samples: vec![0; 4],
+        channels: 1,
+        rate: 8_000,
+    };
+    let cached = cached_from_buffer(&cache, &source, 64, &changed_buffer).unwrap();
+    assert_eq!(cached.peaks, first.peaks);
+    assert_eq!(std::fs::read_dir(&cache).unwrap().count(), 1);
+    std::fs::remove_dir_all(root).ok();
+}

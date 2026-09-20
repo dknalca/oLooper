@@ -7,6 +7,8 @@ import {
   playerSeek,
   playerSetLoop,
   playerSetLoopEnabled,
+  playerSetSpeed,
+  playerSetPitchLock,
   playerSetVolume,
   playerStatus,
   playerStop,
@@ -38,6 +40,21 @@ export default function Player({ status: st, trackId, onStatusChange }: Props) {
   const loopEndRef = useRef<HTMLInputElement>(null);
   const scrubRef = useRef<HTMLDivElement>(null);
   const [isScrubbing, setIsScrubbing] = useState(false);
+
+  // Preferences are applied only after a track has been loaded by the user.
+  useEffect(() => {
+    if (!st?.loaded) return;
+    const speed = Number(localStorage.getItem("olooper.player.speed"));
+    const pitchLock = localStorage.getItem("olooper.player.pitch-lock");
+    if (Number.isFinite(speed) && speed >= 50 && speed <= 200 && speed !== st.speed_pct) run(playerSetSpeed(speed));
+    if (pitchLock !== null && (pitchLock === "true") !== st.pitch_lock) run(playerSetPitchLock(pitchLock === "true"));
+  }, [st?.loaded]);
+
+  useEffect(() => {
+    if (!st?.loaded) return;
+    localStorage.setItem("olooper.player.speed", String(st.speed_pct));
+    localStorage.setItem("olooper.player.pitch-lock", String(st.pitch_lock));
+  }, [st?.loaded, st?.speed_pct, st?.pitch_lock]);
 
   // Loop slots
   const [slots, setSlots] = useState<LoopSlot[]>([]);
@@ -255,9 +272,18 @@ export default function Player({ status: st, trackId, onStatusChange }: Props) {
           />
         </div>
 
-        <div className="w-px h-5 bg-border" />
+         <div className="w-px h-5 bg-border" />
 
-        {/* Loop controls */}
+         <div className="flex items-center gap-1">
+           <button onClick={() => run(playerSetSpeed(Math.max(50, (st?.speed_pct ?? 100) - 5)))} disabled={!loaded} title="Slower" className="rounded bg-border px-1.5 py-0.5 text-xs text-text-secondary hover:text-text disabled:opacity-30">−</button>
+           <span className="w-9 text-center font-mono text-[10px] text-text-secondary">{Math.round(st?.speed_pct ?? 100)}%</span>
+           <button onClick={() => run(playerSetSpeed(Math.min(200, (st?.speed_pct ?? 100) + 5)))} disabled={!loaded} title="Faster" className="rounded bg-border px-1.5 py-0.5 text-xs text-text-secondary hover:text-text disabled:opacity-30">+</button>
+           <button onClick={() => run(playerSetPitchLock(!st?.pitch_lock))} disabled={!loaded} title="Keep pitch while changing speed" className={`rounded px-1.5 py-0.5 text-[9px] ${st?.pitch_lock ? "bg-success/20 text-success" : "bg-border text-text-secondary"}`}>PITCH LOCK</button>
+         </div>
+
+         <div className="w-px h-5 bg-border" />
+
+         {/* Loop controls */}
         {loaded && (
           <div className="flex items-center gap-1.5">
             <button

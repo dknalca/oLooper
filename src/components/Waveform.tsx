@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import {
   playerSeek,
-  waveformPeaks,
+  playerWaveformPeaks,
   type PlayerStatus,
   type WaveformData,
 } from "../tauri";
@@ -32,14 +32,25 @@ export default function Waveform({ refreshKey, status }: Props) {
       waveRef.current = null;
       return;
     }
-    const width = wrapRef.current?.clientWidth ?? 800;
-    const buckets = Math.min(2048, Math.max(64, Math.floor(width / 2)));
-    waveformPeaks(loadedPath, buckets)
-      .then((w) => {
-        waveRef.current = w;
-        setError(null);
-      })
-      .catch((e) => setError(String(e)));
+    let cancelled = false;
+    // Let selection and audio playback paint before starting the second decode.
+    const timer = window.setTimeout(() => {
+      const width = wrapRef.current?.clientWidth ?? 800;
+      const buckets = Math.min(2048, Math.max(64, Math.floor(width / 2)));
+      playerWaveformPeaks(loadedPath, buckets)
+        .then((w) => {
+          if (cancelled) return;
+          waveRef.current = w;
+          setError(null);
+        })
+        .catch((e) => {
+          if (!cancelled) setError(String(e));
+        });
+    }, 180);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
   }, [loadedPath, refreshKey]);
 
   // Render loop: interpolate between polls while playing.
