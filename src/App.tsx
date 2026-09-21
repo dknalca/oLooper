@@ -37,7 +37,7 @@ export default function App() {
 
       <main className="flex flex-1 min-h-0 flex-col">
         <div className="h-1/5 min-h-36 shrink-0 p-3">
-          <Waveform refreshKey={refreshKey} status={playerStatus} />
+          <Waveform refreshKey={refreshKey} status={playerStatus} onStatusChange={setPlayerStatus} />
         </div>
         <Player
           status={playerStatus}

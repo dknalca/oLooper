@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use tauri::Emitter as _;
+use tauri::Manager as _;
 use std::sync::{Mutex, OnceLock};
 
 static CANCELLED_IMPORTS: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
@@ -9,7 +10,14 @@ fn import_cancelled(job_id: &str) -> bool {
         .lock().map(|jobs| jobs.contains(job_id)).unwrap_or(false)
 }
 
+fn import_unmark_cancelled(job_id: &str) {
+    if let Ok(mut jobs) = CANCELLED_IMPORTS.get_or_init(|| Mutex::new(std::collections::HashSet::new())).lock() {
+        jobs.remove(job_id);
+    }
+}
+
 pub mod analysis;
+pub mod autoloop;
 pub mod import;
 pub mod library;
 pub mod player;
@@ -33,6 +41,12 @@ struct ImportProgress {
     detail: String,
     done: bool,
     error: Option<String>,
+    /// Present only on the final `done` event of worker-run imports, so the
+    /// frontend can update counts without awaiting the command. Keep in sync
+    /// with `src/tauri.ts` `ImportProgress`.
+    report: Option<library::ImportReport>,
+    /// Same, for custom-audio jobs (per-file results).
+    custom_report: Option<Vec<library::CustomReport>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -122,6 +136,35 @@ fn emit_import_progress(
             detail: detail.into(),
             done,
             error,
+            report: None,
+            custom_report: None,
+        },
+    );
+}
+
+/// Final event of a worker-run import: carries the report so fire-and-forget
+/// commands still give the frontend per-file counts.
+fn emit_import_done(
+    app: &tauri::AppHandle,
+    job_id: &str,
+    current: usize,
+    total: usize,
+    detail: impl Into<String>,
+    report: Option<library::ImportReport>,
+    custom_report: Option<Vec<library::CustomReport>>,
+) {
+    let _ = app.emit(
+        "olooper:import-progress",
+        ImportProgress {
+            job_id: job_id.to_string(),
+            stage: "complete".to_string(),
+            current,
+            total,
+            detail: detail.into(),
+            done: true,
+            error: None,
+            report,
+            custom_report,
         },
     );
 }
@@ -291,6 +334,19 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .manage(player::spawn())
         .manage(std::sync::Mutex::new(None::<library::Library>))
+        .setup(|app| {
+            // Background import worker: jobs are enqueued by `import_swf` and
+            // processed sequentially with their own SQLite connection, so the
+            // UI thread never blocks on a multi-minute import.
+            let handle = app.handle().clone();
+            let (tx, rx) = std::sync::mpsc::channel::<ImportJob>();
+            app.manage(ImportQueue { tx });
+            std::thread::Builder::new()
+                .name("olooper-import".to_string())
+                .spawn(move || import_worker_loop(handle, rx))
+                .expect("cannot spawn import thread");
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             get_app_status,
             greet,
@@ -304,10 +360,15 @@ pub fn run() {
             player_set_speed,
             player_set_pitch_lock,
             player_set_loop,
+            player_set_loop_snapped,
             player_set_loop_enabled,
             player_status,
             player_waveform_peaks,
             player_seek,
+            player_sample_window,
+            player_snap_loop_boundary,
+            player_auto_loop,
+            player_set_diagnostics,
             library_default_root,
             library_init,
             library_portable_init,
@@ -385,6 +446,11 @@ fn player_set_loop(
 }
 
 #[tauri::command]
+fn player_set_loop_snapped(start_ms: u64, end_ms: u64, audio: Audio<'_>) -> Result<player::PlayerStatus, String> {
+    audio.set_loop_snapped(start_ms, end_ms)
+}
+
+#[tauri::command]
 fn player_set_loop_enabled(
     enabled: bool,
     audio: Audio<'_>,
@@ -400,6 +466,60 @@ fn player_status(audio: Audio<'_>) -> Result<player::PlayerStatus, String> {
 #[tauri::command]
 fn player_seek(position_ms: u64, audio: Audio<'_>) -> Result<player::PlayerStatus, String> {
     audio.seek(position_ms)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct SampleWindow {
+    start_frame: usize,
+    end_frame: usize,
+    sample_rate: u32,
+    channels: u16,
+    samples: Vec<i16>,
+}
+
+#[tauri::command]
+fn player_sample_window(
+    center_frame: usize,
+    radius_frames: usize,
+    max_points: usize,
+    audio: Audio<'_>,
+) -> Result<SampleWindow, String> {
+    audio.sample_window(center_frame, radius_frames, max_points)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct SnappedBoundary {
+    frame: usize,
+    ms: u64,
+    discontinuity: f64,
+    zero_crossing_found: bool,
+}
+
+#[tauri::command]
+fn player_snap_loop_boundary(
+    boundary: String,
+    requested_frame: usize,
+    other_boundary_frame: usize,
+    audio: Audio<'_>,
+) -> Result<SnappedBoundary, String> {
+    audio.snap_loop_boundary(&boundary, requested_frame, other_boundary_frame)
+}
+
+#[tauri::command]
+fn player_auto_loop(
+    bpm: Option<f64>,
+    audio: Audio<'_>,
+) -> Result<crate::autoloop::AutoLoopResult, String> {
+    audio.auto_loop(bpm)
+}
+
+#[tauri::command]
+fn player_set_diagnostics(
+    loop_origin: String,
+    loop_quality: f64,
+    audio: Audio<'_>,
+) -> Result<player::PlayerStatus, String> {
+    audio.set_diagnostics(loop_origin, loop_quality)
 }
 
 type Db<'a> = tauri::State<'a, std::sync::Mutex<Option<library::Library>>>;
@@ -614,12 +734,6 @@ fn library_delete_slot(track_id: i64, slot: i64, db: Db<'_>) -> Result<bool, Str
 }
 
 #[tauri::command]
-fn import_custom(paths: Vec<String>, db: Db<'_>) -> Result<Vec<library::CustomReport>, String> {
-    let g = self::db(&db)?;
-    Ok(require_lib(&g)?.import_custom(&paths))
-}
-
-#[tauri::command]
 fn waveform_peaks(path: String, buckets: usize) -> Result<waveform::WaveformData, String> {
     let data = read_input(&path)?;
     waveform::compute(&data, buckets)
@@ -653,187 +767,277 @@ fn cancel_import(job_id: String) -> Result<(), String> {
     Ok(())
 }
 
-#[tauri::command]
-fn import_swf(
-    path: String,
+/// One import job for the background worker. The worker opens its own
+/// `Library` connection on `root`, so the shared `Db` mutex is only held
+/// for the instant it takes to enqueue — playback and library browsing stay
+/// responsive during multi-minute imports.
+enum ImportKind {
+    Swf,
+    Exe,
+    Custom,
+}
+
+struct ImportJob {
+    root: std::path::PathBuf,
+    kind: ImportKind,
+    paths: Vec<String>,
     job_id: String,
-    app: tauri::AppHandle,
-    db: Db<'_>,
-) -> Result<library::ImportReport, String> {
-    if import_cancelled(&job_id) { return Err("import cancelled".to_string()); }
-    emit_import_progress(&app, &job_id, "copying source", 0, 0, &path, false, None);
-    let data = read_input(&path)?;
-    let copied_path = copy_dropped_source(&path, &data)?;
-    emit_import_progress(&app, &job_id, "analyzing", 0, 0, &copied_path, false, None);
-    let sounds = match import::swf::parse(&data) {
-        Ok(sounds) => sounds,
+}
+
+struct ImportQueue {
+    tx: std::sync::mpsc::Sender<ImportJob>,
+}
+
+fn run_swf_job(app: &tauri::AppHandle, job: &ImportJob) {
+    run_container_job(app, job, /* exe */ false);
+}
+
+fn run_exe_job(app: &tauri::AppHandle, job: &ImportJob) {
+    run_container_job(app, job, /* exe */ true);
+}
+
+/// Shared SWF/EXE pipeline: copy source → locate+parse → decode+BPM+insert.
+/// `paths[0]` is the dropped file. Runs on the worker with its own connection.
+fn run_container_job(app: &tauri::AppHandle, job: &ImportJob, exe: bool) {
+    let path = job.paths.first().map(String::as_str).unwrap_or("");
+    let fail = |error: String| {
+        emit_import_progress(app, &job.job_id, "failed", 0, 0, path, true, Some(error));
+    };
+    if import_cancelled(&job.job_id) {
+        fail("import cancelled".to_string());
+        return;
+    }
+    emit_import_progress(app, &job.job_id, "copying source", 0, 0, path, false, None);
+    let data = match read_input(path) {
+        Ok(data) => data,
         Err(e) => {
-            let error = import::swf::user_message(&e);
-            emit_import_progress(
-                &app,
-                &job_id,
-                "failed",
-                0,
-                0,
-                &copied_path,
-                true,
-                Some(error.clone()),
-            );
-            return Err(error);
+            fail(e);
+            return;
         }
     };
-    let g = self::db(&db)?;
-    let lib = require_lib(&g)?;
+    let copied_path = match copy_dropped_source(path, &data) {
+        Ok(path) => path,
+        Err(e) => {
+            fail(e);
+            return;
+        }
+    };
+    emit_import_progress(app, &job.job_id, "analyzing", 0, 0, &copied_path, false, None);
+    let source_type = if exe { "exe" } else { "swf" };
+    // EXE projectors embed the SWF at an offset; plain SWF parses from zero.
+    let (sounds, exe_offset, exe_length) = if exe {
+        let found = match import::exe::locate(&data) {
+            Ok(found) => found,
+            Err(e) => {
+                fail(import::exe::user_message(&e));
+                return;
+            }
+        };
+        match import::swf::parse(&data[found.offset..found.offset + found.length]) {
+            Ok(sounds) => (sounds, Some(found.offset as i64), Some(found.length as i64)),
+            Err(e) => {
+                fail(import::swf::user_message(&e));
+                return;
+            }
+        }
+    } else {
+        match import::swf::parse(&data) {
+            Ok(sounds) => (sounds, None, None),
+            Err(e) => {
+                fail(import::swf::user_message(&e));
+                return;
+            }
+        }
+    };
+    // Own connection: the main one already migrated at `library_init`, so
+    // this open is a no-op migration plus WAL setup. Never touches `Db`.
+    let lib = match library::Library::open(&job.root) {
+        Ok(lib) => lib,
+        Err(e) => {
+            fail(e);
+            return;
+        }
+    };
     let report = lib.import_sounds_with_progress(
         &looper_name(&copied_path),
-        "swf",
+        source_type,
         &copied_path,
         &library::sha256_hex(&data),
-        None,
-        None,
+        exe_offset,
+        exe_length,
         &sounds.sounds,
         |stage, current, total| {
-            if import_cancelled(&job_id) { return Err("import cancelled".to_string()); }
+            if import_cancelled(&job.job_id) {
+                return Err("import cancelled".to_string());
+            }
             emit_import_progress(
-                &app,
-                &job_id,
+                app,
+                &job.job_id,
                 stage,
                 current,
                 total,
                 &copied_path,
                 false,
                 None,
-            ); Ok(())
+            );
+            Ok(())
         },
     );
     match report {
         Ok(report) => {
-            emit_import_progress(
-                &app,
-                &job_id,
-                "complete",
+            emit_import_done(
+                app,
+                &job.job_id,
                 report.added + report.already_there,
                 sounds.sounds.len(),
                 &copied_path,
-                true,
+                Some(report),
                 None,
             );
-            Ok(report)
         }
-        Err(error) => {
-            emit_import_progress(
-                &app,
-                &job_id,
-                "failed",
-                0,
+        Err((partial, error)) => {
+            let processed = partial.added + partial.already_there + partial.failed.len();
+            emit_import_done(
+                app,
+                &job.job_id,
+                processed,
                 sounds.sounds.len(),
-                &copied_path,
-                true,
-                Some(error.clone()),
+                format!("{error}: {processed}/{} sounds processed", sounds.sounds.len()),
+                Some(partial),
+                None,
             );
-            Err(error)
         }
     }
+}
+
+fn import_worker_loop(app: tauri::AppHandle, rx: std::sync::mpsc::Receiver<ImportJob>) {
+    for job in rx {
+        match job.kind {
+            ImportKind::Swf => run_swf_job(&app, &job),
+            ImportKind::Exe => run_exe_job(&app, &job),
+            ImportKind::Custom => run_custom_job(&app, &job),
+        }
+        import_unmark_cancelled(&job.job_id);
+    }
+}
+
+/// Custom audio imports: per-file decode → copy → BPM → row, with progress
+/// per file so the modal tracks each entry. The final `done` event carries
+/// the per-file reports (same shape as the old synchronous return).
+fn run_custom_job(app: &tauri::AppHandle, job: &ImportJob) {
+    let total = job.paths.len();
+    let fail = |error: String| {
+        emit_import_progress(app, &job.job_id, "failed", 0, total, "", true, Some(error));
+    };
+    if import_cancelled(&job.job_id) {
+        fail("import cancelled".to_string());
+        return;
+    }
+    // Own connection: the main one already migrated at `library_init`, so
+    // this open is a no-op migration plus WAL setup. Never touches `Db`.
+    let lib = match library::Library::open(&job.root) {
+        Ok(lib) => lib,
+        Err(e) => {
+            fail(e);
+            return;
+        }
+    };
+    let mut reports = Vec::with_capacity(total);
+    for (i, path) in job.paths.iter().enumerate() {
+        if import_cancelled(&job.job_id) {
+            fail("import cancelled".to_string());
+            return;
+        }
+        emit_import_progress(app, &job.job_id, "importing audio", i, total, path, false, None);
+        let rep = lib.import_one_custom(path);
+        reports.push(rep);
+        emit_import_progress(app, &job.job_id, "importing audio", i + 1, total, path, false, None);
+    }
+    let added = reports.iter().filter(|r| r.added).count();
+    emit_import_done(
+        app,
+        &job.job_id,
+        total,
+        total,
+        format!("{added} of {total} audio file(s) imported"),
+        None,
+        Some(reports),
+    );
+}
+
+#[tauri::command]
+fn import_swf(
+    path: String,
+    job_id: String,
+    queue: tauri::State<'_, ImportQueue>,
+    db: Db<'_>,
+) -> Result<String, String> {
+    if import_cancelled(&job_id) {
+        return Err("import cancelled".to_string());
+    }
+    // Short lock: clone the root, then release. The worker does the rest.
+    let root = require_lib(&self::db(&db)?)?.root.clone();
+    queue
+        .tx
+        .send(ImportJob {
+            root,
+            kind: ImportKind::Swf,
+            paths: vec![path],
+            job_id: job_id.clone(),
+        })
+        .map_err(|e| format!("import worker unavailable: {e}"))?;
+    Ok(job_id)
 }
 
 #[tauri::command]
 fn import_exe(
     path: String,
     job_id: String,
-    app: tauri::AppHandle,
+    queue: tauri::State<'_, ImportQueue>,
     db: Db<'_>,
-) -> Result<library::ImportReport, String> {
-    if import_cancelled(&job_id) { return Err("import cancelled".to_string()); }
-    emit_import_progress(&app, &job_id, "copying source", 0, 0, &path, false, None);
-    let data = read_input(&path)?;
-    let copied_path = copy_dropped_source(&path, &data)?;
-    emit_import_progress(&app, &job_id, "analyzing", 0, 0, &copied_path, false, None);
-    let found = match import::exe::locate(&data) {
-        Ok(found) => found,
-        Err(e) => {
-            let error = import::exe::user_message(&e);
-            emit_import_progress(
-                &app,
-                &job_id,
-                "failed",
-                0,
-                0,
-                &copied_path,
-                true,
-                Some(error.clone()),
-            );
-            return Err(error);
-        }
-    };
-    let sounds = match import::swf::parse(&data[found.offset..found.offset + found.length]) {
-        Ok(sounds) => sounds,
-        Err(e) => {
-            let error = import::swf::user_message(&e);
-            emit_import_progress(
-                &app,
-                &job_id,
-                "failed",
-                0,
-                0,
-                &copied_path,
-                true,
-                Some(error.clone()),
-            );
-            return Err(error);
-        }
-    };
-    let g = self::db(&db)?;
-    let lib = require_lib(&g)?;
-    let report = lib.import_sounds_with_progress(
-        &looper_name(&copied_path),
-        "exe",
-        &copied_path,
-        &library::sha256_hex(&data),
-        Some(found.offset as i64),
-        Some(found.length as i64),
-        &sounds.sounds,
-        |stage, current, total| {
-            if import_cancelled(&job_id) { return Err("import cancelled".to_string()); }
-            emit_import_progress(
-                &app,
-                &job_id,
-                stage,
-                current,
-                total,
-                &copied_path,
-                false,
-                None,
-            ); Ok(())
-        },
-    );
-    match report {
-        Ok(report) => {
-            emit_import_progress(
-                &app,
-                &job_id,
-                "complete",
-                report.added + report.already_there,
-                sounds.sounds.len(),
-                &copied_path,
-                true,
-                None,
-            );
-            Ok(report)
-        }
-        Err(error) => {
-            emit_import_progress(
-                &app,
-                &job_id,
-                "failed",
-                0,
-                sounds.sounds.len(),
-                &copied_path,
-                true,
-                Some(error.clone()),
-            );
-            Err(error)
-        }
+) -> Result<String, String> {
+    if import_cancelled(&job_id) {
+        return Err("import cancelled".to_string());
     }
+    // Short lock: clone the root, then release. The worker does the rest.
+    let root = require_lib(&self::db(&db)?)?.root.clone();
+    queue
+        .tx
+        .send(ImportJob {
+            root,
+            kind: ImportKind::Exe,
+            paths: vec![path],
+            job_id: job_id.clone(),
+        })
+        .map_err(|e| format!("import worker unavailable: {e}"))?;
+    Ok(job_id)
+}
+
+#[tauri::command]
+fn import_custom(
+    paths: Vec<String>,
+    job_id: String,
+    queue: tauri::State<'_, ImportQueue>,
+    db: Db<'_>,
+) -> Result<String, String> {
+    if paths.is_empty() {
+        return Err("select at least one audio file".to_string());
+    }
+    if import_cancelled(&job_id) {
+        return Err("import cancelled".to_string());
+    }
+    // Short lock: clone the root, then release. The worker does the rest.
+    let root = require_lib(&self::db(&db)?)?.root.clone();
+    queue
+        .tx
+        .send(ImportJob {
+            root,
+            kind: ImportKind::Custom,
+            paths,
+            job_id: job_id.clone(),
+        })
+        .map_err(|e| format!("import worker unavailable: {e}"))?;
+    Ok(job_id)
 }
 
 #[cfg(test)]

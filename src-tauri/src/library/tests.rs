@@ -43,7 +43,7 @@ fn wav_buf() -> crate::player::LoopBuffer {
 fn migrate_starts_at_current_schema() {
     let root = tmp_root("migrate");
     let lib = Library::open(&root).unwrap();
-    assert_eq!(lib.schema_version().unwrap(), 5);
+    assert_eq!(lib.schema_version().unwrap(), 6);
     assert!(root.join("Custom Loops").is_dir());
     assert!(root.join("olooper.db").is_file());
     std::fs::remove_dir_all(&root).ok();
@@ -285,7 +285,7 @@ fn import_reports_extraction_stage_before_a_sound_failure() {
     let tags = define_sound_tag(1, FORMAT_MP3, &fake_mp3(0));
     let swf = crate::import::swf::parse(&fws_file(5, &tags)).unwrap();
     let mut stages = Vec::new();
-    let err = lib
+    let (_, err) = lib
         .import_sounds_with_progress(
             "Looper",
             "swf",
@@ -530,5 +530,146 @@ fn custom_import_garbage_fails_per_file() {
     assert!(reps[0].error.is_some() && !reps[0].added);
     assert!(reps[1].added);
     assert_eq!(lib.list_tracks().unwrap().len(), 1);
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn import_one_custom_adds_then_dedups() {
+    // Per-file entry point used by the background worker: same result as
+    // the batch `import_custom`, second call reports "already in library".
+    let root = tmp_root("one-custom");
+    let lib = Library::open(&root).unwrap();
+    let good = root.join("ok.wav");
+    write_wav(&good, &[0; 16000], 8000);
+    let path = good.to_str().unwrap().to_string();
+    let first = lib.import_one_custom(&path);
+    assert!(first.added);
+    assert!(first.track_id.is_some());
+    assert!(first.error.is_none());
+    let second = lib.import_one_custom(&path);
+    assert!(!second.added);
+    assert_eq!(second.error.as_deref(), Some("already in library"));
+    assert_eq!(lib.list_tracks().unwrap().len(), 1);
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn loop_buffer_to_wav_roundtrips() {
+    let buf = wav_buf();
+    let wav = Library::loop_buffer_to_wav(&buf);
+    // Must start with RIFF header.
+    assert_eq!(&wav[..4], b"RIFF");
+    assert_eq!(&wav[8..12], b"WAVE");
+    // Must decode back to the same shape.
+    let decoded = crate::player::decode_bytes(&wav).unwrap();
+    assert_eq!(decoded.frames(), buf.frames());
+    assert_eq!(decoded.rate, buf.rate);
+    assert_eq!(decoded.channels, buf.channels);
+    assert_eq!(decoded.samples, buf.samples);
+}
+
+#[test]
+fn trim_mp3_gapless_returns_none_when_no_trim_needed() {
+    // Both zero → no trim.
+    let buf = wav_buf();
+    let wav = Library::loop_buffer_to_wav(&buf);
+    let result = Library::trim_mp3_gapless(&wav, 0, 0);
+    assert!(result.is_none());
+}
+
+#[test]
+fn trim_mp3_gapless_trims_valid_range() {
+    // Create a WAV that decodes to 800 frames, then trim to [100, 500).
+    let buf = wav_buf();
+    assert_eq!(buf.frames(), 800);
+    let wav = Library::loop_buffer_to_wav(&buf);
+    let (trimmed, out_wav) = Library::trim_mp3_gapless(&wav, 100, 400).unwrap();
+    assert_eq!(trimmed.frames(), 400);
+    assert_eq!(trimmed.rate, buf.rate);
+    assert_eq!(trimmed.channels, buf.channels);
+    // Verify the samples match the original slice.
+    let ch = buf.channels as usize;
+    assert_eq!(trimmed.samples, buf.samples[100 * ch..500 * ch]);
+    // Output WAV must decode to the same trimmed buffer.
+    let redecoded = crate::player::decode_bytes(&out_wav).unwrap();
+    assert_eq!(redecoded.samples, trimmed.samples);
+}
+
+#[test]
+fn trim_mp3_gapless_clamps_to_buffer_end() {
+    let buf = wav_buf(); // 800 frames
+    let wav = Library::loop_buffer_to_wav(&buf);
+    // Request [700, 2000) → clamped to [700, 800).
+    let (trimmed, _) = Library::trim_mp3_gapless(&wav, 700, 1300).unwrap();
+    assert_eq!(trimmed.frames(), 100);
+}
+
+#[test]
+fn trim_mp3_gapless_rejects_out_of_range() {
+    let buf = wav_buf(); // 800 frames
+    let wav = Library::loop_buffer_to_wav(&buf);
+    // start >= total_frames → None.
+    assert!(Library::trim_mp3_gapless(&wav, 800, 100).is_none());
+    // seek_samples=500, sample_count=0 → valid: trim leading 500, keep rest.
+    let (trimmed, _) = Library::trim_mp3_gapless(&wav, 500, 0).unwrap();
+    assert_eq!(trimmed.frames(), 300);
+}
+
+#[test]
+fn open_enables_wal_mode() {
+    // The background import worker holds its own connection; WAL is what
+    // lets it write while the main connection serves readers.
+    let root = tmp_root("wal");
+    let lib = Library::open(&root).unwrap();
+    let mode: String = lib
+        .conn
+        .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(mode.to_lowercase(), "wal");
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn second_connection_reads_while_first_writes() {
+
+    // Mirrors the worker pattern: one handle imports, another lists.
+    // With WAL + busy_timeout neither side may see "database is locked".
+    let root = tmp_root("two-conn");
+    let main = Library::open(&root).unwrap();
+    let buf = wav_buf();
+    let audio = root.join("Custom Loops").join("w.wav");
+    std::fs::write(&audio, b"fake").unwrap();
+    main.add_track(
+        "w",
+        "Custom Loops",
+        &audio,
+        "custom",
+        "/src/w.wav",
+        "hash-w",
+        0,
+        None,
+        None,
+        "wav",
+        &buf,
+        0,
+        0,
+    )
+    .unwrap();
+    let worker_root = root.clone();
+    let handle = std::thread::spawn(move || {
+        let worker = Library::open(&worker_root).unwrap();
+        for i in 0..20 {
+            let tracks = worker.list_tracks().expect("worker read locked out");
+            assert!(!tracks.is_empty());
+            worker
+                .set_favorite(tracks[0].id, i % 2 == 0)
+                .expect("worker write locked out");
+        }
+    });
+    for _ in 0..20 {
+        let tracks = main.list_tracks().expect("main read locked out");
+        assert_eq!(tracks.len(), 1);
+    }
+    handle.join().expect("worker thread panicked");
     std::fs::remove_dir_all(&root).ok();
 }

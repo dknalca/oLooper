@@ -14,7 +14,7 @@ use sha2::{Digest as _, Sha256};
 use crate::import::swf::Sound;
 
 /// Current schema version (`PRAGMA user_version`).
-const SCHEMA_VERSION: i32 = 5;
+const SCHEMA_VERSION: i32 = 6;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Track {
@@ -32,6 +32,8 @@ pub struct Track {
     pub sample_rate: i64,
     pub channels: i64,
     pub duration_ms: i64,
+    pub seek_samples: i64,
+    pub trimmed_leading: i64,
     pub bpm: Option<f64>,
     pub bpm_confidence: Option<f64>,
     pub bpm_source: Option<String>,
@@ -39,6 +41,12 @@ pub struct Track {
     pub loop_start_ms: i64,
     pub loop_end_ms: i64,
     pub loop_enabled: bool,
+    pub loop_start_frame: i64,
+    pub loop_end_frame: i64,
+    pub loop_origin: String,
+    pub loop_quality: f64,
+    pub loop_needs_review: bool,
+    pub total_frames: i64,
     pub imported_at: i64,
     pub updated_at: i64,
     pub favorite: bool,
@@ -127,6 +135,12 @@ impl Library {
         // Enable foreign key enforcement (off by default in SQLite).
         conn.execute_batch("PRAGMA foreign_keys = ON;")
             .map_err(|e| format!("cannot enable foreign keys: {e}"))?;
+        // WAL lets a background import connection write while the main
+        // connection serves readers (library list, waveform). Persists in
+        // the db file; re-asserted on every open. Busy timeout absorbs
+        // short writer/writer contention instead of failing reads.
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")
+            .map_err(|e| format!("cannot set WAL mode: {e}"))?;
         migrate(&conn)?;
         Ok(Self {
             conn,
@@ -145,9 +159,10 @@ impl Library {
             .conn
             .prepare(
                 "SELECT id,title,looper_name,file_path,source_type,source_path,source_hash,\
-                 source_sound_id,codec,sample_rate,channels,duration_ms,\
+                 source_sound_id,codec,sample_rate,channels,duration_ms,seek_samples,trimmed_leading,\
                  bpm,bpm_confidence,bpm_source,primary_cue_ms,loop_start_ms,\
-                   loop_end_ms,loop_enabled,imported_at,updated_at,favorite,tags,last_played_at \
+                   loop_end_ms,loop_enabled,loop_start_frame,loop_end_frame,loop_origin,\
+                   loop_quality,loop_needs_review,total_frames,imported_at,updated_at,favorite,tags,last_played_at \
                  FROM tracks ORDER BY id",
             )
             .map_err(|e| e.to_string())?;
@@ -168,18 +183,26 @@ impl Library {
                     sample_rate: r.get(9)?,
                     channels: r.get(10)?,
                     duration_ms: r.get(11)?,
-                    bpm: r.get(12)?,
-                    bpm_confidence: r.get(13)?,
-                    bpm_source: r.get(14)?,
-                    primary_cue_ms: r.get(15)?,
-                    loop_start_ms: r.get(16)?,
-                    loop_end_ms: r.get(17)?,
-                    loop_enabled: r.get(18)?,
-                    imported_at: r.get(19)?,
-                    updated_at: r.get(20)?,
-                    favorite: r.get(21)?,
-                    tags: r.get(22)?,
-                    last_played_at: r.get(23)?,
+                    seek_samples: r.get(12)?,
+                    trimmed_leading: r.get(13)?,
+                    bpm: r.get(14)?,
+                    bpm_confidence: r.get(15)?,
+                    bpm_source: r.get(16)?,
+                    primary_cue_ms: r.get(17)?,
+                    loop_start_ms: r.get(18)?,
+                    loop_end_ms: r.get(19)?,
+                    loop_enabled: r.get(20)?,
+                    loop_start_frame: r.get(21)?,
+                    loop_end_frame: r.get(22)?,
+                    loop_origin: r.get(23)?,
+                    loop_quality: r.get(24)?,
+                    loop_needs_review: r.get(25)?,
+                    total_frames: r.get(26)?,
+                    imported_at: r.get(27)?,
+                    updated_at: r.get(28)?,
+                    favorite: r.get(29)?,
+                    tags: r.get(30)?,
+                    last_played_at: r.get(31)?,
                 })
             })
             .map_err(|e| e.to_string())?;
@@ -211,6 +234,7 @@ impl Library {
     ) -> Result<(i64, bool), String> {
         let now = now_secs();
         let duration = buf.duration_ms() as i64;
+        let total_frames = buf.frames() as i64;
         let n = self
             .conn
             .execute(
@@ -219,9 +243,10 @@ impl Library {
                  exe_offset,exe_length,codec,sample_rate,channels,duration_ms,\
                  seek_samples,trimmed_leading,\
                  primary_cue_ms,loop_start_ms,loop_end_ms,loop_enabled,\
+                 loop_start_frame,loop_end_frame,loop_origin,loop_quality,loop_needs_review,total_frames,\
                  imported_at,updated_at) \
-                  VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,\
-                  0,0,?13,1,?16,?16) \
+                   VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,\
+                   0,0,?13,1,0,?16,'manual',1.0,0,?16,?17,?17) \
                  ON CONFLICT(source_hash,source_sound_id) DO NOTHING",
                 rusqlite::params![
                     title,
@@ -239,6 +264,7 @@ impl Library {
                     duration,
                     seek_samples,
                     trimmed_leading,
+                    total_frames,
                     now,
                 ],
             )
@@ -273,11 +299,22 @@ impl Library {
             return Err("cue outside track duration".to_string());
         }
         crate::player::check_region(start_ms as u64, end_ms as u64, t.duration_ms as u64)?;
+        // Use stored total_frames to avoid round-trip precision loss.
+        let rate = t.sample_rate as u32;
+        let total = if t.total_frames > 0 {
+            t.total_frames as u64
+        } else {
+            // Fallback for legacy rows without total_frames.
+            t.duration_ms as u64 * rate as u64 / 1000
+        };
+        let start_frame = (start_ms as u64 * rate as u64 / 1000).min(total) as i64;
+        let end_frame = ((end_ms as u64 * rate as u64 / 1000).max(1).min(total)) as i64;
         self.conn
             .execute(
                 "UPDATE tracks SET primary_cue_ms=?1,loop_start_ms=?2,loop_end_ms=?3,\
-                 loop_enabled=?4,updated_at=?5 WHERE id=?6",
-                rusqlite::params![cue_ms, start_ms, end_ms, enabled, now_secs(), id],
+                 loop_enabled=?4,loop_start_frame=?5,loop_end_frame=?6,loop_origin='manual',\
+                 updated_at=?7 WHERE id=?8",
+                rusqlite::params![cue_ms, start_ms, end_ms, enabled, start_frame, end_frame, now_secs(), id],
             )
             .map_err(|e| e.to_string())?;
         self.get_track(id)?
@@ -606,6 +643,68 @@ impl Library {
             sounds,
             |_, _, _| Ok(()),
         )
+        .map_err(|(_, e)| e)
+    }
+
+    /// Encode a `LoopBuffer` as a minimal PCM16 WAV byte vector.
+    fn loop_buffer_to_wav(buf: &crate::player::LoopBuffer) -> Vec<u8> {
+        let channels = buf.channels as u32;
+        let rate = buf.rate;
+        let byte_align = channels * 2;
+        let byte_rate = rate * byte_align;
+        let data_bytes = (buf.samples.len() * 2) as u32;
+        let mut wav = Vec::with_capacity(44 + buf.samples.len() * 2);
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&(36 + data_bytes).to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&(channels as u16).to_le_bytes());
+        wav.extend_from_slice(&rate.to_le_bytes());
+        wav.extend_from_slice(&byte_rate.to_le_bytes());
+        wav.extend_from_slice(&(byte_align as u16).to_le_bytes());
+        wav.extend_from_slice(&16u16.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&data_bytes.to_le_bytes());
+        for s in &buf.samples {
+            wav.extend_from_slice(&s.to_le_bytes());
+        }
+        wav
+    }
+
+    /// Decode MP3 bytes, trim to `[seek_samples, seek_samples + sample_count)`,
+    /// and return the trimmed `LoopBuffer` plus its WAV byte encoding.
+    /// Returns `None` when seek_samples and sample_count are both zero (no trim
+    /// needed) or when the declared range is invalid.
+    fn trim_mp3_gapless(
+        mp3_bytes: &[u8],
+        seek_samples: u16,
+        sample_count: u32,
+    ) -> Option<(crate::player::LoopBuffer, Vec<u8>)> {
+        if seek_samples == 0 && sample_count == 0 {
+            return None;
+        }
+        let buf = crate::player::decode_bytes(mp3_bytes).ok()?;
+        let total = buf.frames();
+        let channels = buf.channels as usize;
+        let start = seek_samples as usize;
+        let end = if sample_count > 0 {
+            (start + sample_count as usize).min(total)
+        } else {
+            total
+        };
+        if start >= total || end <= start {
+            return None;
+        }
+        let start_sample = start * channels;
+        let end_sample = end * channels;
+        let trimmed = crate::player::LoopBuffer {
+            samples: buf.samples[start_sample..end_sample].to_vec(),
+            channels: buf.channels,
+            rate: buf.rate,
+        };
+        let wav = Self::loop_buffer_to_wav(&trimmed);
+        Some((trimmed, wav))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -619,21 +718,27 @@ impl Library {
         exe_length: Option<i64>,
         sounds: &[Sound],
         mut progress: F,
-    ) -> Result<ImportReport, String>
+    ) -> Result<ImportReport, (ImportReport, String)>
     where
         F: FnMut(&str, usize, usize) -> Result<(), String>,
     {
         if sounds.is_empty() {
-            return Err("no extractable sounds".to_string());
+            return Err((ImportReport { looper: looper.to_string(), added: 0, already_there: 0, failed: vec![], track_ids: vec![] }, "no extractable sounds".to_string()));
         }
         let looper = sanitize_name(looper);
         let dir = self.root.join(&looper);
-        std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create looper dir: {e}"))?;
+        std::fs::create_dir_all(&dir).map_err(|e| {
+            let partial = ImportReport { looper: looper.clone(), added: 0, already_there: 0, failed: vec![], track_ids: vec![] };
+            (partial, format!("cannot create looper dir: {e}"))
+        })?;
 
         let mut added = 0;
         let mut already_there = 0;
         let mut failed = Vec::new();
         let mut track_ids = Vec::new();
+        let make_partial = |looper: &str, added: usize, already_there: usize, failed: Vec<FailedSound>, track_ids: Vec<i64>| {
+            ImportReport { looper: looper.to_string(), added, already_there, failed, track_ids }
+        };
         for (i, s) in sounds.iter().enumerate() {
             let current = i + 1;
             let total = sounds.len();
@@ -646,7 +751,7 @@ impl Library {
                     |r| r.get(0),
                 )
                 .optional()
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| (make_partial(&looper, added, already_there, failed.clone(), track_ids.clone()), e.to_string()))?;
             if let Some(id) = known {
                 already_there += 1;
                 track_ids.push(id);
@@ -659,7 +764,7 @@ impl Library {
                 });
                 continue;
             }
-            progress("extracting", current, total)?;
+            progress("extracting", current, total).map_err(|e| (make_partial(&looper, added, already_there, failed.clone(), track_ids.clone()), e))?;
             let buf = match crate::player::decode_bytes(&s.frames) {
                 Ok(b) => b,
                 Err(e) => {
@@ -671,13 +776,29 @@ impl Library {
                     continue;
                 }
             };
-            progress("adjusting BPM", current, total)?;
+            // MP3 gapless: trim encoder priming + trailing padding when SWF
+            // provides seek_samples / sample_count.  The trimmed result is
+            // written as WAV so the player loads exact-length PCM without
+            // needing metadata at load time.
+            let (buf, file_bytes, file_codec) =
+                if s.codec == "mp3" && (s.seek_samples > 0 || s.sample_count > 0) {
+                    if let Some((trimmed, wav)) =
+                        Self::trim_mp3_gapless(&s.frames, s.seek_samples, s.sample_count)
+                    {
+                        (trimmed, wav, "wav".to_string())
+                    } else {
+                        (buf, s.frames.clone(), s.codec.clone())
+                    }
+                } else {
+                    (buf, s.frames.clone(), s.codec.clone())
+                };
+            progress("adjusting BPM", current, total).map_err(|e| (make_partial(&looper, added, already_there, failed.clone(), track_ids.clone()), e))?;
             let estimate = crate::analysis::estimate(&buf);
-            progress("adjusting loops", current, total)?;
-            let dest = dir.join(format!("{:02}_{}.{}", i + 1, s.id, s.codec));
-            let final_path = self.atomic_write(&dest, &s.frames)?;
+            progress("adjusting loops", current, total).map_err(|e| (make_partial(&looper, added, already_there, failed.clone(), track_ids.clone()), e))?;
+            let dest = dir.join(format!("{:02}_{}.{}", i + 1, s.id, file_codec));
+            let final_path = self.atomic_write(&dest, &file_bytes).map_err(|e| (make_partial(&looper, added, already_there, failed.clone(), track_ids.clone()), e))?;
             let title = format!("{:02} · {}", i + 1, looper);
-            progress("inserting in library", current, total)?;
+            progress("inserting in library", current, total).map_err(|e| (make_partial(&looper, added, already_there, failed.clone(), track_ids.clone()), e))?;
             match self.add_track(
                 &title,
                 &looper,
@@ -688,14 +809,14 @@ impl Library {
                 s.id as i64,
                 exe_offset,
                 exe_length,
-                &s.codec,
+                &file_codec,
                 &buf,
-                s.seek_samples as i64,
-                s.trimmed_leading as i64,
+                0, // seek_samples already applied
+                0, // trimmed_leading already applied
             ) {
                 Ok((id, true)) => {
                     if let Some(estimate) = estimate {
-                        self.update_bpm(id, estimate.bpm, Some(estimate.confidence), false)?;
+                        self.update_bpm(id, estimate.bpm, Some(estimate.confidence), false).map_err(|e| (make_partial(&looper, added, already_there, failed.clone(), track_ids.clone()), e))?;
                     }
                     added += 1;
                     track_ids.push(id);
@@ -708,13 +829,13 @@ impl Library {
                 }
                 Err(e) => {
                     let _ = std::fs::remove_file(&final_path);
-                    return Err(e);
+                    return Err((make_partial(&looper, added, already_there, failed, track_ids), e));
                 }
             }
         }
         if added == 0 && already_there == 0 {
             let _ = std::fs::remove_dir(&dir); // don't leave empty dirs
-            return Err("no sounds could be imported".to_string());
+            return Err((make_partial(&looper, 0, 0, failed, track_ids), "no sounds could be imported".to_string()));
         }
         Ok(ImportReport {
             looper,
@@ -743,7 +864,10 @@ impl Library {
         paths.iter().map(|p| self.import_one_custom(p)).collect()
     }
 
-    fn import_one_custom(&self, path: &str) -> CustomReport {
+    /// Import one user audio file: validate → copy into `Custom Loops/` →
+    /// BPM estimate → row. Never touches the original. Public so the
+    /// background import worker can report progress per file.
+    pub fn import_one_custom(&self, path: &str) -> CustomReport {
         let fail = |reason: String| CustomReport {
             file: path.to_string(),
             added: false,
@@ -976,6 +1100,25 @@ fn migrate(conn: &Connection) -> Result<(), String> {
     if v < 5 {
         conn.execute_batch("BEGIN; ALTER TABLE tracks ADD COLUMN tags TEXT NOT NULL DEFAULT ''; ALTER TABLE tracks ADD COLUMN last_played_at INTEGER; PRAGMA user_version = 5; COMMIT;")
             .map_err(|e| format!("migration 4→5 failed: {e}"))?;
+    }
+    if v < 6 {
+        conn.execute_batch(
+            "BEGIN;
+             ALTER TABLE tracks ADD COLUMN loop_start_frame INTEGER NOT NULL DEFAULT 0;
+             ALTER TABLE tracks ADD COLUMN loop_end_frame INTEGER NOT NULL DEFAULT 0;
+             ALTER TABLE tracks ADD COLUMN loop_origin TEXT NOT NULL DEFAULT 'manual';
+             ALTER TABLE tracks ADD COLUMN loop_quality REAL NOT NULL DEFAULT 1.0;
+             ALTER TABLE tracks ADD COLUMN loop_needs_review INTEGER NOT NULL DEFAULT 0;
+             ALTER TABLE tracks ADD COLUMN total_frames INTEGER NOT NULL DEFAULT 0;
+             PRAGMA user_version = 6;
+             COMMIT;",
+        )
+        .map_err(|e| format!("migration 5→6 failed: {e}"))?;
+        // Backfill total_frames from duration_ms and sample_rate for existing rows.
+        conn.execute_batch(
+            "UPDATE tracks SET total_frames = duration_ms * sample_rate / 1000 WHERE total_frames = 0;",
+        )
+        .map_err(|e| format!("migration 5→6 backfill failed: {e}"))?;
     }
     Ok(())
 }

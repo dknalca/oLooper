@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   libraryList,
   libraryMarkPlayed,
@@ -10,6 +10,8 @@ import {
   librarySetFavorite,
   libraryUpdateMetadata,
   playerLoad,
+  playerSetDiagnostics,
+  playerStatus,
   pickDirectory,
   playerPlay,
   revealInFileManager,
@@ -26,6 +28,10 @@ function groupName(track: Track): string {
   return track.looper_name;
 }
 
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 export default function Sidebar({ libraryReady, refreshKey, onTrackSelected }: Props) {
   const [tracks, setTracks] = useState<Track[]>([]);
   const [error, setError] = useState<string | null>(null);
@@ -40,6 +46,10 @@ export default function Sidebar({ libraryReady, refreshKey, onTrackSelected }: P
   const [contextMenu, setContextMenu] = useState<number | null>(null);
   const [groupMenu, setGroupMenu] = useState<string | null>(null);
   const [selectedIds, setSelectedIds] = useState<number[]>([]);
+  const [loadingId, setLoadingId] = useState<number | null>(null);
+  // Newest selection wins: older in-flight loads are abandoned (the backend
+  // discards superseded decodes by load generation).
+  const loadSeq = useRef(0);
 
   const refresh = () => libraryList()
     .then((next) => { setError(null); setTracks(next); setSelectedIds((ids) => ids.filter((id) => next.some((track) => track.id === id))); })
@@ -85,13 +95,34 @@ export default function Sidebar({ libraryReady, refreshKey, onTrackSelected }: P
   }, {});
 
   const playTrack = async (track: Track) => {
+    const my = loadSeq.current + 1;
+    loadSeq.current = my;
+    const previousId = activeId;
     setError(null);
+    // Immediate visual selection; decode happens in the background and the
+    // previous audio keeps playing until the new buffer proves valid.
     setActiveId(track.id);
+    setLoadingId(track.id);
     try {
-      await playerLoad(track.file_path);
+      let st = await playerLoad(track.file_path);
+      const deadline = Date.now() + 120_000;
+      while (st.loading && Date.now() < deadline) {
+        if (loadSeq.current !== my) return; // superseded by newer selection
+        await sleep(150);
+        st = await playerStatus();
+      }
+      if (loadSeq.current !== my) return;
+      if (st.loading) throw new Error("load timed out");
+      if (st.load_error) throw new Error(st.load_error);
+      if (st.path !== track.file_path) return; // another track won meanwhile
+      setLoadingId(null);
+      playerSetDiagnostics(track.loop_origin, track.loop_quality).catch(() => {});
       onTrackSelected(track, await playerPlay());
       libraryMarkPlayed(track.id).then(refresh).catch(() => {});
     } catch (e) {
+      if (loadSeq.current !== my) return;
+      setLoadingId(null);
+      setActiveId(previousId); // keep the previous (still sounding) track
       setError(String(e));
     }
   };
@@ -197,12 +228,12 @@ export default function Sidebar({ libraryReady, refreshKey, onTrackSelected }: P
                 >
                    <span className="flex min-w-0 items-center gap-2 text-text-secondary">
                      <input type="checkbox" checked={selectedIds.includes(track.id)} onClick={(event) => event.stopPropagation()} onChange={() => setSelectedIds((ids) => ids.includes(track.id) ? ids.filter((id) => id !== track.id) : [...ids, track.id])} aria-label={`Select ${track.title}`} />
-                    <span className="w-3 shrink-0 text-center">{activeId === track.id ? "▸" : "♪"}</span>
+                    <span className="w-3 shrink-0 text-center" title={loadingId === track.id ? "Loading audio…" : undefined}>{loadingId === track.id ? "…" : activeId === track.id ? "▸" : "♪"}</span>
                     <span className="truncate">{name}</span>
                   </span>
                    <span className="min-w-0"><span className="block truncate font-medium">{track.title}</span>{track.tags && <span className="block truncate text-[10px] text-text-secondary">{track.tags}</span>}</span>
                   <span className={`text-right text-[11px] tabular-nums ${track.bpm ? "text-success" : "text-text-secondary"}`}>
-                    {track.bpm ? `${Math.round(track.bpm)} ${track.bpm_source === "analyzed" ? "calc" : ""}` : "--"}
+                    {track.bpm ? `${Math.round(track.bpm)} bpm` : "--"}
                   </span>
                   <span className="text-right text-[11px] tabular-nums text-text-secondary">{(track.duration_ms / 1000).toFixed(1)}s</span>
                   <span className="flex justify-end gap-1">

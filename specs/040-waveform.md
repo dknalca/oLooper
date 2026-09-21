@@ -24,6 +24,14 @@ computation; rendering is canvas-only (no audio decoding per frame).
    delay selection or playback controls.
 7. Waveform peaks reuse the PCM buffer decoded by the player. A track switch
    must not reread or decode the same audio file solely for waveform display.
+8. Contention-free protocol: the request first tries the persistent disk
+   cache (no engine lock at all on a hit). On a miss it clones the player's
+   `Arc<LoopBuffer>` under a short read lock, releases the lock immediately,
+   and computes peaks off-lock. Each job is tagged with path + load
+   generation; after computing, the job re-checks the current generation and
+   discards its result (`"track changed …"` error) if the user already
+   selected another track. Peak computation never blocks track loading or
+   transport.
 
 ## Supported inputs
 
@@ -45,7 +53,10 @@ computation; rendering is canvas-only (no audio decoding per frame).
   directory. Cache keys include canonical path, file size, modification time,
   and bucket count, so replacing a track invalidates its prior waveform.
 - Cache entries are derived data only, written atomically and capped by the
-  existing bucket limit. Missing, corrupt, or unwritable cache entries fall
+  existing bucket limit. Every request logs one `[olooper:metrics]` line
+  with lookup/compute/store durations, lock waits, bucket count, audio
+  shape, and cache hit/miss. The UI shows `Generating waveform…` while a
+  miss computes. Missing, corrupt, or unwritable cache entries fall
   back to peak computation without affecting playback or source audio.
 
 ## Platform considerations
@@ -68,4 +79,4 @@ computation; rendering is canvas-only (no audio decoding per frame).
 ## Non-goals
 
 - Multiresolution/frequency-colored waveform, beat markers, stems view,
-  disk cache, pinch-zoom (fixed window + full-track fallback only).
+  pinch-zoom (fixed window + full-track fallback only).

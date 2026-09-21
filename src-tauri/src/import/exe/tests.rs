@@ -29,6 +29,18 @@ fn projector_stub(payload: &[u8]) -> Vec<u8> {
     exe
 }
 
+fn cws_payload(sound_id: u16) -> Vec<u8> {
+    use std::io::Write as _;
+    let fws = fws_payload(sound_id);
+    let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(&fws[8..]).unwrap();
+    let mut cws = b"CWS".to_vec();
+    cws.push(fws[3]);
+    cws.extend_from_slice(&fws[4..8]);
+    cws.extend_from_slice(&encoder.finish().unwrap());
+    cws
+}
+
 #[test]
 fn stub_with_appended_swf_locates_and_extracts() {
     let swf = fws_payload(9);
@@ -39,6 +51,15 @@ fn stub_with_appended_swf_locates_and_extracts() {
     let sounds = extract(&exe).unwrap();
     assert_eq!(sounds.sounds.len(), 1);
     assert_eq!(sounds.sounds[0].id, 9);
+}
+
+#[test]
+fn stub_with_compressed_swf_uses_remaining_overlay_bytes() {
+    let cws = cws_payload(11);
+    let exe = projector_stub(&cws);
+    let found = locate(&exe).unwrap();
+    assert_eq!(found.offset, 2 + 6 + 512);
+    assert_eq!(extract(&exe).unwrap().sounds[0].id, 11);
 }
 
 #[test]
@@ -76,4 +97,35 @@ fn largest_valid_candidate_wins() {
     exe.extend_from_slice(&big);
     let found = locate(&exe).unwrap();
     assert_eq!(found.length, big.len());
+}
+
+#[test]
+fn larger_content_wins_over_earlier_cws_stub() {
+    // Regression (collec_vol4): a small valid CWS loader stub placed BEFORE
+    // a larger valid CWS movie. The stub's stored slice (rest-of-file) is
+    // longer on disk, but the movie's declared content is larger, so the
+    // movie must win — otherwise a soundless stub shadows real content.
+    use std::io::Write as _;
+    let mut big_fws = fws_payload(2);
+    big_fws.pop();
+    big_fws.pop();
+    big_fws.extend_from_slice(&[0x00u8; 64]); // extra End tags
+    let new_len = big_fws.len() as u32;
+    big_fws[4..8].copy_from_slice(&new_len.to_le_bytes());
+    let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+    enc.write_all(&big_fws[8..]).unwrap();
+    let mut big = b"CWS".to_vec();
+    big.push(big_fws[3]);
+    big.extend_from_slice(&big_fws[4..8]);
+    big.extend_from_slice(&enc.finish().unwrap());
+    let small = cws_payload(1);
+    assert!(big.len() > small.len());
+    let mut exe = b"MZ".to_vec();
+    exe.extend_from_slice(&[0xAA; 64]);
+    let big_off = exe.len() + small.len();
+    exe.extend_from_slice(&small);
+    exe.extend_from_slice(&big);
+    let found = locate(&exe).unwrap();
+    assert_eq!(found.offset, big_off);
+    assert_eq!(extract(&exe).unwrap().sounds[0].id, 2);
 }

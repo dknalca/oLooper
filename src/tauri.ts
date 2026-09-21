@@ -26,6 +26,21 @@ export interface PlayerStatus {
   volume_pct: number;
   speed_pct: number;
   pitch_lock: boolean;
+  /** A WSOLA stretch worker is running; current audio plays untouched. */
+  pitch_preparing: boolean;
+  pitch_error: string | null;
+  /** A background decode is running; previous audio (if any) still live. */
+  loading: boolean;
+  load_error: string | null;
+  /** Frame-precise values for internal use. */
+  position_frame: number;
+  loop_start_frame: number;
+  loop_end_frame: number;
+  total_frames: number;
+  /** Loop origin: "manual" or "automatic". */
+  loop_origin: string;
+  /** Loop quality score 0.0–1.0. */
+  loop_quality: number;
 }
 
 export function playerLoad(path: string): Promise<PlayerStatus> {
@@ -60,6 +75,10 @@ export function playerSetLoop(startMs: number, endMs: number): Promise<PlayerSta
   return invoke<PlayerStatus>("player_set_loop", { startMs, endMs });
 }
 
+export function playerSetLoopSnapped(startMs: number, endMs: number): Promise<PlayerStatus> {
+  return invoke<PlayerStatus>("player_set_loop_snapped", { startMs, endMs });
+}
+
 export function playerSetLoopEnabled(enabled: boolean): Promise<PlayerStatus> {
   return invoke<PlayerStatus>("player_set_loop_enabled", { enabled });
 }
@@ -70,6 +89,79 @@ export function playerStatus(): Promise<PlayerStatus> {
 
 export function playerSeek(positionMs: number): Promise<PlayerStatus> {
   return invoke<PlayerStatus>("player_seek", { positionMs });
+}
+
+export interface SampleWindow {
+  start_frame: number;
+  end_frame: number;
+  sample_rate: number;
+  channels: number;
+  samples: number[];
+}
+
+export function playerSampleWindow(
+  centerFrame: number,
+  radiusFrames: number,
+  maxPoints: number,
+): Promise<SampleWindow> {
+  return invoke<SampleWindow>("player_sample_window", {
+    centerFrame,
+    radiusFrames,
+    maxPoints,
+  });
+}
+
+export interface SnappedBoundary {
+  frame: number;
+  ms: number;
+  discontinuity: number;
+  zero_crossing_found: boolean;
+}
+
+export function playerSnapLoopBoundary(
+  boundary: "start" | "end",
+  requestedFrame: number,
+  otherBoundaryFrame: number,
+): Promise<SnappedBoundary> {
+  return invoke<SnappedBoundary>("player_snap_loop_boundary", {
+    boundary,
+    requestedFrame,
+    otherBoundaryFrame,
+  });
+}
+
+export interface AutoLoopCandidate {
+  start_frame: number;
+  end_frame: number;
+  quality: number;
+  discontinuity: number;
+  zero_crossing_start: boolean;
+  zero_crossing_end: boolean;
+  bpm_aligned: boolean;
+  onset_frame: number;
+  duration_frames: number;
+}
+
+export interface AutoLoopResult {
+  candidate: AutoLoopCandidate | null;
+  bpm: number | null;
+  bpm_confidence: number | null;
+  total_frames: number;
+  sample_rate: number;
+  all_candidates: AutoLoopCandidate[];
+}
+
+export function playerAutoLoop(
+  bpm?: number,
+): Promise<AutoLoopResult> {
+  return invoke<AutoLoopResult>("player_auto_loop", { bpm: bpm ?? null });
+}
+
+export function playerSetDiagnostics(
+  loopOrigin: string,
+  loopQuality: number,
+): Promise<PlayerStatus> {
+  return invoke<PlayerStatus>("player_set_diagnostics", { loopOrigin, loopQuality });
 }
 
 export interface WaveformData {
@@ -100,6 +192,8 @@ export interface Track {
   sample_rate: number;
   channels: number;
   duration_ms: number;
+  seek_samples: number;
+  trimmed_leading: number;
   bpm: number | null;
   bpm_confidence: number | null;
   bpm_source: string | null;
@@ -107,6 +201,12 @@ export interface Track {
   loop_start_ms: number;
   loop_end_ms: number;
   loop_enabled: boolean;
+  loop_start_frame: number;
+  loop_end_frame: number;
+  loop_origin: string;
+  loop_quality: number;
+  loop_needs_review: boolean;
+  total_frames: number;
   imported_at: number;
   updated_at: number;
   favorite: boolean;
@@ -130,6 +230,10 @@ export interface ImportProgress {
   detail: string;
   done: boolean;
   error: string | null;
+  /** Present only on the final `done` event of worker-run imports. */
+  report: ImportReport | null;
+  /** Same, for custom-audio jobs (per-file results). */
+  custom_report: CustomReport[] | null;
 }
 
 function importJobId(): string {
@@ -156,12 +260,59 @@ export function libraryList(): Promise<Track[]> {
   return invoke<Track[]>("library_list");
 }
 
-export function importSwf(path: string, jobId = importJobId()): Promise<ImportReport> {
-  return invoke<ImportReport>("import_swf", { path, jobId });
+export function importSwf(path: string, jobId = importJobId()): Promise<string> {
+  return invoke<string>("import_swf", { path, jobId });
 }
 
-export function importExe(path: string, jobId = importJobId()): Promise<ImportReport> {
-  return invoke<ImportReport>("import_exe", { path, jobId });
+/** Resolve when the matching `done` event arrives; reject on failure/timeout. */
+function waitForImportDone(jobId: string, timeoutMs = 30 * 60 * 1000): Promise<ImportProgress> {
+  return new Promise((resolve, reject) => {
+    let unlisten: UnlistenFn | undefined;
+    const timeout = window.setTimeout(() => {
+      unlisten?.();
+      reject(new Error("import timed out"));
+    }, timeoutMs);
+    listenImportProgress((progress) => {
+      if (progress.job_id !== jobId || !progress.done) return;
+      window.clearTimeout(timeout);
+      unlisten?.();
+      resolve(progress);
+    }).then((off) => {
+      unlisten = off;
+    }).catch(reject);
+  });
+}
+
+/**
+ * Enqueue an SWF import on the background worker and await its final report.
+ * Keeps the `Promise<ImportReport>` shape so existing call sites don't change.
+ * The listener is registered before the IPC call to avoid a race where the
+ * worker finishes before `waitForImportDone` starts listening.
+ */
+export async function importSwfAndWait(path: string, jobId = importJobId()): Promise<ImportReport> {
+  const donePromise = waitForImportDone(jobId);
+  await importSwf(path, jobId);
+  const done = await donePromise;
+  if (done.report) return done.report;
+  if (done.error) throw new Error(done.error);
+  throw new Error("import finished without a report");
+}
+
+export function importExe(path: string, jobId = importJobId()): Promise<string> {
+  return invoke<string>("import_exe", { path, jobId });
+}
+
+/**
+ * Enqueue an EXE import on the background worker and await its final report.
+ * Keeps the `Promise<ImportReport>` shape so existing call sites don't change.
+ */
+export async function importExeAndWait(path: string, jobId = importJobId()): Promise<ImportReport> {
+  const donePromise = waitForImportDone(jobId);
+  await importExe(path, jobId);
+  const done = await donePromise;
+  if (done.report) return done.report;
+  if (done.error) throw new Error(done.error);
+  throw new Error("import finished without a report");
 }
 
 export function cancelImport(jobId: string): Promise<void> {
@@ -183,8 +334,22 @@ export interface CustomReport {
   error: string | null;
 }
 
-export function importCustom(paths: string[]): Promise<CustomReport[]> {
-  return invoke<CustomReport[]>("import_custom", { paths });
+export function importCustom(paths: string[], jobId = importJobId()): Promise<string> {
+  return invoke<string>("import_custom", { paths, jobId });
+}
+
+/**
+ * Enqueue a custom-audio import on the background worker and await the
+ * per-file results. Keeps the `Promise<CustomReport[]>` shape so existing
+ * call sites don't change.
+ */
+export async function importCustomAndWait(paths: string[], jobId = importJobId()): Promise<CustomReport[]> {
+  const donePromise = waitForImportDone(jobId);
+  await importCustom(paths, jobId);
+  const done = await donePromise;
+  if (done.custom_report) return done.custom_report;
+  if (done.error) throw new Error(done.error);
+  throw new Error("import finished without a report");
 }
 
 // --- File dialog wrappers ---

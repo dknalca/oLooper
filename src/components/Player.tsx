@@ -1,11 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   libraryGetSlots,
+  libraryDeleteSlot,
   librarySetSlot,
+  playerAutoLoop,
   playerPause,
   playerPlay,
   playerSeek,
-  playerSetLoop,
+  playerSetLoopSnapped,
   playerSetLoopEnabled,
   playerSetSpeed,
   playerSetPitchLock,
@@ -24,7 +26,7 @@ function fmt(ms: number): string {
   )}`;
 }
 
-const SLOT_LABELS = ["A", "B", "C", "D"];
+const SLOT_LABELS = ["1", "2", "3", "4"];
 
 interface Props {
   status: PlayerStatus | null;
@@ -41,14 +43,16 @@ export default function Player({ status: st, trackId, onStatusChange }: Props) {
   const scrubRef = useRef<HTMLDivElement>(null);
   const [isScrubbing, setIsScrubbing] = useState(false);
 
-  // Preferences are applied only after a track has been loaded by the user.
+  // Preferences are applied after a track becomes ready. Deps include the
+  // path (not just `loaded`) because background track swaps keep `loaded`
+  // true while changing the underlying audio.
   useEffect(() => {
-    if (!st?.loaded) return;
+    if (!st?.loaded || st.loading) return;
     const speed = Number(localStorage.getItem("olooper.player.speed"));
     const pitchLock = localStorage.getItem("olooper.player.pitch-lock");
     if (Number.isFinite(speed) && speed >= 50 && speed <= 200 && speed !== st.speed_pct) run(playerSetSpeed(speed));
     if (pitchLock !== null && (pitchLock === "true") !== st.pitch_lock) run(playerSetPitchLock(pitchLock === "true"));
-  }, [st?.loaded]);
+  }, [st?.loaded, st?.loading, st?.path]);
 
   useEffect(() => {
     if (!st?.loaded) return;
@@ -59,6 +63,10 @@ export default function Player({ status: st, trackId, onStatusChange }: Props) {
   // Loop slots
   const [slots, setSlots] = useState<LoopSlot[]>([]);
   const [activeSlot, setActiveSlot] = useState<number>(1);
+
+  useEffect(() => {
+    window.dispatchEvent(new CustomEvent<LoopSlot[]>("olooper:cues", { detail: slots }));
+  }, [slots]);
 
   const run = useCallback(
     (p: Promise<PlayerStatus>) =>
@@ -74,12 +82,14 @@ export default function Player({ status: st, trackId, onStatusChange }: Props) {
     [onStatusChange],
   );
 
-  // Poll native position at 4 Hz.
+  // Poll native position at 4 Hz while playing, and also while a
+  // background job (decode/stretch) is pending so progress and async
+  // errors surface without new event plumbing.
   useEffect(() => {
-    if (!st?.playing) return;
+    if (!st?.playing && !st?.loading && !st?.pitch_preparing) return;
     const id = setInterval(() => playerStatus().then(onStatusChange).catch(() => {}), 250);
     return () => clearInterval(id);
-  }, [st?.playing]);
+  }, [st?.playing, st?.loading, st?.pitch_preparing]);
 
   // Expose state to keyboard shortcuts hook.
   useEffect(() => {
@@ -103,13 +113,7 @@ export default function Player({ status: st, trackId, onStatusChange }: Props) {
       return;
     }
     libraryGetSlots(trackId).then((saved) => {
-      setSlots(saved);
-      const slotA = saved.find((slot) => slot.slot === 1);
-      if (slotA?.enabled) {
-        setLoopStart(String(slotA.cue_ms));
-        setLoopEnd(String(slotA.loop_end_ms));
-        run(playerSetLoop(slotA.loop_start_ms, slotA.loop_end_ms));
-      }
+      setSlots(saved.filter((slot) => slot.slot > 1 && slot.enabled));
     }).catch(() => setSlots([]));
   }, [trackId, run]);
 
@@ -145,9 +149,9 @@ export default function Player({ status: st, trackId, onStatusChange }: Props) {
   const saveToSlot = (slot: number) => {
     if (!trackId) return;
     const label = SLOT_LABELS[slot - 1];
-    const cueMs = Number(loopStart) || 0;
-    const startMs = Number(loopStart) || 0;
-    const endMs = Number(loopEnd) || st?.duration_ms || 0;
+    const cueMs = st?.position_ms ?? 0;
+    const startMs = st?.loop_start_ms ?? 0;
+    const endMs = st?.loop_end_ms ?? 0;
     librarySetSlot(trackId, slot, label, cueMs, startMs, endMs, true)
       .then((saved) => {
         setSlots((prev) => {
@@ -167,15 +171,23 @@ export default function Player({ status: st, trackId, onStatusChange }: Props) {
     const s = slots.find((sl) => sl.slot === slot);
     if (!s) return;
     setActiveSlot(slot);
-    setLoopStart(String(s.cue_ms));
-    setLoopEnd(String(s.loop_end_ms));
-    run(playerSetLoop(s.loop_start_ms, s.loop_end_ms));
-    run(playerSetLoopEnabled(true));
+    run(playerSeek(s.cue_ms));
+  };
+
+  const clearSlot = (slot: number) => {
+    if (!trackId || slot === 1) return;
+    libraryDeleteSlot(trackId, slot).then(() => {
+      setSlots((current) => current.filter((item) => item.slot !== slot));
+      if (activeSlot === slot) setActiveSlot(1);
+    }).catch((e) => setError(String(e)));
   };
 
   const posFrac = st?.loaded && st.duration_ms > 0 ? st.position_ms / st.duration_ms : 0;
   const loaded = st?.loaded ?? false;
   const playing = st?.playing ?? false;
+  // Async job errors arrive via status polling, not via the invoke that
+  // started them; surface them in the same slot as command errors.
+  const shownError = error ?? st?.pitch_error ?? null;
 
   return (
     <div className="flex flex-col gap-2 px-4 py-3 bg-surface border-t border-border">
@@ -237,7 +249,9 @@ export default function Player({ status: st, trackId, onStatusChange }: Props) {
 
         {/* Time display */}
         <div className="font-mono text-xs text-text-secondary tabular-nums min-w-[80px]">
-          {loaded ? (
+          {st?.loading ? (
+            <span className="text-warning">Loading audio…</span>
+          ) : loaded ? (
             <span>
               <span className="text-text">{fmt(st!.position_ms)}</span>
               <span className="mx-1">/</span>
@@ -278,7 +292,10 @@ export default function Player({ status: st, trackId, onStatusChange }: Props) {
            <button onClick={() => run(playerSetSpeed(Math.max(50, (st?.speed_pct ?? 100) - 5)))} disabled={!loaded} title="Slower" className="rounded bg-border px-1.5 py-0.5 text-xs text-text-secondary hover:text-text disabled:opacity-30">−</button>
            <span className="w-9 text-center font-mono text-[10px] text-text-secondary">{Math.round(st?.speed_pct ?? 100)}%</span>
            <button onClick={() => run(playerSetSpeed(Math.min(200, (st?.speed_pct ?? 100) + 5)))} disabled={!loaded} title="Faster" className="rounded bg-border px-1.5 py-0.5 text-xs text-text-secondary hover:text-text disabled:opacity-30">+</button>
-           <button onClick={() => run(playerSetPitchLock(!st?.pitch_lock))} disabled={!loaded} title="Keep pitch while changing speed" className={`rounded px-1.5 py-0.5 text-[9px] ${st?.pitch_lock ? "bg-success/20 text-success" : "bg-border text-text-secondary"}`}>PITCH LOCK</button>
+            <button onClick={() => run(playerSetPitchLock(!st?.pitch_lock))} disabled={!loaded} title={st?.pitch_preparing ? "Preparing pitch lock… (click to cancel)" : "Keep pitch while changing speed"} className={`rounded px-1.5 py-0.5 text-[9px] ${st?.pitch_preparing ? "bg-warning/20 text-warning" : st?.pitch_lock ? "bg-success/20 text-success" : "bg-border text-text-secondary"}`}>{st?.pitch_preparing ? "PITCH …" : "PITCH LOCK"}</button>
+            {st?.pitch_preparing && (
+              <span className="text-[10px] text-warning">Preparing pitch lock…</span>
+            )}
          </div>
 
          <div className="w-px h-5 bg-border" />
@@ -297,6 +314,29 @@ export default function Player({ status: st, trackId, onStatusChange }: Props) {
             >
               LOOP
             </button>
+            <button
+              onClick={() => run(playerAutoLoop().then((r) => {
+                if (r.candidate) {
+                  return playerSetLoopSnapped(
+                    Math.round(r.candidate.start_frame * 1000 / r.sample_rate),
+                    Math.round(r.candidate.end_frame * 1000 / r.sample_rate),
+                  );
+                }
+                return Promise.reject(new Error("No suitable loop found"));
+              }))}
+              title="Auto-detect loop from audio"
+              className="text-[10px] px-1.5 py-0.5 rounded bg-border text-text-secondary hover:text-text transition-colors"
+            >
+              AUTO
+            </button>
+            {st!.loop_enabled && st!.loop_origin && (
+              <span
+                title={`Origin: ${st!.loop_origin} · Quality: ${Math.round(st!.loop_quality * 100)}%`}
+                className={`inline-block w-1.5 h-1.5 rounded-full ${
+                  st!.loop_quality >= 0.7 ? "bg-success" : st!.loop_quality >= 0.3 ? "bg-warning" : "bg-danger"
+                }`}
+              />
+            )}
             {st!.loop_enabled && (
               <>
                 <input
@@ -315,7 +355,7 @@ export default function Player({ status: st, trackId, onStatusChange }: Props) {
                   className="bg-elevated border border-border rounded px-1.5 py-0.5 text-[10px] font-mono w-14 text-text text-center"
                 />
                 <button
-                  onClick={() => run(playerSetLoop(Number(loopStart), Number(loopEnd)))}
+                  onClick={() => run(playerSetLoopSnapped(Number(loopStart), Number(loopEnd)))}
                   className="text-[10px] px-1.5 py-0.5 rounded bg-border text-text-secondary hover:text-text transition-colors"
                 >
                   Set
@@ -327,25 +367,27 @@ export default function Player({ status: st, trackId, onStatusChange }: Props) {
 
         <div className="w-px h-5 bg-border" />
 
-        {/* Slot selector */}
+          {/* Cue selector */}
         {loaded && trackId && (
           <div className="flex items-center gap-1">
             {SLOT_LABELS.map((label, i) => {
               const slotNum = i + 1;
-              const hasData = slots.some((s) => s.slot === slotNum);
+              const hasData = slotNum === 1 || slots.some((s) => s.slot === slotNum);
               const isActive = activeSlot === slotNum;
               return (
+                <span key={label} className="flex items-center">
                 <button
-                  key={label}
                   onClick={() => {
                     setActiveSlot(slotNum);
-                    if (hasData) {
+                    if (slotNum === 1) {
+                      run(playerSeek(0));
+                    } else if (hasData) {
                       loadSlot(slotNum);
                     } else {
                       saveToSlot(slotNum);
                     }
                   }}
-                  title={hasData ? `Load slot ${label}` : `Save to slot ${label}`}
+                  title={hasData ? `Jump to cue ${label}` : `Set cue ${label} at current position`}
                   className={`w-6 h-6 rounded text-[10px] font-bold transition-colors ${
                     isActive
                       ? "bg-accent text-app"
@@ -356,6 +398,8 @@ export default function Player({ status: st, trackId, onStatusChange }: Props) {
                 >
                   {label}
                 </button>
+                {slotNum > 1 && hasData && <button onClick={() => clearSlot(slotNum)} title={`Clear cue ${label}`} aria-label={`Clear cue ${label}`} className="-ml-1 rounded px-1 text-[10px] text-text-secondary hover:bg-danger/10 hover:text-danger">×</button>}
+                </span>
               );
             })}
           </div>
@@ -363,8 +407,8 @@ export default function Player({ status: st, trackId, onStatusChange }: Props) {
 
         <div className="flex-1" />
 
-        {error && (
-          <span className="text-[10px] text-danger truncate max-w-64" role="alert">{error}</span>
+        {shownError && (
+          <span className="text-[10px] text-danger truncate max-w-64" role="alert">{shownError}</span>
         )}
       </div>
     </div>

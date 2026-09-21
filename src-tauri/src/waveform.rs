@@ -94,26 +94,45 @@ fn cache_key(path: &std::path::Path, buckets: usize) -> Result<String, String> {
     ))
 }
 
-/// Read a derived waveform cache entry or calculate and atomically store it.
-pub fn cached_from_buffer(
+/// Disk-cache target for a (path, bucket-count) pair. `None` when the path
+/// cannot be resolved (missing file, permission error).
+fn cache_target(
     cache_dir: &std::path::Path,
     path: &std::path::Path,
     buckets: usize,
-    buffer: &crate::player::LoopBuffer,
-) -> Result<WaveformData, String> {
+) -> Option<std::path::PathBuf> {
+    cache_key(path, buckets)
+        .ok()
+        .map(|key| cache_dir.join(format!("{key}.json")))
+}
+
+/// Lock-free disk lookup: returns cached peaks without needing the audio
+/// buffer, so cache hits never touch the engine.
+pub fn cache_lookup(
+    cache_dir: &std::path::Path,
+    path: &std::path::Path,
+    buckets: usize,
+) -> Option<WaveformData> {
     let buckets = clamp_buckets(buckets);
-    let key = cache_key(path, buckets)?;
-    let target = cache_dir.join(format!("{key}.json"));
-    if let Ok(data) = std::fs::read(&target) {
-        if let Ok(cached) = serde_json::from_slice::<WaveformData>(&data) {
-            if cached.buckets == buckets && cached.peaks.len() == buckets {
-                return Ok(cached);
-            }
-        }
-    }
-    let waveform = from_buffer(buffer, buckets);
+    let target = cache_target(cache_dir, path, buckets)?;
+    let data = std::fs::read(&target).ok()?;
+    let cached = serde_json::from_slice::<WaveformData>(&data).ok()?;
+    (cached.buckets == buckets && cached.peaks.len() == buckets).then_some(cached)
+}
+
+/// Best-effort atomic store of derived peaks. Never fails the caller.
+pub fn cache_store(
+    cache_dir: &std::path::Path,
+    path: &std::path::Path,
+    buckets: usize,
+    waveform: &WaveformData,
+) {
+    let buckets = clamp_buckets(buckets);
+    let Some(target) = cache_target(cache_dir, path, buckets) else {
+        return;
+    };
     if std::fs::create_dir_all(cache_dir).is_ok() {
-        if let Ok(data) = serde_json::to_vec(&waveform) {
+        if let Ok(data) = serde_json::to_vec(waveform) {
             let tmp = target.with_extension("json.tmp");
             if std::fs::write(&tmp, data).is_ok() {
                 if std::fs::rename(&tmp, &target).is_err() {
@@ -122,6 +141,21 @@ pub fn cached_from_buffer(
             }
         }
     }
+}
+
+/// Read a derived waveform cache entry or calculate and atomically store it.
+pub fn cached_from_buffer(
+    cache_dir: &std::path::Path,
+    path: &std::path::Path,
+    buckets: usize,
+    buffer: &crate::player::LoopBuffer,
+) -> Result<WaveformData, String> {
+    let buckets = clamp_buckets(buckets);
+    if let Some(cached) = cache_lookup(cache_dir, path, buckets) {
+        return Ok(cached);
+    }
+    let waveform = from_buffer(buffer, buckets);
+    cache_store(cache_dir, path, buckets, &waveform);
     Ok(waveform)
 }
 

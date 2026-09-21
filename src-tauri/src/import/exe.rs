@@ -81,24 +81,31 @@ pub fn scan(data: &[u8]) -> Vec<EmbeddedSwf> {
             continue;
         }
         let len = length as usize;
-        if len < 8
-            || off
-                .checked_add(len)
-                .map(|end| end > data.len())
-                .unwrap_or(true)
-        {
-            continue;
-        }
+        if len < 8 { continue; }
+        // CWS FileLength describes the *decompressed* FWS image, not the
+        // compressed bytes stored in a projector overlay. Pass the remaining
+        // bytes to the zlib parser, which validates the declared output size.
+        let stored_len = if data[off] == b'C' { data.len() - off } else { len };
+        if off.checked_add(stored_len).map(|end| end > data.len()).unwrap_or(true) { continue; }
         // Skip candidates fully inside an already-accepted larger one? No:
         // keep it simple, prefer largest valid later.
         if out.len() < MAX_CANDIDATES {
             out.push(EmbeddedSwf {
                 offset: off,
-                length: len,
+                length: stored_len,
             });
         }
     }
     out
+}
+
+/// Declared content size from the SWF header: on-disk bytes for FWS,
+/// decompressed bytes for CWS. Used only to rank candidates; the slice
+/// handed to the parser is still the bounds-checked one from [`scan`].
+fn declared_len(data: &[u8], off: usize) -> usize {
+    data.get(off + 4..off + 8)
+        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize)
+        .unwrap_or(0)
 }
 
 /// Locate the embedded SWF: MZ check, scan, then validate largest-first.
@@ -111,10 +118,14 @@ pub fn locate(data: &[u8]) -> Result<EmbeddedSwf, ExeError> {
         return Err(ExeError::NotAnExe);
     }
     let mut cands = scan(data);
-    // Largest first; FWS preferred on ties (simpler container, fewer false positives).
+    // Largest *content* first, ranked by declared header length — not by the
+    // stored slice length. For CWS the stored slice runs to end-of-file, so
+    // an early loader stub would otherwise outrank the real (later, larger)
+    // movie and a valid-but-soundless stub would win over content.
+    // FWS preferred on ties (simpler container, fewer false positives).
     cands.sort_by_key(|c| {
         let is_fws = data[c.offset] == b'F';
-        (std::cmp::Reverse(c.length), !is_fws)
+        (std::cmp::Reverse(declared_len(data, c.offset)), !is_fws)
     });
 
     let mut saw_zws = false;

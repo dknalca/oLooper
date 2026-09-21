@@ -7,9 +7,9 @@ import {
   playerSetLoop,
   playerSetLoopEnabled,
   pickFiles,
-  importCustom,
-  importExe,
-  importSwf,
+  importCustomAndWait,
+  importExeAndWait,
+  importSwfAndWait,
 } from "../tauri";
 
 // Global player state ref — updated by Player component via exposePlayerState().
@@ -67,9 +67,9 @@ export default function useKeyboardShortcuts() {
           ]);
           for (const file of files) {
             const ext = file.split(".").pop()?.toLowerCase();
-            if (ext === "swf") await importSwf(file);
-            else if (ext === "exe") await importExe(file);
-            else await importCustom([file]);
+            if (ext === "swf") await importSwfAndWait(file);
+            else if (ext === "exe") await importExeAndWait(file);
+            else await importCustomAndWait([file]);
           }
           if (files.length > 0) window.dispatchEvent(new CustomEvent("olooper:imported"));
         });

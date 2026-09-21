@@ -7,7 +7,7 @@ A desktop app for DJs and turntablists to extract and practice with audio loops 
 - **SWF extraction** — drop a `.swf`, get all embedded MP3 and ADPCM loops as practice tracks
 - **EXE projector extraction** — drop a projector `.exe`, locate the embedded SWF, same pipeline
 - **Custom audio import** — WAV/MP3 drop or browse, instantly playable
-- **Persistent library** — SQLite catalog (schema v5) survives restarts, deduplicates on import
+- **Persistent library** — SQLite catalog (schema v6) survives restarts, deduplicates on import
 - **Practice player** — play/pause/stop, gapless region looping, volume, seek
 - **Speed control** — 50–200% playback speed in 5% steps, with optional pitch lock (WSOLA time-stretching)
 - **BPM detection** — automatic energy-flux onset analysis, normalized to 65–150 BPM; manual BPM overrides are preserved
@@ -95,13 +95,13 @@ src/                     Frontend (React + TypeScript + Tailwind)
     ├── Sidebar.tsx      Track list with search/filter/sort + context menus
     ├── Player.tsx       Transport + scrub + loop + speed + A-D slot selector
     ├── Waveform.tsx     Canvas waveform with playhead + loop overlay
-    ├── ImportBar.tsx    File import with browse buttons + drag-drop + progress modal
+    ├── ImportBar.tsx    File import with browse buttons + drag-drop + inline progress
     └── Logo.tsx         Waveform loop "O" logo component
 
 src-tauri/               Backend (Rust)
 ├── src/lib.rs           Tauri commands + app builder + portable storage
 ├── src/player/mod.rs    Audio engine (rodio, region loop, speed, pitch lock)
-├── src/library/mod.rs   SQLite catalog (schema v5) + file management + loop slots
+├── src/library/mod.rs   SQLite catalog (schema v6) + file management + loop slots
 ├── src/import/          SWF/EXE parsers (MP3 + ADPCM + SoundStreamBlock)
 ├── src/waveform.rs      Peak computation + persistent disk cache
 └── src/analysis.rs      BPM estimator (energy-flux autocorrelation)
@@ -117,16 +117,18 @@ specs/                   Feature specifications
 ├── 020-swf-extraction.md
 ├── 025-exe-extraction.md
 ├── 030-player.md
+├── 035-loop-fidelity.md
 ├── 040-waveform.md
 ├── 050-custom-loops.md
 ├── 060-keyboard-shortcuts.md
 ├── 060-reliability-hardening.md
 ├── 070-loop-slots.md
 ├── 080-portable-drop-import.md
-└── 090-library-workflow-completion.md
+├── 090-library-workflow-completion.md
+└── 095-background-import.md
 
 docs/                    Documentation
-├── adr/                 Architecture decision records (0001–0006)
+├── adr/                 Architecture decision records (0001–0008)
 └── macos-release.md     macOS signing and notarization guide
 ```
 

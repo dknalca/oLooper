@@ -27,6 +27,21 @@ fn loop_region_wraps_without_gaps() {
 }
 
 #[test]
+fn loop_region_repeats_exact_boundary_frames() {
+    let buf = mono(vec![-4, -2, 0, 3, 5, 2, 0, -3]);
+    let mut src = LoopRegion::new(buf, 2, 2, 7, true, cursor());
+    let got: Vec<i16> = src.by_ref().take(15).collect();
+    assert_eq!(got, vec![0, 3, 5, 2, 0, 0, 3, 5, 2, 0, 0, 3, 5, 2, 0]);
+}
+
+#[test]
+fn zero_crossing_snap_prefers_nearest_crossing() {
+    let buf = LoopBuffer { samples: vec![-5, -2, 0, 3, 5, 2, -1, -4], channels: 1, rate: 1000 };
+    assert_eq!(snap_zero_crossing(&buf, 3), 3);
+    assert_eq!(snap_zero_crossing(&buf, 6), 6);
+}
+
+#[test]
 fn one_shot_region_ends() {
     let buf = mono(vec![0, 1, 2, 3, 4]);
     let mut src = LoopRegion::new(buf, 0, 0, 3, false, cursor());
@@ -108,4 +123,102 @@ fn engine_reports_empty_without_touching_hardware() {
     assert!(client.set_volume(101.0).is_err());
     // No track loaded: error whether or not an audio device exists.
     assert!(client.play().is_err());
+}
+
+fn nanos() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos()
+}
+
+#[test]
+fn waveform_cache_hit_needs_no_engine_lock() {
+    let client = spawn();
+    let root = std::env::temp_dir().join(format!("olooper-waveform-nolock-{}", nanos()));
+    let source = root.join("loop.wav");
+    let cache = root.join("cache");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(&source, pcm_wav(64)).unwrap();
+    let path = source.to_string_lossy().to_string();
+    let buf = Arc::new(decode_bytes(&pcm_wav(64)).unwrap());
+    *client.loaded_buffer.write().unwrap() = Some((path.clone(), 1, buf));
+    // First call computes peaks and stores them persistently.
+    let first = client.waveform_peaks(&path, 64, &cache).unwrap();
+    assert_eq!(first.peaks.len(), 64);
+    // A cache hit must succeed even while the WRITE lock is held elsewhere:
+    // it takes no engine lock, so waveform can never block track loading.
+    let _held = client.loaded_buffer.write().unwrap();
+    let second = client.waveform_peaks(&path, 64, &cache).unwrap();
+    assert_eq!(second.peaks, first.peaks);
+    drop(_held);
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn waveform_snapshot_current_matches_path_and_generation() {
+    let loaded: LoadedSnapshot = Some(("/a.wav".to_string(), 1, mono(vec![1, 2, 3])));
+    assert!(waveform_snapshot_current(&loaded, "/a.wav", 1));
+    assert!(!waveform_snapshot_current(&loaded, "/a.wav", 2)); // reloaded track
+    assert!(!waveform_snapshot_current(&loaded, "/b.wav", 1)); // other track
+    assert!(!waveform_snapshot_current(&None, "/a.wav", 1));
+}
+
+fn loaded_for_pitch() -> Loaded {
+    Loaded {
+        path: "/a.wav".to_string(),
+        generation: 7,
+        buf: mono(vec![0; 8]),
+        original_buf: mono(vec![0; 8]),
+        start_frame: 0,
+        end_frame: 8,
+        enabled: true,
+        source: LoopSource::Manual,
+        resume_frame: 0,
+        cursor: cursor(),
+        volume: 0.8,
+        speed: 1.2,
+        pitch_lock: true,
+        pitch_pending: true,
+        pitch_job: 3,
+        pitch_requested_speed: 1.2,
+        pitch_job_speed: 1.2,
+        pitch_error: None,
+        loop_origin: "manual".to_string(),
+        loop_quality: 1.0,
+    }
+}
+
+#[test]
+fn pitch_completion_applies_only_when_nothing_moved() {
+    let t = loaded_for_pitch();
+    assert!(pitch_job_current(&t, 7, 3, 1.2));
+    assert!(!pitch_job_current(&t, 8, 3, 1.2)); // track changed
+    assert!(!pitch_job_current(&t, 7, 2, 1.2)); // older job
+    assert!(!pitch_job_current(&t, 7, 3, 1.3)); // speed changed
+    let mut unlocked = loaded_for_pitch();
+    unlocked.pitch_lock = false;
+    assert!(!pitch_job_current(&unlocked, 7, 3, 1.2)); // lock disabled
+    let mut idle = loaded_for_pitch();
+    idle.pitch_pending = false;
+    assert!(!pitch_job_current(&idle, 7, 3, 1.2)); // nothing pending
+}
+
+#[test]
+fn load_completion_applies_only_to_latest_request() {
+    let pending = Some(PendingLoad {
+        generation: 2,
+        path: "/b.wav".to_string(),
+    });
+    assert!(load_ready_current(&pending, 2, "/b.wav"));
+    assert!(!load_ready_current(&pending, 1, "/b.wav")); // superseded decode
+    assert!(!load_ready_current(&pending, 2, "/a.wav")); // other path
+    assert!(!load_ready_current(&None, 2, "/b.wav")); // nothing pending
+}
+
+#[test]
+fn frame_remap_scales_across_buffers() {
+    assert_eq!(remap_frame(50, 100, 200), 100);
+    assert_eq!(remap_frame(0, 100, 200), 0);
+    assert_eq!(remap_frame(7, 0, 200), 0);
 }

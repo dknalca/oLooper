@@ -1,10 +1,10 @@
 import { useEffect, useRef, useState } from "react";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import {
-  importCustom,
+  importCustomAndWait,
   cancelImport,
-  importExe,
-  importSwf,
+  importExeAndWait,
+  importSwfAndWait,
   listenImportProgress,
   type ImportProgress,
   pickFiles,
@@ -44,6 +44,8 @@ export default function ImportBar({ onImported }: Props) {
     detail,
     done: false,
     error: null,
+    report: null,
+    custom_report: null,
   });
 
   const beginImport = (paths: string[]) => {
@@ -102,41 +104,47 @@ export default function ImportBar({ onImported }: Props) {
           setError(null);
           setReport(null);
           (async () => {
-            const results: PromiseSettledResult<ImportReport | Awaited<ReturnType<typeof importCustom>>>[] = [];
+            let totalAdded = 0;
+            let totalExisting = 0;
+            let totalFailed = 0;
+            let firstError: string | null = null;
             for (const path of paths) {
               if (cancelQueue.current) break;
               setFiles((current) => current.map((file) => file.path === path ? { ...file, stage: "Preparing", done: false } : file));
               try {
                 const kind = importKindForPath(path);
-                const value = kind === "swf" ? await importSwf(path) : kind === "exe" ? await importExe(path) : await importCustom([path]);
-                results.push({ status: "fulfilled", value });
+                if (kind === "swf") {
+                  const r = await importSwfAndWait(path);
+                  totalAdded += r.added;
+                  totalExisting += r.already_there;
+                } else if (kind === "exe") {
+                  const r = await importExeAndWait(path);
+                  totalAdded += r.added;
+                  totalExisting += r.already_there;
+                } else {
+                  const rs = await importCustomAndWait([path]);
+                  totalAdded += rs.filter((r) => r.added).length;
+                  totalExisting += rs.filter((r) => r.error === "already in library").length;
+                  const bad = rs.filter((r) => !r.added && r.error !== "already in library");
+                  if (bad.length > 0) { totalFailed++; firstError ??= bad[0].error ?? "import failed"; }
+                }
               } catch (reason) {
-                results.push({ status: "rejected", reason });
+                totalFailed++;
+                firstError ??= String(reason);
               }
             }
-              const reports = results
-                .filter((result): result is PromiseFulfilledResult<ImportReport | Awaited<ReturnType<typeof importCustom>>> => result.status === "fulfilled")
-                .map((result) => result.value);
-              const failed = results.filter((result) => result.status === "rejected");
-              const added = reports.reduce((sum, result) => {
-                if (Array.isArray(result)) return sum + result.filter((entry) => entry.added).length;
-                return sum + result.added;
-              }, 0);
-              if (failed.length > 0) {
-                setError(`${failed.length} file(s) failed: ${String(failed[0].reason)}`);
-                finishProgress(String(failed[0].reason));
-              } else {
-                finishProgress();
-              }
-              const existing = reports.reduce((sum, result) => sum + (Array.isArray(result)
-                ? result.filter((entry) => entry.error === "already in library").length
-                : result.already_there), 0);
-              if (existing > 0) showNotice(`${existing} existing track${existing === 1 ? "" : "s"} already in library`);
-              if (added > 0) {
-                setDragCount(added);
-                setTimeout(() => setDragCount(null), 3000);
-              }
-              onImported();
+            if (totalFailed > 0) {
+              setError(`${totalFailed} file(s) failed: ${firstError}`);
+              finishProgress(firstError);
+            } else {
+              finishProgress();
+            }
+            if (totalExisting > 0) showNotice(`${totalExisting} existing track${totalExisting === 1 ? "" : "s"} already in library`);
+            if (totalAdded > 0) {
+              setDragCount(totalAdded);
+              setTimeout(() => setDragCount(null), 3000);
+            }
+            onImported();
             setBusy(false);
           })();
         } else {
@@ -202,7 +210,7 @@ export default function ImportBar({ onImported }: Props) {
     setError(null);
     setReport(null);
     try {
-      const rs = await importCustom(files);
+      const rs = await importCustomAndWait(files);
       const failed = rs.filter((r) => !r.added && r.error !== "already in library");
       const added = rs.filter((r) => r.added).length;
       const existing = rs.filter((r) => r.error === "already in library").length;
@@ -233,19 +241,18 @@ export default function ImportBar({ onImported }: Props) {
         </div>
       )}
 
-      {progress && <ImportProgressModal progress={progress} files={files} elapsed={elapsed} onClose={() => setProgress(null)} onCancel={busy ? requestCancel : null} />}
       {notice && <div className="fixed right-4 top-14 z-[80] rounded border border-success/40 bg-surface px-4 py-3 text-xs text-success shadow-xl" role="status">{notice}</div>}
 
       <div className="flex items-center gap-2 px-4 py-2 bg-surface border-t border-border">
         <BrowseBtn
-          onClick={() => browseAndImport(importSwf, [
+          onClick={() => browseAndImport(importSwfAndWait, [
             { name: "Flash files", extensions: ["swf"] },
           ])}
           disabled={busy}
           label="SWF"
         />
         <BrowseBtn
-          onClick={() => browseAndImport(importExe, [
+          onClick={() => browseAndImport(importExeAndWait, [
             { name: "Projector files", extensions: ["exe"] },
           ])}
           disabled={busy}
@@ -258,6 +265,18 @@ export default function ImportBar({ onImported }: Props) {
         />
 
         <div className="flex-1" />
+
+        {progress && !progress.done && (
+          <div className="flex items-center gap-2">
+            <span className="text-[10px] text-accent animate-pulse">{progress.stage}</span>
+            {progress.total > 0 && (
+              <span className="text-[10px] text-text-secondary">{progress.current}/{progress.total}</span>
+            )}
+            {busy && (
+              <button onClick={requestCancel} className="text-[10px] text-danger hover:text-danger/80 transition-colors">Cancel</button>
+            )}
+          </div>
+        )}
 
         {dragCount !== null && (
           <span className="text-[10px] text-success">+{dragCount} imported</span>
@@ -276,70 +295,43 @@ export default function ImportBar({ onImported }: Props) {
           </span>
         )}
       </div>
-    </>
-  );
-}
 
-function ImportProgressModal({
-  progress,
-  files,
-  elapsed,
-  onClose,
-  onCancel,
-}: {
-  progress: ImportProgress;
-  files: ImportFileState[];
-  elapsed: number;
-  onClose: () => void;
-  onCancel: (() => void) | null;
-}) {
-  const progressText = progress.total > 0 ? `${progress.current} / ${progress.total}` : "";
-  const fraction = progress.total > 0 ? Math.min(1, progress.current / progress.total) : 0;
-  return (
-    <div className="fixed inset-0 z-[60] flex items-center justify-center bg-app/80 backdrop-blur-sm" role="status">
-      <div className="w-[28rem] rounded-lg border border-border bg-surface p-5 shadow-2xl">
-        <div className="flex items-start justify-between gap-3">
-          <p className="text-xs uppercase tracking-wider text-text-secondary">Importing looper</p>
-          <span className="font-mono text-[10px] text-text-secondary">{elapsedLabel(elapsed)}</span>
-        </div>
-        <p className={`mt-2 text-base font-medium ${progress.error ? "text-danger" : "text-text"}`}>
-          {progress.stage}
-        </p>
-        <p className="mt-1 truncate text-xs text-text-secondary" title={progress.detail}>
-          {progress.detail}
-        </p>
-        <div className="mt-4 h-1.5 overflow-hidden rounded-full bg-border">
-          <svg viewBox="0 0 100 2" preserveAspectRatio="none" className="h-full w-full" aria-hidden="true">
-            <line
-              x1="0"
-              y1="1"
-              x2={(progress.done ? 1 : fraction) * 100}
-              y2="1"
-              className="stroke-accent"
-              strokeWidth="2"
-            />
-          </svg>
-        </div>
-        <p className="mt-2 text-right text-[10px] text-text-secondary">{progress.error ?? progressText}</p>
-        <div className="mt-4 max-h-36 overflow-y-auto rounded border border-border/70">
-          {files.map((file) => (
-            <div key={file.path} className="flex items-center gap-2 border-b border-border/50 px-3 py-2 text-xs last:border-b-0">
-              <span className={`h-1.5 w-1.5 rounded-full ${file.error ? "bg-danger" : file.done ? "bg-success" : "bg-accent"}`} />
-              <span className="min-w-0 flex-1 truncate text-text" title={file.path}>{fileName(file.path)}</span>
-              <span className="shrink-0 text-[10px] text-text-secondary">{file.error ?? file.stage}</span>
+      {progress && files.length > 0 && (
+        <div className="border-t border-border/50 bg-surface/80 px-4 py-2">
+          <div className="flex items-center justify-between mb-1.5">
+            <div className="flex items-center gap-2">
+              <span className="text-[10px] text-text-secondary">Importing</span>
+              {progress.total > 0 && (
+                <div className="w-24 h-1 overflow-hidden rounded-full bg-border">
+                  <div className="h-full bg-accent rounded-full transition-all" style={{ width: `${Math.min(100, (progress.current / progress.total) * 100)}%` }} />
+                </div>
+              )}
+              {progress.total > 0 && (
+                <span className="text-[10px] text-text-secondary">{Math.round((progress.current / progress.total) * 100)}%</span>
+              )}
+              <span className="font-mono text-[10px] text-text-secondary">{elapsedLabel(elapsed)}</span>
             </div>
-          ))}
-        </div>
-        {progress.done && (
-          <div className="mt-5 flex justify-end">
-            <button onClick={onClose} className="rounded bg-border px-3 py-1.5 text-xs text-text hover:bg-surface-hover">Close</button>
+            <div className="flex items-center gap-2">
+              {progress.error && (
+                <span className="text-[10px] text-danger">{progress.error}</span>
+              )}
+              {progress.done && (
+                <button onClick={() => setProgress(null)} className="text-[10px] text-text-secondary hover:text-text transition-colors">Dismiss</button>
+              )}
+            </div>
           </div>
-        )}
-        {!progress.done && onCancel && (
-          <div className="mt-5 flex justify-end"><button onClick={onCancel} className="rounded border border-danger/50 px-3 py-1.5 text-xs text-danger hover:bg-danger/10">Cancel queue</button></div>
-        )}
-      </div>
-    </div>
+          <div className="max-h-24 overflow-y-auto rounded border border-border/30">
+            {files.map((file) => (
+              <div key={file.path} className="flex items-center gap-2 border-b border-border/20 px-2 py-1 text-[10px] last:border-b-0">
+                <span className={`h-1 w-1 rounded-full shrink-0 ${file.error ? "bg-danger" : file.done ? "bg-success" : "bg-accent"}`} />
+                <span className="min-w-0 flex-1 truncate text-text" title={file.path}>{fileName(file.path)}</span>
+                <span className="shrink-0 text-text-secondary">{file.error ?? file.stage}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+    </>
   );
 }
 

@@ -1,48 +1,37 @@
 # Agent Instructions
 
-## Repository status
+Tauri 2 desktop app: React 18 + TS (strict) + Tailwind v4 + Vite 6 frontend, Rust core (edition 2021, MSRV 1.87), SQLite catalog (schema v6). Extracts practice loops from legacy Flash `.swf` / projector `.exe` files.
 
-- This repository contains a working Tauri 2 desktop application with React/TypeScript frontend and Rust core.
-- Build: `pnpm install && pnpm run tauri build` (or `./scripts/build.sh`).
-- Typecheck: `pnpm run typecheck`. Lint: not yet configured.
-- Tests: Rust unit tests via `cargo test` in `src-tauri/` (60 tests). Frontend tests via `pnpm test` (Vitest).
+## Commands (use pnpm, not npm)
 
-## Tech stack
+- Dev: `pnpm install && pnpm tauri dev` (fixed port `1420`, must match `devUrl` in `src-tauri/tauri.conf.json`).
+- Build: `./scripts/build.sh` (`--dev` for faster debug build). Do NOT run `pnpm run tauri build` directly — `build.sh` first runs `pnpm install --frozen-lockfile` + `node scripts/generate-icons.mjs` (compile needs `src-tauri/icons/icon.icns|.png`) and copies the `.app` to repo root via `ditto`.
+- DMG: `./scripts/package-dmg.sh` (unsigned).
+- Typecheck: `pnpm run typecheck`. No lint configured. No CI workflows.
 
-- **Frontend**: React 18, TypeScript (strict), Tailwind CSS v4, Vite 6.
-- **Backend**: Rust (edition 2021, MSRV 1.87), Tauri 2, rodio (audio), rusqlite (bundled SQLite), sha2, flate2, wsola (time-stretching).
-- **Plugins**: `tauri-plugin-dialog` (file pickers), `tauri-plugin-shell` (Show in Finder).
-- **Icons**: Generated via `scripts/generate-icons.mjs` (sharp + SVG source in `.dev/icon-source.svg`).
-- **Frontend tests**: Vitest (configured in `package.json`, run via `pnpm test`).
-- **macOS release**: `scripts/build.sh` → `scripts/package-dmg.sh` for unsigned DMG.
+## Tests
 
-## Product boundaries
+- Rust: `cargo test` from `src-tauri/`; single test: `cargo test <name> -- --exact` (or partial match without `--exact`).
+- `#[ignore]` Rust tests need real fixtures in `loopersFlash/` (gitignored, never commit, never CI): `cargo test -- --ignored`.
+- Frontend (Vitest): `pnpm test`; single file: `pnpm vitest run src/importFlow.test.ts`.
 
-- The app is a cross-platform Tauri 2 desktop app with a React/TypeScript frontend, Rust core, and SQLite metadata store.
-- Keep binary parsing, filesystem mutation, audio analysis, persistence, and metadata serialization out of React components; expose them through typed Tauri commands.
-- User audio must remain normal files in a configurable library. SQLite stores catalog and derived metadata, not the only copy of audio.
-- Serato is an adapter/export target, not the internal track model or source of truth.
+## Architecture
 
-## Safety requirements
+- `src/tauri.ts` is the only typed bridge to backend commands. Components must not import `@tauri-apps/api/*` directly — sole exception: `getCurrentWebview` from `@tauri-apps/api/webview` in `ImportBar.tsx` for drag-drop. File-picker `open()` from `@tauri-apps/plugin-dialog` lives in `tauri.ts` wrappers (`pickFiles`, `pickDirectory`).
+- Rust: `src-tauri/src/lib.rs` (commands + portable-storage app builder), `player/mod.rs` (rodio engine), `library/mod.rs` (all SQLite migrations via `PRAGMA user_version`; current v6 — add new migrations there), `import/` (SWF/EXE parsers), `waveform.rs`, `analysis.rs` (BPM).
+- Library model: audio stays as normal files under a configurable root; SQLite holds catalog + derived metadata only. Default root is portable (beside the app); custom root persisted via `library_init`/`library_restore`. Waveform cache: `<library>/.olooper-cache/waveforms/`. Removing a track/group never deletes source audio from disk.
+- Imports: SQLite runs in WAL mode (`Library::open` sets `journal_mode=WAL` + `busy_timeout`). `import_swf`/`import_exe`/`import_custom` only enqueue on the `olooper-import` worker thread (own DB connection) and return `job_id` immediately; the result arrives in the `done` `olooper:import-progress` event (`report` field, or `custom_report` for custom audio). Frontend: `import*()` enqueue, `import*AndWait()` await the result.
+- Serato is an export adapter only, never the internal model.
 
-- Treat imported `.swf`, `.exe`, and audio files as untrusted input. Parse them as data; never execute imported executables or Flash content.
-- Preserve source files. Use bounds checks, allocation limits, sanitized paths, and atomic/validated writes for extracted audio and metadata.
-- Do not claim third-party metadata compatibility without fixture tests and validation against supported real-world versions.
+## Safety (untrusted input)
 
-## Change workflow
+- Parse `.swf`/`.exe`/audio as data only — never execute. Preserve source files; use bounds checks, allocation limits, sanitized paths, atomic/validated writes for extracted audio and metadata.
+- Don't claim third-party metadata compatibility without fixture tests against real-world versions.
 
-- For non-trivial work, update or add the relevant specification under `specs/` before implementation. Record lasting architecture decisions under `docs/adr/`.
-- Define observable acceptance criteria, failure behavior, persistence behavior, platform implications, security implications, and non-goals.
-- Keep changes small and reversible. Add regression tests for parsing, serialization, persistence, and security-sensitive behavior when test infrastructure exists.
-- If requirements affect user data, file-format compatibility, irreversible behavior, architecture, security, or licensing, do not silently guess; ask or choose a safe reversible/unsupported path and document it.
+## Conventions
 
-## Dev conventions
-
-- All frontend styling uses Tailwind utility classes. No inline `style={}` props.
-- Design tokens in `src/index.css` (`--color-*` variables).
-- All Tauri command wrappers in `src/tauri.ts`. Components must not import `@tauri-apps/api` directly (except `@tauri-apps/api/webview` for drag-drop and `@tauri-apps/plugin-dialog` for file pickers).
-- Keyboard shortcuts in `src/hooks/useKeyboardShortcuts.ts`.
-- Scratch verification artifacts go in `.dev/` (gitignored).
-- Real samples in `loopersFlash/` (gitignored, never in CI).
-- SQLite schema versioned via `PRAGMA user_version`; all migrations in `library/mod.rs`.
-- Waveform cache stored under `<library>/.olooper-cache/waveforms/`.
+- Styling: Tailwind utilities only, no `style={}` props; tokens in `src/index.css` (`--color-*`).
+- Keyboard shortcuts live in `src/hooks/useKeyboardShortcuts.ts`; disabled while typing.
+- `src-tauri/gen/` is gitignored but `src-tauri/icons/` IS committed (required at compile time).
+- Never commit: `loopersFlash/`, `audios/`, `olooper-library.json`, `.dev/` (scratch verification artifacts go here), `oLooper.app/`, `dist/`.
+- Non-trivial work: update/add spec in `specs/` first, record lasting decisions in `docs/adr/`. Keep changes small and reversible; add regression tests for parsing, serialization, persistence, and security-sensitive paths. If a change affects user data, format compat, or irreversible behavior, ask or pick a safe reversible path and document it.

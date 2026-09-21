@@ -18,7 +18,10 @@ Locate an embedded SWF and reuse the `020` pipeline.
   Projector layouts vary by authoring tool → no fixed offset assumed.
 - Candidate validation: magic `FWS`/`CWS`, version 1–40, declared length fits
   inside the file from the candidate offset, header fully parseable.
-  Largest valid candidate wins; ties prefer `FWS`.
+  Largest *content* wins, ranked by declared header length (on-disk for
+  `FWS`, decompressed size for `CWS`) — not by stored slice length, since a
+  `CWS` slice runs to end-of-file and an early loader stub would otherwise
+  outrank the real movie. Ties prefer `FWS`.
 
 ## Outputs
 
