@@ -37,6 +37,36 @@ fn valid_fws_extracts_mp3_in_order() {
 }
 
 #[test]
+fn extracts_largest_embedded_jpeg_as_swf_cover() {
+    let small = [0xff, 0xd8, 1, 2, 0xff, 0xd9];
+    let large = [0xff, 0xd8, 3, 4, 5, 6, 7, 8, 0xff, 0xd9];
+    let mut small_tag = 9u16.to_le_bytes().to_vec();
+    small_tag.extend_from_slice(&small);
+    let mut large_tag = 10u16.to_le_bytes().to_vec();
+    large_tag.extend_from_slice(&large);
+    let mut tags = swf_tag(21, &small_tag);
+    tags.extend(swf_tag(21, &large_tag));
+
+    let parsed = parse(&fws_file(10, &tags)).unwrap();
+    assert_eq!(parsed.cover_image.as_deref(), Some(large.as_slice()));
+}
+
+#[test]
+fn reconstructs_jpeg_using_define_bits_and_jpeg_tables() {
+    let tables = [0xff, 0xd8, 1, 2, 0xff, 0xd9];
+    let mut table_tag = swf_tag(8, &tables);
+    let mut image_tag = 1u16.to_le_bytes().to_vec();
+    image_tag.extend_from_slice(&[3, 4, 0xff, 0xd9]);
+    table_tag.extend(swf_tag(6, &image_tag));
+
+    let parsed = parse(&fws_file(10, &table_tag)).unwrap();
+    assert_eq!(
+        parsed.cover_image.as_deref(),
+        Some([0xff, 0xd8, 1, 2, 3, 4, 0xff, 0xd9].as_slice())
+    );
+}
+
+#[test]
 fn valid_cws_extracts_mp3() {
     // Compressible padding makes the on-disk CWS smaller than its declared
     // uncompressed length, as real CWS files normally are.

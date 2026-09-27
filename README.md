@@ -6,7 +6,9 @@ A desktop app for DJs and turntablists to extract and practice with audio loops 
 
 - **SWF extraction** — drop a `.swf`, get all embedded MP3 and ADPCM loops as practice tracks
 - **EXE projector extraction** — drop a projector `.exe`, locate the embedded SWF, same pipeline
+- **Cover art** — extract embedded JPEG artwork from SWF/EXE or use Tablist looper artwork
 - **Custom audio import** — WAV/MP3 drop or browse, instantly playable
+- **Tablist online catalog** — browse/search public loopers, then double-click to download all tracks
 - **Persistent library** — SQLite catalog (schema v6) survives restarts, deduplicates on import
 - **Practice player** — play/pause/stop, gapless region looping, volume, seek
 - **Speed control** — 50–200% playback speed in 5% steps, with optional pitch lock (WSOLA time-stretching)
@@ -52,8 +54,12 @@ The built `.app` bundle will be at `./oLooper.app` in the project root.
 ## Testing
 
 ```bash
-# Rust unit tests (60 tests: parser, player, library, waveform, analysis)
+# Rust unit tests (parser, player, library, waveform, analysis)
 cd src-tauri && cargo test
+
+# Probe Tablist downloads without building the desktop app (from src-tauri/)
+cargo run --example tablist_download_test
+# Files are saved to ../.dev/tablist-downloads/
 
 # Frontend tests (Vitest)
 pnpm test
@@ -92,7 +98,8 @@ src/                     Frontend (React + TypeScript + Tailwind)
 │   └── useKeyboardShortcuts.ts
 └── components/          UI components
     ├── TopBar.tsx       Header with version + library init + folder picker
-    ├── Sidebar.tsx      Track list with search/filter/sort + context menus
+    ├── Sidebar.tsx      Local track list with search/filter/sort + context menus
+    ├── TablistCatalog.tsx Online looper search, pagination + double-click import
     ├── Player.tsx       Transport + scrub + loop + speed + A-D slot selector
     ├── Waveform.tsx     Canvas waveform with playhead + loop overlay
     ├── ImportBar.tsx    File import with browse buttons + drag-drop + inline progress
@@ -101,8 +108,9 @@ src/                     Frontend (React + TypeScript + Tailwind)
 src-tauri/               Backend (Rust)
 ├── src/lib.rs           Tauri commands + app builder + portable storage
 ├── src/player/mod.rs    Audio engine (rodio, region loop, speed, pitch lock)
-├── src/library/mod.rs   SQLite catalog (schema v6) + file management + loop slots
+├── src/library/mod.rs   SQLite catalog (schema v6) + file management + loop slots + covers
 ├── src/import/          SWF/EXE parsers (MP3 + ADPCM + SoundStreamBlock)
+├── src/tablist.rs       Tablist catalog, App Check, and audio/cover downloads
 ├── src/waveform.rs      Peak computation + persistent disk cache
 └── src/analysis.rs      BPM estimator (energy-flux autocorrelation)
 
@@ -125,10 +133,11 @@ specs/                   Feature specifications
 ├── 070-loop-slots.md
 ├── 080-portable-drop-import.md
 ├── 090-library-workflow-completion.md
-└── 095-background-import.md
+├── 095-background-import.md
+└── 100-tablist-import.md
 
 docs/                    Documentation
-├── adr/                 Architecture decision records (0001–0008)
+├── adr/                 Architecture decision records (0001–0009)
 └── macos-release.md     macOS signing and notarization guide
 ```
 

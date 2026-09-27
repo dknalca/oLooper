@@ -135,7 +135,76 @@ impl rodio::Source for LoopRegion {
 
 /// Decode any rodio-supported bytes into a buffer. Hardware-free.
 pub fn decode_bytes(data: &[u8]) -> Result<LoopBuffer, String> {
+    // rodio 0.20's Symphonia adapter panics when its MP4 reader requests a
+    // seek during initialization for Tablist's M4A files. Decode ISO BMFF
+    // directly through Symphonia instead of letting that adapter panic.
+    if data.get(4..8) == Some(b"ftyp") {
+        return decode_isomp4(data);
+    }
     decode_owned(data.to_vec())
+}
+
+fn decode_isomp4(data: &[u8]) -> Result<LoopBuffer, String> {
+    use symphonia::core::{
+        audio::SampleBuffer, codecs::DecoderOptions, errors::Error as SymphoniaError,
+        formats::FormatOptions, io::MediaSourceStream, meta::MetadataOptions, probe::Hint,
+    };
+
+    let source = MediaSourceStream::new(Box::new(Cursor::new(data.to_vec())), Default::default());
+    let mut hint = Hint::new();
+    hint.with_extension("m4a");
+    let mut probed = symphonia::default::get_probe()
+        .format(
+            &hint,
+            source,
+            &FormatOptions::default(),
+            &MetadataOptions::default(),
+        )
+        .map_err(|error| format!("cannot inspect M4A audio: {error}"))?;
+    let track = probed
+        .format
+        .default_track()
+        .ok_or_else(|| "M4A audio has no default track".to_string())?;
+    let track_id = track.id;
+    let mut decoder = symphonia::default::get_codecs()
+        .make(&track.codec_params, &DecoderOptions::default())
+        .map_err(|error| format!("cannot initialize M4A decoder: {error}"))?;
+
+    let mut samples = Vec::new();
+    let (mut channels, mut rate) = (0u16, 0u32);
+    loop {
+        let packet = match probed.format.next_packet() {
+            Ok(packet) => packet,
+            Err(SymphoniaError::IoError(_)) => break,
+            Err(error) => return Err(format!("cannot read M4A packet: {error}")),
+        };
+        if packet.track_id() != track_id {
+            continue;
+        }
+        let decoded = decoder
+            .decode(&packet)
+            .map_err(|error| format!("cannot decode M4A packet: {error}"))?;
+        channels = decoded.spec().channels.count() as u16;
+        rate = decoded.spec().rate;
+        let mut interleaved = SampleBuffer::<i16>::new(decoded.capacity() as u64, *decoded.spec());
+        interleaved.copy_interleaved_ref(decoded);
+        samples.extend_from_slice(interleaved.samples());
+    }
+    if samples.is_empty() || channels == 0 || rate == 0 {
+        return Err("M4A stream contains no decodable audio frames".to_string());
+    }
+    let buffer = LoopBuffer {
+        samples,
+        channels,
+        rate,
+    };
+    if buffer.duration_ms() > MAX_DURATION_MS {
+        return Err(format!(
+            "track is {} min, over the 15 min practice limit",
+            buffer.duration_ms() / 60_000
+        ));
+    }
+    Ok(buffer)
 }
 
 fn decode_owned(data: Vec<u8>) -> Result<LoopBuffer, String> {

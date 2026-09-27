@@ -21,6 +21,7 @@ pub mod autoloop;
 pub mod import;
 pub mod library;
 pub mod player;
+pub mod tablist;
 pub mod waveform;
 
 /// Typed status DTO exposed to the frontend via `get_app_status`.
@@ -385,12 +386,15 @@ pub fn run() {
             library_rename_looper,
             library_remove_looper,
             library_group_directory,
+            library_group_cover,
             library_get_slots,
             library_set_slot,
             library_delete_slot,
             import_swf,
             import_exe,
             import_custom,
+            import_tablist,
+            tablist_search,
             cancel_import,
             waveform_peaks,
             reveal_in_file_manager
@@ -699,6 +703,12 @@ fn library_group_directory(source_hash: String, db: Db<'_>) -> Result<String, St
 }
 
 #[tauri::command]
+fn library_group_cover(source_hash: String, db: Db<'_>) -> Result<Option<String>, String> {
+    let g = self::db(&db)?;
+    require_lib(&g)?.group_cover_data_url(&source_hash)
+}
+
+#[tauri::command]
 fn library_get_slots(track_id: i64, db: Db<'_>) -> Result<Vec<library::LoopSlot>, String> {
     let g = self::db(&db)?;
     require_lib(&g)?.get_slots(track_id)
@@ -775,6 +785,7 @@ enum ImportKind {
     Swf,
     Exe,
     Custom,
+    Tablist,
 }
 
 struct ImportJob {
@@ -858,11 +869,12 @@ fn run_container_job(app: &tauri::AppHandle, job: &ImportJob, exe: bool) {
             return;
         }
     };
+    let source_hash = library::sha256_hex(&data);
     let report = lib.import_sounds_with_progress(
         &looper_name(&copied_path),
         source_type,
         &copied_path,
-        &library::sha256_hex(&data),
+        &source_hash,
         exe_offset,
         exe_length,
         &sounds.sounds,
@@ -883,6 +895,17 @@ fn run_container_job(app: &tauri::AppHandle, job: &ImportJob, exe: bool) {
             Ok(())
         },
     );
+    let imported_tracks = match &report {
+        Ok(report) => report.added + report.already_there,
+        Err((partial, _)) => partial.added + partial.already_there,
+    };
+    if imported_tracks > 0 {
+        if let Some(cover) = sounds.cover_image.as_deref() {
+            if let Err(error) = lib.save_group_cover(&source_hash, cover) {
+                eprintln!("[oLooper] SWF cover was not saved: {error}");
+            }
+        }
+    }
     match report {
         Ok(report) => {
             emit_import_done(
@@ -916,6 +939,7 @@ fn import_worker_loop(app: tauri::AppHandle, rx: std::sync::mpsc::Receiver<Impor
             ImportKind::Swf => run_swf_job(&app, &job),
             ImportKind::Exe => run_exe_job(&app, &job),
             ImportKind::Custom => run_custom_job(&app, &job),
+            ImportKind::Tablist => run_tablist_job(&app, &job),
         }
         import_unmark_cancelled(&job.job_id);
     }
@@ -960,6 +984,123 @@ fn run_custom_job(app: &tauri::AppHandle, job: &ImportJob) {
         total,
         total,
         format!("{added} of {total} audio file(s) imported"),
+        None,
+        Some(reports),
+    );
+}
+
+/// Resolve one public Tablist looper and import its pre-looped audio tracks.
+fn run_tablist_job(app: &tauri::AppHandle, job: &ImportJob) {
+    let input = job.paths.first().map(String::as_str).unwrap_or("");
+    let fail = |error: String| {
+        emit_import_progress(app, &job.job_id, "failed", 0, 0, input, true, Some(error));
+    };
+    if import_cancelled(&job.job_id) {
+        fail("import cancelled".to_string());
+        return;
+    }
+    emit_import_progress(
+        app,
+        &job.job_id,
+        "looking up Tablist looper",
+        0,
+        0,
+        input,
+        false,
+        None,
+    );
+    let page = match tablist::resolve_page(input, app) {
+        Ok(page) => page,
+        Err(error) => {
+            fail(error);
+            return;
+        }
+    };
+    let lib = match library::Library::open(&job.root) {
+        Ok(lib) => lib,
+        Err(error) => {
+            fail(error);
+            return;
+        }
+    };
+    let group_hash = library::sha256_hex(page.path.as_bytes());
+    let page_referrer = format!("https://tablist.net/{}", page.path);
+    let cover = page.cover_path.as_deref().and_then(|path| {
+        match tablist::download_cover(path, &page_referrer) {
+            Ok(bytes) => Some(bytes),
+            Err(error) => {
+                eprintln!("[oLooper] Tablist cover was not downloaded: {error}");
+                None
+            }
+        }
+    });
+    let total = page.tracks.len();
+    let mut reports = Vec::with_capacity(total);
+    for (index, track) in page.tracks.iter().enumerate() {
+        if import_cancelled(&job.job_id) {
+            fail("import cancelled".to_string());
+            return;
+        }
+        emit_import_progress(
+            app,
+            &job.job_id,
+            "downloading Tablist track",
+            index,
+            total,
+            &track.title,
+            false,
+            None,
+        );
+        let bytes = match tablist::download_track(track, &page_referrer) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                reports.push(library::CustomReport {
+                    file: track.title.clone(),
+                    added: false,
+                    track_id: None,
+                    bpm: track.bpm,
+                    bpm_confidence: None,
+                    error: Some(error),
+                });
+                continue;
+            }
+        };
+        let report = lib.import_tablist_track(
+            &page.title,
+            &group_hash,
+            input,
+            &track.id,
+            &track.title,
+            &track.extension,
+            &bytes,
+            track.bpm,
+        );
+        reports.push(report);
+        emit_import_progress(
+            app,
+            &job.job_id,
+            "importing Tablist track",
+            index + 1,
+            total,
+            &track.title,
+            false,
+            None,
+        );
+    }
+    if reports.iter().any(|report| report.track_id.is_some()) {
+        if let Some(cover) = cover.as_deref() {
+            if let Err(error) = lib.save_group_cover(&group_hash, cover) {
+                eprintln!("[oLooper] Tablist cover was not saved: {error}");
+            }
+        }
+    }
+    let added = reports.iter().filter(|report| report.added).count();
+    emit_import_done(
+        app,
+        &job.job_id,
+        total,
+        total,
+        format!("{added} of {total} Tablist track(s) imported"),
         None,
         Some(reports),
     );
@@ -1038,6 +1179,41 @@ fn import_custom(
         })
         .map_err(|e| format!("import worker unavailable: {e}"))?;
     Ok(job_id)
+}
+
+#[tauri::command]
+fn import_tablist(
+    url: String,
+    job_id: String,
+    queue: tauri::State<'_, ImportQueue>,
+    db: Db<'_>,
+) -> Result<String, String> {
+    tablist::parse_looper_url(&url)?;
+    if import_cancelled(&job_id) {
+        return Err("import cancelled".to_string());
+    }
+    let root = require_lib(&self::db(&db)?)?.root.clone();
+    queue
+        .tx
+        .send(ImportJob {
+            root,
+            kind: ImportKind::Tablist,
+            paths: vec![url],
+            job_id: job_id.clone(),
+        })
+        .map_err(|error| format!("import worker unavailable: {error}"))?;
+    Ok(job_id)
+}
+
+#[tauri::command]
+async fn tablist_search(
+    query: String,
+    offset: usize,
+    app: tauri::AppHandle,
+) -> Result<tablist::TablistCatalogPage, String> {
+    tauri::async_runtime::spawn_blocking(move || tablist::search_loopers(&app, &query, offset))
+        .await
+        .map_err(|error| format!("Tablist search worker failed: {error}"))?
 }
 
 #[cfg(test)]

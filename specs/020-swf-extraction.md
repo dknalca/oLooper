@@ -31,11 +31,17 @@ Never executes ActionScript; never requires Flash.
   carried by `SoundStreamBlock` is assembled in frame order into a derived
   track. Blocks have bounded aggregate size and malformed stream headers or
   blocks are skipped without affecting independent `DefineSound` extraction.
+- The largest complete embedded JPEG from `DefineBits`, `DefineBitsJPEG2`,
+  `DefineBitsJPEG3`, or `DefineBitsJPEG4` is offered as the looper cover. EXE
+  projectors use the cover from their validated embedded SWF.
 
 ## Outputs
 
 - Extracted audio files (original bytes) written `tmp → validate → atomic rename`
   into `Loopers/<sanitized-looper-name>/NN.mp3`.
+- A valid cover is normalized to a bounded JPEG thumbnail stored beside audio
+  as `cover.jpg`; the cover remains on disk with the audio when catalog rows are
+  removed.
 - Provenance per track: `source_type=swf`, `source_path`, `source_hash` (of the
   `.swf`), `source_sound_id`, `imported_at`.
 

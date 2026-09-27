@@ -4,6 +4,7 @@ import Sidebar from "./components/Sidebar";
 import Player from "./components/Player";
 import Waveform from "./components/Waveform";
 import ImportBar from "./components/ImportBar";
+import TablistCatalog from "./components/TablistCatalog";
 import useKeyboardShortcuts from "./hooks/useKeyboardShortcuts";
 import type { PlayerStatus, Track } from "./tauri";
 
@@ -13,6 +14,7 @@ export default function App() {
   const [refreshKey, setRefreshKey] = useState(0);
   const [playerStatus, setPlayerStatus] = useState<PlayerStatus | null>(null);
   const [activeTrackId, setActiveTrackId] = useState<number | null>(null);
+  const [libraryView, setLibraryView] = useState<"local" | "tablist">("local");
 
   const onLibraryReady = useCallback(() => setLibraryReady(true), []);
   const onImported = useCallback(
@@ -46,11 +48,35 @@ export default function App() {
         />
         <section className="flex min-h-0 flex-1 flex-col border-t border-border">
           <ImportBar onImported={onImported} />
-          <Sidebar
-            libraryReady={libraryReady}
-            refreshKey={refreshKey}
-            onTrackSelected={onTrackSelected}
-          />
+          <div className="flex shrink-0 items-center gap-1 border-b border-border bg-surface px-3 pt-1.5" role="tablist" aria-label="Library views">
+            <button
+              role="tab"
+              aria-selected={libraryView === "local"}
+              onClick={() => setLibraryView("local")}
+              className={`rounded-t px-3 py-1.5 text-[11px] ${libraryView === "local" ? "border border-border border-b-surface bg-surface text-text" : "text-text-secondary hover:text-text"}`}
+            >
+              My Library
+            </button>
+            <button
+              role="tab"
+              aria-selected={libraryView === "tablist"}
+              onClick={() => setLibraryView("tablist")}
+              className={`rounded-t px-3 py-1.5 text-[11px] ${libraryView === "tablist" ? "border border-border border-b-surface bg-surface text-text" : "text-text-secondary hover:text-text"}`}
+            >
+              Tablist Online
+            </button>
+          </div>
+          <div className="flex min-h-0 flex-1 flex-col">
+            {libraryView === "local" ? (
+              <Sidebar
+                libraryReady={libraryReady}
+                refreshKey={refreshKey}
+                onTrackSelected={onTrackSelected}
+              />
+            ) : (
+              <TablistCatalog libraryReady={libraryReady} onImported={onImported} />
+            )}
+          </div>
         </section>
       </main>
     </div>

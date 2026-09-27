@@ -264,23 +264,49 @@ export function importSwf(path: string, jobId = importJobId()): Promise<string> 
   return invoke<string>("import_swf", { path, jobId });
 }
 
-/** Resolve when the matching `done` event arrives; reject on failure/timeout. */
-function waitForImportDone(jobId: string, timeoutMs = 30 * 60 * 1000): Promise<ImportProgress> {
-  return new Promise((resolve, reject) => {
-    let unlisten: UnlistenFn | undefined;
-    const timeout = window.setTimeout(() => {
-      unlisten?.();
-      reject(new Error("import timed out"));
-    }, timeoutMs);
-    listenImportProgress((progress) => {
-      if (progress.job_id !== jobId || !progress.done) return;
-      window.clearTimeout(timeout);
-      unlisten?.();
-      resolve(progress);
-    }).then((off) => {
-      unlisten = off;
-    }).catch(reject);
+/** Register before enqueueing to avoid missing a fast worker completion. */
+function waitForImportDone(jobId: string, timeoutMs = 30 * 60 * 1000): {
+  ready: Promise<void>;
+  done: Promise<ImportProgress>;
+  cancel: () => void;
+} {
+  let unlisten: UnlistenFn | undefined;
+  let timeout: number | undefined;
+  let settled = false;
+  let resolveReady!: () => void;
+  let rejectReady!: (error: unknown) => void;
+  let resolveDone!: (progress: ImportProgress) => void;
+  let rejectDone!: (error: unknown) => void;
+  const ready = new Promise<void>((resolve, reject) => {
+    resolveReady = resolve;
+    rejectReady = reject;
   });
+  const done = new Promise<ImportProgress>((resolve, reject) => {
+    resolveDone = resolve;
+    rejectDone = reject;
+  });
+  const cancel = () => {
+    if (timeout !== undefined) window.clearTimeout(timeout);
+    unlisten?.();
+  };
+  listenImportProgress((progress) => {
+    if (progress.job_id !== jobId || !progress.done || settled) return;
+    settled = true;
+    cancel();
+    resolveDone(progress);
+  }).then((off) => {
+    unlisten = off;
+    resolveReady();
+    if (settled) off();
+    else timeout = window.setTimeout(() => {
+      settled = true;
+      cancel();
+      rejectDone(new Error("import timed out"));
+    }, timeoutMs);
+  }).catch((error) => {
+    rejectReady(error);
+  });
+  return { ready, done, cancel };
 }
 
 /**
@@ -290,9 +316,16 @@ function waitForImportDone(jobId: string, timeoutMs = 30 * 60 * 1000): Promise<I
  * worker finishes before `waitForImportDone` starts listening.
  */
 export async function importSwfAndWait(path: string, jobId = importJobId()): Promise<ImportReport> {
-  const donePromise = waitForImportDone(jobId);
-  await importSwf(path, jobId);
-  const done = await donePromise;
+  const waiter = waitForImportDone(jobId);
+  await waiter.ready;
+  let done: ImportProgress;
+  try {
+    await importSwf(path, jobId);
+    done = await waiter.done;
+  } catch (error) {
+    waiter.cancel();
+    throw error;
+  }
   if (done.report) return done.report;
   if (done.error) throw new Error(done.error);
   throw new Error("import finished without a report");
@@ -307,9 +340,16 @@ export function importExe(path: string, jobId = importJobId()): Promise<string> 
  * Keeps the `Promise<ImportReport>` shape so existing call sites don't change.
  */
 export async function importExeAndWait(path: string, jobId = importJobId()): Promise<ImportReport> {
-  const donePromise = waitForImportDone(jobId);
-  await importExe(path, jobId);
-  const done = await donePromise;
+  const waiter = waitForImportDone(jobId);
+  await waiter.ready;
+  let done: ImportProgress;
+  try {
+    await importExe(path, jobId);
+    done = await waiter.done;
+  } catch (error) {
+    waiter.cancel();
+    throw error;
+  }
   if (done.report) return done.report;
   if (done.error) throw new Error(done.error);
   throw new Error("import finished without a report");
@@ -334,6 +374,28 @@ export interface CustomReport {
   error: string | null;
 }
 
+export interface TablistCatalogLooper {
+  nid: string;
+  title: string;
+  tags: string[];
+  loops: string[];
+  image: string;
+  path: string;
+  date: string;
+}
+
+export interface TablistCatalogPage {
+  hits: TablistCatalogLooper[];
+  estimatedTotalHits: number;
+  limit: number;
+  offset: number;
+  skippedInvalidPaths: number;
+}
+
+export function tablistSearch(query: string, offset: number): Promise<TablistCatalogPage> {
+  return invoke<TablistCatalogPage>("tablist_search", { query, offset });
+}
+
 export function importCustom(paths: string[], jobId = importJobId()): Promise<string> {
   return invoke<string>("import_custom", { paths, jobId });
 }
@@ -344,12 +406,43 @@ export function importCustom(paths: string[], jobId = importJobId()): Promise<st
  * call sites don't change.
  */
 export async function importCustomAndWait(paths: string[], jobId = importJobId()): Promise<CustomReport[]> {
-  const donePromise = waitForImportDone(jobId);
-  await importCustom(paths, jobId);
-  const done = await donePromise;
+  const waiter = waitForImportDone(jobId);
+  await waiter.ready;
+  let done: ImportProgress;
+  try {
+    await importCustom(paths, jobId);
+    done = await waiter.done;
+  } catch (error) {
+    waiter.cancel();
+    throw error;
+  }
   if (done.custom_report) return done.custom_report;
   if (done.error) throw new Error(done.error);
   throw new Error("import finished without a report");
+}
+
+export function importTablist(url: string, jobId = importJobId()): Promise<string> {
+  return invoke<string>("import_tablist", { url, jobId });
+}
+
+/** Import every audio loop exposed by a Tablist looper page. */
+export async function importTablistAndWait(
+  url: string,
+  jobId = importJobId(),
+): Promise<CustomReport[]> {
+  const waiter = waitForImportDone(jobId);
+  await waiter.ready;
+  let done: ImportProgress;
+  try {
+    await importTablist(url, jobId);
+    done = await waiter.done;
+  } catch (error) {
+    waiter.cancel();
+    throw error;
+  }
+  if (done.custom_report) return done.custom_report;
+  if (done.error) throw new Error(done.error);
+  throw new Error("Tablist import finished without a report");
 }
 
 // --- File dialog wrappers ---
@@ -437,6 +530,10 @@ export function libraryRemoveLooper(sourceHash: string): Promise<number> {
 
 export function libraryGroupDirectory(sourceHash: string): Promise<string> {
   return invoke<string>("library_group_directory", { sourceHash });
+}
+
+export function libraryGroupCover(sourceHash: string): Promise<string | null> {
+  return invoke<string | null>("library_group_cover", { sourceHash });
 }
 
 export function revealInFileManager(path: string): Promise<void> {

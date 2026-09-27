@@ -534,6 +534,67 @@ fn custom_import_garbage_fails_per_file() {
 }
 
 #[test]
+fn tablist_import_preserves_full_loop_bpm_and_deduplicates() {
+    let root = tmp_root("tablist-import");
+    let lib = Library::open(&root).unwrap();
+    let source = root.join("source.wav");
+    write_wav(&source, &[0; 16000], 8000);
+    let bytes = std::fs::read(source).unwrap();
+    let group = sha256_hex(b"looper/example");
+    let first = lib.import_tablist_track(
+        "Example Looper",
+        &group,
+        "https://tablist.net/looper/example",
+        "loop-1",
+        "Track 1",
+        "wav",
+        &bytes,
+        Some(123.5),
+    );
+    assert!(first.added);
+    assert_eq!(first.bpm, Some(123.5));
+    let track = lib.get_track(first.track_id.unwrap()).unwrap().unwrap();
+    assert_eq!(track.source_type, "tablist");
+    assert_eq!(track.bpm, Some(123.5));
+    assert_eq!(track.bpm_source.as_deref(), Some("analyzed"));
+    assert_eq!(
+        (track.loop_start_ms, track.loop_end_ms),
+        (0, track.duration_ms)
+    );
+    assert_eq!(track.source_path, "https://tablist.net/looper/example");
+    assert!(Path::new(&track.file_path).is_file());
+
+    let source_cover = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+        24,
+        16,
+        image::Rgb([40, 100, 180]),
+    ));
+    let mut cover_bytes = std::io::Cursor::new(Vec::new());
+    source_cover
+        .write_to(&mut cover_bytes, image::ImageFormat::Png)
+        .unwrap();
+    assert!(lib.save_group_cover(&group, cover_bytes.get_ref()).unwrap());
+    let cover_url = lib.group_cover_data_url(&group).unwrap().unwrap();
+    assert!(cover_url.starts_with("data:image/jpeg;base64,"));
+    assert!(!lib.save_group_cover(&group, cover_bytes.get_ref()).unwrap());
+
+    let second = lib.import_tablist_track(
+        "Example Looper",
+        &group,
+        "https://tablist.net/looper/example",
+        "loop-1",
+        "Track 1",
+        "wav",
+        &bytes,
+        Some(123.5),
+    );
+    assert!(!second.added);
+    assert_eq!(second.track_id, first.track_id);
+    assert_eq!(lib.list_tracks().unwrap().len(), 1);
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
 fn import_one_custom_adds_then_dedups() {
     // Per-file entry point used by the background worker: same result as
     // the batch `import_custom`, second call reports "already in library".

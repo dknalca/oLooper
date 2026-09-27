@@ -5,6 +5,7 @@
 //! and row writes are transactional. Removing a track deletes its row, never
 //! the user's audio.
 
+use std::io::Cursor;
 use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, OptionalExtension as _};
@@ -440,6 +441,49 @@ impl Library {
             return Err("looper folder is outside the library".to_string());
         }
         Ok(canonical)
+    }
+
+    /// Save one normalized looper cover beside its extracted audio files.
+    /// Existing covers are kept so re-imports do not replace a user's choice.
+    pub fn save_group_cover(&self, source_hash: &str, bytes: &[u8]) -> Result<bool, String> {
+        let normalized = normalize_cover(bytes)?;
+        let directory = self.group_directory(source_hash)?;
+        let destination = directory.join("cover.jpg");
+        if destination.exists() {
+            return Ok(false);
+        }
+        self.atomic_write(&destination, &normalized)?;
+        Ok(true)
+    }
+
+    /// Return a small local cover as a data URL for the webview UI.
+    pub fn group_cover_data_url(&self, source_hash: &str) -> Result<Option<String>, String> {
+        const MAX_STORED_COVER_BYTES: u64 = 2 * 1024 * 1024;
+        let directory = self.group_directory(source_hash)?;
+        let path = directory.join("cover.jpg");
+        if !path.is_file() {
+            return Ok(None);
+        }
+        let root = self
+            .root
+            .canonicalize()
+            .map_err(|error| format!("cannot resolve library root: {error}"))?;
+        let path = path
+            .canonicalize()
+            .map_err(|error| format!("cannot resolve cover: {error}"))?;
+        if !path.starts_with(root) {
+            return Err("cover path escapes the library".to_string());
+        }
+        let metadata = std::fs::metadata(&path).map_err(|error| error.to_string())?;
+        if metadata.len() > MAX_STORED_COVER_BYTES {
+            return Err("stored cover exceeds the size limit".to_string());
+        }
+        let bytes = std::fs::read(path).map_err(|error| error.to_string())?;
+        use base64::Engine as _;
+        Ok(Some(format!(
+            "data:image/jpeg;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(bytes)
+        )))
     }
 
     /// Rename the derived-audio folder and its catalog label. Source files stay untouched.
@@ -983,6 +1027,206 @@ impl Library {
             }
         }
     }
+
+    /// Persist one pre-looped Tablist audio file under its looper group.
+    /// The whole audio file remains the loop region; published BPM is retained.
+    pub fn import_tablist_track(
+        &self,
+        looper_name: &str,
+        source_hash: &str,
+        source_url: &str,
+        remote_id: &str,
+        title: &str,
+        extension: &str,
+        data: &[u8],
+        bpm: Option<f64>,
+    ) -> CustomReport {
+        let fail = |reason: String| CustomReport {
+            file: title.to_string(),
+            added: false,
+            track_id: None,
+            bpm,
+            bpm_confidence: None,
+            error: Some(reason),
+        };
+        if data.is_empty() || data.len() > 512 * 1024 * 1024 {
+            return fail("Tablist audio is empty or exceeds the 512 MiB limit".to_string());
+        }
+        let extension = extension.to_ascii_lowercase();
+        if !matches!(
+            extension.as_str(),
+            "wav" | "mp3" | "ogg" | "flac" | "m4a" | "aac" | "audio"
+        ) {
+            return fail("Tablist returned an unsupported audio format".to_string());
+        }
+        let buf = match crate::player::decode_bytes(data) {
+            Ok(buffer) => buffer,
+            Err(error) => return fail(format!("'{}' is not playable audio: {error}", title)),
+        };
+        let remote_hash = Sha256::digest(remote_id.as_bytes());
+        let mut sound_id =
+            (u64::from_be_bytes(remote_hash[..8].try_into().unwrap()) & i64::MAX as u64) as i64;
+        if sound_id == 0 {
+            sound_id = 1;
+        }
+        let existing: Result<Option<i64>, _> = self
+            .conn
+            .query_row(
+                "SELECT id FROM tracks WHERE source_hash=?1 AND source_sound_id=?2",
+                rusqlite::params![source_hash, sound_id],
+                |row| row.get(0),
+            )
+            .optional();
+        match existing {
+            Ok(Some(id)) => {
+                return CustomReport {
+                    file: title.to_string(),
+                    added: false,
+                    track_id: Some(id),
+                    bpm,
+                    bpm_confidence: None,
+                    error: Some("already in library".to_string()),
+                }
+            }
+            Ok(None) => {}
+            Err(error) => return fail(error.to_string()),
+        }
+
+        let requested_name = sanitize_name(looper_name);
+        let known_group: Result<Option<String>, _> = self
+            .conn
+            .query_row(
+                "SELECT looper_name FROM tracks WHERE source_hash=?1 LIMIT 1",
+                [source_hash],
+                |row| row.get(0),
+            )
+            .optional();
+        let is_new_group = known_group.as_ref().is_ok_and(|group| group.is_none());
+        let mut looper_name = match known_group {
+            Ok(Some(name)) => name,
+            Ok(None) => requested_name.clone(),
+            Err(error) => return fail(error.to_string()),
+        };
+        if is_new_group {
+            let mut suffix = 2;
+            loop {
+                let directory = self.root.join(&looper_name);
+                let owner: Result<Option<String>, _> = self
+                    .conn
+                    .query_row(
+                        "SELECT source_hash FROM tracks WHERE looper_name=?1 LIMIT 1",
+                        [&looper_name],
+                        |row| row.get(0),
+                    )
+                    .optional();
+                match owner {
+                    Ok(Some(hash)) if hash == source_hash => break,
+                    Ok(None) if !directory.exists() => break,
+                    Ok(Some(_)) | Ok(None) => {
+                        looper_name = format!("{} ({suffix})", requested_name);
+                        suffix += 1;
+                        if suffix > 10_000 {
+                            return fail("too many Tablist looper name collisions".to_string());
+                        }
+                    }
+                    Err(error) => return fail(error.to_string()),
+                }
+            }
+        }
+        let title = sanitize_name(title);
+        let directory = self.root.join(&looper_name);
+        if let Err(error) = std::fs::create_dir_all(&directory) {
+            return fail(format!("cannot create Tablist looper folder: {error}"));
+        }
+        let mut destination = directory.join(format!("{title}.{extension}"));
+        let mut suffix = 2;
+        while destination.exists() {
+            destination = directory.join(format!("{title} ({suffix}).{extension}"));
+            suffix += 1;
+        }
+        let final_path = match self.atomic_write(&destination, data) {
+            Ok(path) => path,
+            Err(error) => return fail(error),
+        };
+        let (id, added) = match self.add_track(
+            &title,
+            &looper_name,
+            &final_path,
+            "tablist",
+            source_url,
+            source_hash,
+            sound_id,
+            None,
+            None,
+            &extension,
+            &buf,
+            0,
+            0,
+        ) {
+            Ok(result) => result,
+            Err(error) => {
+                let _ = std::fs::remove_file(&final_path);
+                return fail(error);
+            }
+        };
+        if !added {
+            let _ = std::fs::remove_file(&final_path);
+            return CustomReport {
+                file: title,
+                added: false,
+                track_id: Some(id),
+                bpm,
+                bpm_confidence: None,
+                error: Some("already in library".to_string()),
+            };
+        }
+        let estimate = crate::analysis::estimate(&buf);
+        let (effective_bpm, confidence) = match bpm {
+            Some(bpm) => (Some(bpm), None),
+            None => (
+                estimate.as_ref().map(|estimate| estimate.bpm),
+                estimate.as_ref().map(|estimate| estimate.confidence),
+            ),
+        };
+        if let Some(bpm) = effective_bpm {
+            if let Err(error) = self.update_bpm(id, bpm, confidence, false) {
+                return fail(error);
+            }
+        }
+        CustomReport {
+            file: title,
+            added: true,
+            track_id: Some(id),
+            bpm: effective_bpm,
+            bpm_confidence: confidence,
+            error: None,
+        }
+    }
+}
+
+const MAX_COVER_INPUT_BYTES: usize = 10 * 1024 * 1024;
+
+fn normalize_cover(bytes: &[u8]) -> Result<Vec<u8>, String> {
+    if bytes.is_empty() || bytes.len() > MAX_COVER_INPUT_BYTES {
+        return Err("cover is empty or exceeds the 10 MiB limit".to_string());
+    }
+    let mut reader = image::ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|error| format!("cannot detect cover image format: {error}"))?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(8192);
+    limits.max_image_height = Some(8192);
+    limits.max_alloc = Some(128 * 1024 * 1024);
+    reader.limits(limits);
+    let image = reader
+        .decode()
+        .map_err(|error| format!("cannot decode cover image: {error}"))?;
+    let thumbnail = image.thumbnail(512, 512);
+    let mut normalized = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut normalized, 84)
+        .encode_image(&thumbnail)
+        .map_err(|error| format!("cannot encode cover thumbnail: {error}"))?;
+    Ok(normalized)
 }
 
 fn migrate(conn: &Connection) -> Result<(), String> {

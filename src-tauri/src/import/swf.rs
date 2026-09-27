@@ -13,6 +13,11 @@ pub const MAX_SWF_LEN: u32 = 256 * 1024 * 1024;
 
 /// `DefineSound` tag id.
 const TAG_DEFINE_SOUND: u16 = 14;
+const TAG_DEFINE_BITS: u16 = 6;
+const TAG_JPEG_TABLES: u16 = 8;
+const TAG_DEFINE_BITS_JPEG2: u16 = 21;
+const TAG_DEFINE_BITS_JPEG3: u16 = 35;
+const TAG_DEFINE_BITS_JPEG4: u16 = 90;
 const TAG_SOUND_STREAM_HEAD: u16 = 18;
 const TAG_SOUND_STREAM_BLOCK: u16 = 19;
 const TAG_SOUND_STREAM_HEAD2: u16 = 45;
@@ -102,6 +107,8 @@ pub struct SwfSounds {
     pub version: u8,
     pub sounds: Vec<Sound>,
     pub skipped: Vec<SkippedSound>,
+    /// Largest embedded JPEG cover candidate, if present.
+    pub cover_image: Option<Vec<u8>>,
 }
 
 struct BitReader<'a> {
@@ -424,6 +431,8 @@ pub fn parse(data: &[u8]) -> Result<SwfSounds, SwfError> {
 
     let mut sounds = Vec::new();
     let mut skipped = Vec::new();
+    let mut jpeg_tables: Option<Vec<u8>> = None;
+    let mut cover_image: Option<Vec<u8>> = None;
     let mut stream: Option<StreamSound> = None;
     let mut next_stream_id = 0x8000u16;
     let mut ended = false;
@@ -444,6 +453,17 @@ pub fn parse(data: &[u8]) -> Result<SwfSounds, SwfError> {
         if code == 0 {
             ended = true;
             break; // End tag
+        }
+        if code == TAG_JPEG_TABLES && tag.len() <= MAX_COVER_IMAGE_BYTES {
+            jpeg_tables = Some(tag.to_vec());
+        }
+        if let Some(image) = jpeg_from_tag(code, tag, jpeg_tables.as_deref()) {
+            if cover_image
+                .as_ref()
+                .is_none_or(|existing| image.len() > existing.len())
+            {
+                cover_image = Some(image);
+            }
         }
         match code {
             TAG_DEFINE_SOUND => match parse_define_sound(tag) {
@@ -503,7 +523,53 @@ pub fn parse(data: &[u8]) -> Result<SwfSounds, SwfError> {
         version,
         sounds,
         skipped,
+        cover_image,
     })
+}
+
+const MAX_COVER_IMAGE_BYTES: usize = 10 * 1024 * 1024;
+
+fn jpeg_from_tag(code: u16, tag: &[u8], jpeg_tables: Option<&[u8]>) -> Option<Vec<u8>> {
+    let image_data = match code {
+        TAG_DEFINE_BITS_JPEG2 => tag.get(2..)?,
+        TAG_DEFINE_BITS_JPEG3 => {
+            let jpeg_len = u32le_at(tag, 2).ok()? as usize;
+            tag.get(6usize..6usize.checked_add(jpeg_len)?)?
+        }
+        TAG_DEFINE_BITS_JPEG4 => {
+            let jpeg_len = u32le_at(tag, 2).ok()? as usize;
+            tag.get(8usize..8usize.checked_add(jpeg_len)?)?
+        }
+        TAG_DEFINE_BITS => {
+            let tables = jpeg_tables?;
+            let data = tag.get(2..)?;
+            if tables.len() < 4 || !tables.starts_with(&[0xff, 0xd8]) {
+                return None;
+            }
+            let tables_end = if tables.ends_with(&[0xff, 0xd9]) {
+                tables.len() - 2
+            } else {
+                tables.len()
+            };
+            let data = data.strip_prefix(&[0xff, 0xd8]).unwrap_or(data);
+            let mut combined = Vec::with_capacity(tables_end.saturating_add(data.len()));
+            combined.extend_from_slice(&tables[..tables_end]);
+            combined.extend_from_slice(data);
+            if !combined.ends_with(&[0xff, 0xd9]) {
+                combined.extend_from_slice(&[0xff, 0xd9]);
+            }
+            return valid_jpeg(combined);
+        }
+        _ => return None,
+    };
+    valid_jpeg(image_data.to_vec())
+}
+
+fn valid_jpeg(image: Vec<u8>) -> Option<Vec<u8>> {
+    (image.len() <= MAX_COVER_IMAGE_BYTES
+        && image.starts_with(&[0xff, 0xd8])
+        && image.ends_with(&[0xff, 0xd9]))
+    .then_some(image)
 }
 
 #[cfg(test)]

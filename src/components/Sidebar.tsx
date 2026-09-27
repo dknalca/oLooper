@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import {
   libraryList,
+  libraryGroupCover,
   libraryMarkPlayed,
   libraryGroupDirectory,
   libraryExportTracks,
@@ -47,6 +48,8 @@ export default function Sidebar({ libraryReady, refreshKey, onTrackSelected }: P
   const [groupMenu, setGroupMenu] = useState<string | null>(null);
   const [selectedIds, setSelectedIds] = useState<number[]>([]);
   const [loadingId, setLoadingId] = useState<number | null>(null);
+  const [covers, setCovers] = useState<Record<string, string>>({});
+  const coverCache = useRef(new Map<string, string>());
   // Newest selection wins: older in-flight loads are abandoned (the backend
   // discards superseded decodes by load generation).
   const loadSeq = useRef(0);
@@ -58,6 +61,35 @@ export default function Sidebar({ libraryReady, refreshKey, onTrackSelected }: P
   useEffect(() => {
     if (libraryReady) refresh();
   }, [libraryReady, refreshKey]);
+
+  useEffect(() => {
+    if (!libraryReady) return;
+    const sourceHashes = [...new Set(tracks
+      .filter((track) => track.source_type !== "custom")
+      .map((track) => track.source_hash))];
+    const missing = sourceHashes.filter((sourceHash) => !coverCache.current.has(sourceHash));
+    if (missing.length === 0) return;
+    let cancelled = false;
+    Promise.all(missing.map(async (sourceHash) => {
+      try {
+        const cover = await libraryGroupCover(sourceHash);
+        if (cover) coverCache.current.set(sourceHash, cover);
+        return [sourceHash, cover] as const;
+      } catch {
+        return [sourceHash, null] as const;
+      }
+    })).then((loaded) => {
+      if (cancelled) return;
+      setCovers((current) => {
+        const next = { ...current };
+        for (const [sourceHash, cover] of loaded) {
+          if (cover) next[sourceHash] = cover;
+        }
+        return next;
+      });
+    });
+    return () => { cancelled = true; };
+  }, [libraryReady, tracks]);
 
   useEffect(() => {
     if (contextMenu === null && groupMenu === null) return;
@@ -205,6 +237,9 @@ export default function Sidebar({ libraryReady, refreshKey, onTrackSelected }: P
             <section key={sourceHash} className="border-b border-border/60">
               <div className="flex items-center gap-2 border-y border-border/50 bg-elevated/30 px-4 py-2 text-[11px] font-medium text-text-secondary">
                 <button onClick={() => setCollapsed((current) => ({ ...current, [sourceHash]: !isCollapsed }))} className="flex min-w-0 flex-1 items-center gap-2 text-left hover:text-text">
+                {covers[sourceHash]
+                  ? <img src={covers[sourceHash]} alt="" className="h-8 w-8 shrink-0 rounded object-cover" />
+                  : <span aria-hidden="true" className="flex h-8 w-8 shrink-0 items-center justify-center rounded bg-border text-sm text-text-secondary">♫</span>}
                 <span className="w-3 text-center">{isCollapsed ? "›" : "⌄"}</span>
                 <span className="truncate">{name}</span>
                 <span className="rounded bg-border px-1.5 py-0.5 text-[9px] uppercase">{entries[0].source_type}</span>

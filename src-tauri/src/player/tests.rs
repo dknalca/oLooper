@@ -108,6 +108,12 @@ fn synthetic_wav_decodes_end_to_end() {
 }
 
 #[test]
+fn malformed_m4a_returns_error_without_panicking() {
+    let bytes = [0, 0, 0, 8, b'f', b't', b'y', b'p', 0, 0, 0, 0];
+    assert!(decode_bytes(&bytes).is_err());
+}
+
+#[test]
 fn garbage_is_not_audio() {
     assert!(decode_bytes(b"definitely not audio").is_err());
     assert!(decode_bytes(&[]).is_err());
