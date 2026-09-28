@@ -9,7 +9,24 @@ use std::path::PathBuf;
 fn report_swf(data: &[u8], dump: Option<&std::path::Path>) {
     match olooper::import::swf::parse(data) {
         Ok(s) => {
-            println!("  SWF v{}: {} extracted, {} skipped", s.version, s.sounds.len(), s.skipped.len());
+            println!(
+                "  SWF v{}: {} extracted, {} skipped",
+                s.version,
+                s.sounds.len(),
+                s.skipped.len()
+            );
+            match s.cover_image.as_deref() {
+                Some(bytes) => {
+                    let dimensions = image::load_from_memory(bytes)
+                        .map(|image| format!("{}x{}", image.width(), image.height()))
+                        .unwrap_or_else(|error| format!("invalid image: {error}"));
+                    println!("  Cover: {} bytes ({dimensions})", bytes.len());
+                    if let Some(dir) = dump {
+                        std::fs::write(dir.join("cover.jpg"), bytes).expect("cover write failed");
+                    }
+                }
+                None => println!("  Cover: not found"),
+            }
             for (i, x) in s.sounds.iter().enumerate() {
                 println!(
                     "    id={} fmt={} samples={} bytes={}",
@@ -19,7 +36,7 @@ fn report_swf(data: &[u8], dump: Option<&std::path::Path>) {
                     x.frames.len()
                 );
                 if let Some(dir) = dump {
-                    let name = format!("{:02}_{}.mp3", i + 1, x.id);
+                    let name = format!("{:02}_{}.{}", i + 1, x.id, x.codec);
                     std::fs::write(dir.join(name), &x.frames).expect("dump write failed");
                 }
             }

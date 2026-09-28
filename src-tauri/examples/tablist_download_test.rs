@@ -1,7 +1,7 @@
 //! Standalone Tablist downloader probe (no oLooper frontend bundle required).
 //!
-//! Run from `src-tauri/`:
-//!   cargo run --example tablist_download_test -- \
+//! Run from the repository root:
+//!   cargo run --manifest-path src-tauri/Cargo.toml --example tablist_download_test -- \
 //!     https://tablist.net/looper/sonny-kraft-friendly-melodies \
 //!     https://tablist.net/looper/molotov-everyday-samurai-2 \
 //!     https://tablist.net/looper/kurtz-bangz-skilzbeat-vol-1
@@ -72,6 +72,31 @@ fn run_probe(app: tauri::AppHandle, urls: Vec<String>) {
             eprintln!("  Cannot create {}: {error}", folder.display());
             failed += page.tracks.len();
             continue;
+        }
+        match page.cover_path.as_deref() {
+            Some(cover_path) => match olooper::tablist::download_cover(
+                cover_path,
+                &format!("https://tablist.net/{}", page.path),
+            ) {
+                Ok(bytes) => match image::load_from_memory(&bytes) {
+                    Ok(image) => {
+                        let path = folder.join("cover-source.img");
+                        match std::fs::write(&path, &bytes) {
+                            Ok(()) => println!(
+                                "  Cover OK: {}x{} {} bytes -> {}",
+                                image.width(),
+                                image.height(),
+                                bytes.len(),
+                                path.display()
+                            ),
+                            Err(error) => eprintln!("  COVER SAVE FAILED: {error}"),
+                        }
+                    }
+                    Err(error) => eprintln!("  COVER DECODE FAILED: {error}"),
+                },
+                Err(error) => eprintln!("  COVER DOWNLOAD FAILED: {error}"),
+            },
+            None => println!("  No cover path was present on the Firestore node."),
         }
         for (index, track) in page.tracks.iter().enumerate() {
             total += 1;

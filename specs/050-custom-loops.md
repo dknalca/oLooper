@@ -8,7 +8,7 @@ ready to practice immediately with the same player/waveform as extractions.
 
 ## User-visible behavior
 
-1. User drops WAV/MP3 (one or many) onto the Library section → each file
+1. User drops supported audio files (one or many) onto the Library section → each file
    validates; valid ones copy in, appear in the list, playable at once.
 2. User can also click Browse buttons (SWF/EXE/Audio) which open native
    OS file pickers via `tauri-plugin-dialog`. Selected files auto-import.
@@ -21,8 +21,8 @@ ready to practice immediately with the same player/waveform as extractions.
 
 ## Supported inputs
 
-- Whatever rodio/Symphonia decodes (WAV, MP3; AIFF if the bundled codecs
-  handle it). Max 512 MiB per file, 15 min duration (player limits).
+- Audio decoded by the bundled rodio/Symphonia codecs (including WAV, MP3,
+  FLAC, OGG, AAC, and M4A). Max 512 MiB per file and 15 min duration.
 
 ## Outputs
 
@@ -61,6 +61,4 @@ ready to practice immediately with the same player/waveform as extractions.
 
 ## Non-goals
 
-- Half/double-time disambiguation UI, beatgrid, key detection, batch progress
-  UI (sequential with a busy flag is enough), moving/copying policy choice
-  (MVP always copies; originals untouched).
+- Half/double-time disambiguation UI, beatgrid, and key detection.

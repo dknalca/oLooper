@@ -81,12 +81,24 @@ pub fn scan(data: &[u8]) -> Vec<EmbeddedSwf> {
             continue;
         }
         let len = length as usize;
-        if len < 8 { continue; }
+        if len < 8 {
+            continue;
+        }
         // CWS FileLength describes the *decompressed* FWS image, not the
         // compressed bytes stored in a projector overlay. Pass the remaining
         // bytes to the zlib parser, which validates the declared output size.
-        let stored_len = if data[off] == b'C' { data.len() - off } else { len };
-        if off.checked_add(stored_len).map(|end| end > data.len()).unwrap_or(true) { continue; }
+        let stored_len = if data[off] == b'C' {
+            data.len() - off
+        } else {
+            len
+        };
+        if off
+            .checked_add(stored_len)
+            .map(|end| end > data.len())
+            .unwrap_or(true)
+        {
+            continue;
+        }
         // Skip candidates fully inside an already-accepted larger one? No:
         // keep it simple, prefer largest valid later.
         if out.len() < MAX_CANDIDATES {

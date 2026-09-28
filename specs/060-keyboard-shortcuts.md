@@ -2,18 +2,18 @@
 
 ## Scope
 
-Frontend-only keyboard shortcuts for hands-free transport and loop control.
+Frontend-only keyboard shortcuts for hands-free transport and loop toggle.
 No global shortcuts plugin; listener runs only while the app window is focused.
 
 ## User-visible behavior
 
 1. When the app window is focused and no text input is active, keyboard
-   shortcuts control playback and loop editing.
+   shortcuts control playback and toggle looping.
 2. Shortcuts are disabled when the user is typing in any `<input>` or
    `<textarea>` element (checked via `document.activeElement`).
 3. Modifier keys (Cmd/Ctrl/Alt) are ignored to preserve system shortcuts
    (Cmd+C, Cmd+V, etc.).
-4. `Cmd+O` is the exception: it opens the native file picker for import.
+4. `Cmd+O` opens the native **File → Import Files…** picker.
 
 ## Key mappings
 
@@ -26,21 +26,18 @@ No global shortcuts plugin; listener runs only while the app window is focused.
 | `L` | Toggle loop on/off | Track loaded |
 | `+` | Increase speed by 5% (50–200%) | Track loaded |
 | `-` | Decrease speed by 5% (50–200%) | Track loaded |
-| `[` | Set loop start = current position | Track loaded, loop enabled |
-| `]` | Set loop end = current position | Track loaded, loop enabled |
-| `Cmd+O` / `Ctrl+O` | Open file picker for import | Library initialized |
+| `Cmd+O` / `Ctrl+O` | File → Import Files… | Library initialized |
 
 ## Architecture
 
-- `src/hooks/useKeyboardShortcuts.ts` — single `useEffect` with
-  `window.addEventListener("keydown", handler)`.
+- `src/hooks/useKeyboardShortcuts.ts` — transport shortcuts use a focused-window
+  key listener. File-import shortcut is provided by the native application menu.
+- The native Edit menu exposes platform text-editing actions; File menu actions
+  dispatch through `src/tauri.ts` and the app import bridge.
 - State bridge: Player component calls `exposePlayerState()` on every
   status update, writing to module-level variables read by the shortcut handler.
-- Loop start/end events: `[` and `]` dispatch `CustomEvent`s
-  (`olooper:set-loop-start`, `olooper:set-loop-end`) consumed by Player
-  to call `player_set_loop`.
-- Import event: `Cmd+O` dispatches `olooper:imported` after successful
-  import, consumed by App to refresh the sidebar.
+- Menu import commands are handled by `ImportBar`; completed imports dispatch
+  `olooper:imported`, consumed by App to refresh the library.
 
 ## Edge cases
 
@@ -48,7 +45,6 @@ No global shortcuts plugin; listener runs only while the app window is focused.
   ref (`pendingRef`) to avoid races.
 - **No track loaded**: all transport shortcuts are no-ops.
 - **Seek bounds**: clamped to `[0, duration_ms]`.
-- **Loop start > end**: allowed (backend clamps); user can adjust after.
 
 ## Persistence behavior
 
@@ -62,7 +58,6 @@ No global shortcuts plugin; listener runs only while the app window is focused.
 - [x] Arrow keys seek ±5s, clamped to track bounds.
 - [x] L toggles loop enabled flag.
 - [x] `+` and `-` change playback speed in 5% steps (50–200%).
-- [x] `[` and `]` set loop start/end to current position and update the player.
 - [x] `Cmd+O` opens native file picker; selected files import automatically.
 - [x] No shortcuts fire when typing in an input field.
 - [x] No shortcuts conflict with system Cmd+key shortcuts.

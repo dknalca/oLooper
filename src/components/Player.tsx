@@ -3,14 +3,10 @@ import {
   libraryGetSlots,
   libraryDeleteSlot,
   librarySetSlot,
-  playerAutoLoop,
   playerPause,
   playerPlay,
   playerSeek,
-  playerSetLoopSnapped,
-  playerSetLoopEnabled,
   playerSetSpeed,
-  playerSetPitchLock,
   playerSetVolume,
   playerStatus,
   playerStop,
@@ -31,34 +27,58 @@ const SLOT_LABELS = ["1", "2", "3", "4"];
 interface Props {
   status: PlayerStatus | null;
   trackId: number | null;
+  canRandom: boolean;
+  onRandomTrack: () => Promise<void>;
+  canNavigateTracks: boolean;
+  onPreviousTrack: () => void;
+  onNextTrack: () => void;
   onStatusChange: (status: PlayerStatus) => void;
 }
 
-export default function Player({ status: st, trackId, onStatusChange }: Props) {
+export default function Player({ status: st, trackId, canRandom, onRandomTrack, canNavigateTracks, onPreviousTrack, onNextTrack, onStatusChange }: Props) {
   const [error, setError] = useState<string | null>(null);
-  const [loopStart, setLoopStart] = useState("0");
-  const [loopEnd, setLoopEnd] = useState("");
-  const loopStartRef = useRef<HTMLInputElement>(null);
-  const loopEndRef = useRef<HTMLInputElement>(null);
   const scrubRef = useRef<HTMLDivElement>(null);
   const [isScrubbing, setIsScrubbing] = useState(false);
-
-  // Preferences are applied after a track becomes ready. Deps include the
-  // path (not just `loaded`) because background track swaps keep `loaded`
-  // true while changing the underlying audio.
-  useEffect(() => {
-    if (!st?.loaded || st.loading) return;
-    const speed = Number(localStorage.getItem("olooper.player.speed"));
-    const pitchLock = localStorage.getItem("olooper.player.pitch-lock");
-    if (Number.isFinite(speed) && speed >= 50 && speed <= 200 && speed !== st.speed_pct) run(playerSetSpeed(speed));
-    if (pitchLock !== null && (pitchLock === "true") !== st.pitch_lock) run(playerSetPitchLock(pitchLock === "true"));
-  }, [st?.loaded, st?.loading, st?.path]);
+  const [randomEnabled, setRandomEnabled] = useState(false);
+  const [randomInterval, setRandomInterval] = useState<"2" | "5" | "custom">("2");
+  const [customMinutes, setCustomMinutes] = useState("10");
+  const [randomRemaining, setRandomRemaining] = useState<number | null>(null);
+  const minutes = randomInterval === "custom" ? Number(customMinutes) : Number(randomInterval);
+  const validInterval = Number.isFinite(minutes) && minutes >= 1 && minutes <= 1440;
 
   useEffect(() => {
-    if (!st?.loaded) return;
-    localStorage.setItem("olooper.player.speed", String(st.speed_pct));
-    localStorage.setItem("olooper.player.pitch-lock", String(st.pitch_lock));
-  }, [st?.loaded, st?.speed_pct, st?.pitch_lock]);
+    if (!randomEnabled || !canRandom || !validInterval) {
+      setRandomRemaining(null);
+      return;
+    }
+    let cancelled = false;
+    let timeout = 0;
+    let ticker = 0;
+    const intervalMs = minutes * 60_000;
+    const schedule = () => {
+      const deadline = Date.now() + intervalMs;
+      const update = () => setRandomRemaining(Math.max(0, Math.ceil((deadline - Date.now()) / 1000)));
+      update();
+      ticker = window.setInterval(update, 250);
+      timeout = window.setTimeout(async () => {
+        window.clearInterval(ticker);
+        setRandomRemaining(0);
+        try {
+          await onRandomTrack();
+          setError(null);
+        } catch (reason) {
+          setError(`Random track: ${String(reason)}`);
+        }
+        if (!cancelled) schedule();
+      }, intervalMs);
+    };
+    schedule();
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timeout);
+      window.clearInterval(ticker);
+    };
+  }, [randomEnabled, canRandom, validInterval, minutes, onRandomTrack]);
 
   // Loop slots
   const [slots, setSlots] = useState<LoopSlot[]>([]);
@@ -73,11 +93,6 @@ export default function Player({ status: st, trackId, onStatusChange }: Props) {
       p.then((s) => {
         onStatusChange(s);
         setError(null);
-        const active = document.activeElement;
-        if (active !== loopStartRef.current && active !== loopEndRef.current) {
-          setLoopStart(String(s.loop_start_ms));
-          setLoopEnd(String(s.loop_end_ms));
-        }
       }).catch((e) => setError(String(e))),
     [onStatusChange],
   );
@@ -100,8 +115,6 @@ export default function Player({ status: st, trackId, onStatusChange }: Props) {
         loaded: st.loaded,
         loop_enabled: st.loop_enabled,
         duration_ms: st.duration_ms,
-        loop_start_ms: st.loop_start_ms,
-        loop_end_ms: st.loop_end_ms,
       });
     }
   }, [st]);
@@ -243,6 +256,18 @@ export default function Player({ status: st, trackId, onStatusChange }: Props) {
               <rect x="3" y="3" width="10" height="10" rx="1" />
             </svg>
           </TransportBtn>
+          <TransportBtn onClick={onPreviousTrack} disabled={!loaded || !canNavigateTracks} title="Previous loop">
+            <svg viewBox="0 0 16 16" className="w-4 h-4 fill-current">
+              <polygon points="11,2 3,8 11,14" />
+              <rect x="12" y="2" width="1.5" height="12" />
+            </svg>
+          </TransportBtn>
+          <TransportBtn onClick={onNextTrack} disabled={!loaded || !canNavigateTracks} title="Next loop">
+            <svg viewBox="0 0 16 16" className="w-4 h-4 fill-current">
+              <polygon points="5,2 13,8 5,14" />
+              <rect x="2.5" y="2" width="1.5" height="12" />
+            </svg>
+          </TransportBtn>
         </div>
 
         <div className="w-px h-5 bg-border" />
@@ -289,88 +314,18 @@ export default function Player({ status: st, trackId, onStatusChange }: Props) {
          <div className="w-px h-5 bg-border" />
 
          <div className="flex items-center gap-1">
-           <button onClick={() => run(playerSetSpeed(Math.max(50, (st?.speed_pct ?? 100) - 5)))} disabled={!loaded} title="Slower" className="rounded bg-border px-1.5 py-0.5 text-xs text-text-secondary hover:text-text disabled:opacity-30">−</button>
-           <span className="w-9 text-center font-mono text-[10px] text-text-secondary">{Math.round(st?.speed_pct ?? 100)}%</span>
-           <button onClick={() => run(playerSetSpeed(Math.min(200, (st?.speed_pct ?? 100) + 5)))} disabled={!loaded} title="Faster" className="rounded bg-border px-1.5 py-0.5 text-xs text-text-secondary hover:text-text disabled:opacity-30">+</button>
-            <button onClick={() => run(playerSetPitchLock(!st?.pitch_lock))} disabled={!loaded} title={st?.pitch_preparing ? "Preparing pitch lock… (click to cancel)" : "Keep pitch while changing speed"} className={`rounded px-1.5 py-0.5 text-[9px] ${st?.pitch_preparing ? "bg-warning/20 text-warning" : st?.pitch_lock ? "bg-success/20 text-success" : "bg-border text-text-secondary"}`}>{st?.pitch_preparing ? "PITCH …" : "PITCH LOCK"}</button>
-            {st?.pitch_preparing && (
-              <span className="text-[10px] text-warning">Preparing pitch lock…</span>
-            )}
-         </div>
-
-         <div className="w-px h-5 bg-border" />
-
-         {/* Loop controls */}
-        {loaded && (
-          <div className="flex items-center gap-1.5">
-            <button
-              onClick={() => run(playerSetLoopEnabled(!st!.loop_enabled))}
-              title="Toggle loop (L)"
-              className={`text-[10px] font-medium px-1.5 py-0.5 rounded transition-colors ${
-                st!.loop_enabled
-                  ? "bg-success/20 text-success"
-                  : "bg-border text-text-secondary hover:text-text"
-              }`}
-            >
-              LOOP
-            </button>
-            <button
-              onClick={() => run(playerAutoLoop().then((r) => {
-                if (r.candidate) {
-                  return playerSetLoopSnapped(
-                    Math.round(r.candidate.start_frame * 1000 / r.sample_rate),
-                    Math.round(r.candidate.end_frame * 1000 / r.sample_rate),
-                  );
-                }
-                return Promise.reject(new Error("No suitable loop found"));
-              }))}
-              title="Auto-detect loop from audio"
-              className="text-[10px] px-1.5 py-0.5 rounded bg-border text-text-secondary hover:text-text transition-colors"
-            >
-              AUTO
-            </button>
-            {st!.loop_enabled && st!.loop_origin && (
-              <span
-                title={`Origin: ${st!.loop_origin} · Quality: ${Math.round(st!.loop_quality * 100)}%`}
-                className={`inline-block w-1.5 h-1.5 rounded-full ${
-                  st!.loop_quality >= 0.7 ? "bg-success" : st!.loop_quality >= 0.3 ? "bg-warning" : "bg-danger"
-                }`}
-              />
-            )}
-            {st!.loop_enabled && (
-              <>
-                <input
-                  ref={loopStartRef}
-                  aria-label="Loop start ms"
-                  value={loopStart}
-                  onChange={(e) => setLoopStart(e.target.value)}
-                  className="bg-elevated border border-border rounded px-1.5 py-0.5 text-[10px] font-mono w-14 text-text text-center"
-                />
-                <span className="text-text-secondary text-[10px]">–</span>
-                <input
-                  ref={loopEndRef}
-                  aria-label="Loop end ms"
-                  value={loopEnd}
-                  onChange={(e) => setLoopEnd(e.target.value)}
-                  className="bg-elevated border border-border rounded px-1.5 py-0.5 text-[10px] font-mono w-14 text-text text-center"
-                />
-                <button
-                  onClick={() => run(playerSetLoopSnapped(Number(loopStart), Number(loopEnd)))}
-                  className="text-[10px] px-1.5 py-0.5 rounded bg-border text-text-secondary hover:text-text transition-colors"
-                >
-                  Set
-                </button>
-              </>
-            )}
+             <button onClick={() => run(playerSetSpeed(Math.max(50, (st?.speed_pct ?? 100) - 5)))} disabled={!loaded} title="Slower" className="rounded bg-border px-1.5 py-0.5 text-xs text-text-secondary hover:text-text disabled:opacity-30">−</button>
+            <span className="w-9 text-center font-mono text-[10px] text-text-secondary">{Math.round(st?.speed_pct ?? 100)}%</span>
+            <button onClick={() => run(playerSetSpeed(Math.min(200, (st?.speed_pct ?? 100) + 5)))} disabled={!loaded} title="Faster" className="rounded bg-border px-1.5 py-0.5 text-xs text-text-secondary hover:text-text disabled:opacity-30">+</button>
           </div>
-        )}
 
-        <div className="w-px h-5 bg-border" />
+          <div className="w-px h-5 bg-border" />
 
           {/* Cue selector */}
-        {loaded && trackId && (
-          <div className="flex items-center gap-1">
-            {SLOT_LABELS.map((label, i) => {
+         {loaded && trackId && (
+           <div className="flex items-center gap-1">
+             <span className="mr-1 text-[9px] font-semibold uppercase tracking-wide text-text-secondary">CUE</span>
+             {SLOT_LABELS.map((label, i) => {
               const slotNum = i + 1;
               const hasData = slotNum === 1 || slots.some((s) => s.slot === slotNum);
               const isActive = activeSlot === slotNum;
@@ -404,6 +359,45 @@ export default function Player({ status: st, trackId, onStatusChange }: Props) {
             })}
           </div>
         )}
+
+        <div className="flex items-center gap-1.5">
+          <button
+            onClick={() => setRandomEnabled((enabled) => !enabled)}
+            disabled={!canRandom || (!randomEnabled && !validInterval)}
+            aria-pressed={randomEnabled}
+            title="Automatically play a random track from your local library at this interval"
+            className={`rounded px-2 py-1 text-[10px] font-medium transition-colors disabled:opacity-30 ${randomEnabled ? "bg-success/20 text-success" : "bg-border text-text-secondary hover:text-text"}`}
+          >
+            {randomEnabled ? "Random ON" : "Random OFF"}
+          </button>
+          <select
+            aria-label="Random track interval"
+            value={randomInterval}
+            onChange={(event) => setRandomInterval(event.target.value as "2" | "5" | "custom")}
+            className="rounded border border-border bg-elevated px-1.5 py-1 text-[10px] text-text"
+          >
+            <option value="2">2 min</option>
+            <option value="5">5 min</option>
+            <option value="custom">Custom</option>
+          </select>
+          {randomInterval === "custom" && (
+            <input
+              type="number"
+              min={1}
+              max={1440}
+              step={1}
+              value={customMinutes}
+              onChange={(event) => setCustomMinutes(event.target.value)}
+              aria-label="Custom random interval in minutes"
+              className="w-12 rounded border border-border bg-elevated px-1.5 py-1 text-center text-[10px] text-text"
+            />
+          )}
+          {randomEnabled && randomRemaining !== null && (
+            <span className="min-w-8 font-mono text-[10px] tabular-nums text-success" aria-live="polite">
+              {Math.floor(randomRemaining / 60)}:{String(randomRemaining % 60).padStart(2, "0")}
+            </span>
+          )}
+        </div>
 
         <div className="flex-1" />
 

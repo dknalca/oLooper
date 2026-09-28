@@ -118,7 +118,27 @@ pub fn resolve_page(input: &str, app: &tauri::AppHandle) -> Result<TablistPage, 
         .as_array()
         .and_then(|rows| rows.iter().find_map(|row| row.get("document")))
         .ok_or_else(|| "No published Tablist looper was found at that URL".to_string())?;
-    parse_document(document, &page_path)
+    let mut page = parse_document(document, &page_path)?;
+    if page.cover_path.is_none() {
+        let slug = page.path.rsplit('/').next().unwrap_or(&page.path);
+        match search_loopers(app, slug, 0) {
+            Ok(catalog) => {
+                page.cover_path = catalog
+                    .hits
+                    .into_iter()
+                    .find(|hit| hit.path == page.path)
+                    .map(|hit| hit.image)
+                    .filter(|path| !path.trim().is_empty());
+                if page.cover_path.is_none() {
+                    eprintln!("[oLooper] No cover image indexed for {}", page.path);
+                }
+            }
+            Err(error) => {
+                eprintln!("[oLooper] Tablist cover fallback lookup failed: {error}");
+            }
+        }
+    }
+    Ok(page)
 }
 
 /// Search Tablist's public Meilisearch `nodes` index for loopers, following the
@@ -128,6 +148,17 @@ pub fn search_loopers(
     query: &str,
     offset: usize,
 ) -> Result<TablistCatalogPage, String> {
+    search_loopers_with_limit(app, query, offset, CATALOG_PAGE_SIZE)
+}
+
+/// Search one bounded catalog window. Smaller limits support global random
+/// selection without downloading whole catalog pages.
+pub fn search_loopers_with_limit(
+    app: &tauri::AppHandle,
+    query: &str,
+    offset: usize,
+    limit: usize,
+) -> Result<TablistCatalogPage, String> {
     let query = query.trim();
     if query.chars().count() > 200 {
         return Err("Catalog search is limited to 200 characters".to_string());
@@ -135,11 +166,16 @@ pub fn search_loopers(
     if offset > 100_000 {
         return Err("Catalog offset is outside the supported range".to_string());
     }
+    if !(1..=CATALOG_PAGE_SIZE).contains(&limit) {
+        return Err(format!(
+            "Catalog limit must be between 1 and {CATALOG_PAGE_SIZE}"
+        ));
+    }
     let request = json!({
         "q": query,
         "filter": "type = \"looper\"",
         "sort": ["date:desc"],
-        "limit": CATALOG_PAGE_SIZE,
+        "limit": limit,
         "offset": offset,
     });
     let script = meili_search_script(&request)?;
@@ -338,12 +374,10 @@ fn normalize_looper_path(path: &str) -> Option<String> {
     } else {
         path.to_string()
     };
-    let route = route
-        .split(['?', '#'])
-        .next()?
-        .trim_matches('/');
+    let route = route.split(['?', '#']).next()?.trim_matches('/');
     let mut segments = route.split('/');
-    let (Some("looper"), Some(slug), None) = (segments.next(), segments.next(), segments.next()) else {
+    let (Some("looper"), Some(slug), None) = (segments.next(), segments.next(), segments.next())
+    else {
         return None;
     };
     if slug.is_empty()
@@ -546,7 +580,8 @@ fn parse_document(document: &Value, fallback_path: &str) -> Result<TablistPage, 
                 .iter()
                 .find_map(|field| field_string(image, field))
         })
-        .or_else(|| field_string(fields, "image"));
+        .or_else(|| field_string(fields, "image"))
+        .filter(|path| !path.trim().is_empty());
     Ok(TablistPage {
         title,
         path: fallback_path.to_string(),
@@ -647,9 +682,16 @@ mod tests {
         .unwrap();
         assert_eq!(page.estimated_total_hits, 12);
         assert_eq!(page.hits[0].loops.len(), 2);
+        assert_eq!(page.hits[0].image, "3557/thumb.jpg");
         assert_eq!(page.hits[0].path, "looper/sonny-kraft-friendly-melodies");
-        assert_eq!(normalize_looper_path("/looper/example/"), Some("looper/example".to_string()));
-        assert_eq!(normalize_looper_path("https://tablist.net/looper/example?q=1"), Some("looper/example".to_string()));
+        assert_eq!(
+            normalize_looper_path("/looper/example/"),
+            Some("looper/example".to_string())
+        );
+        assert_eq!(
+            normalize_looper_path("https://tablist.net/looper/example?q=1"),
+            Some("looper/example".to_string())
+        );
         assert!(normalize_looper_path("https://attacker.test/looper/x").is_none());
     }
 

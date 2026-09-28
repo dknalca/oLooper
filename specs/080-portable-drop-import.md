@@ -15,11 +15,14 @@ Import a dropped `.swf` or projector `.exe` from anywhere in the window into a p
 
 ## User-visible behavior
 
-1. Dropping SWF/EXE anywhere starts an import modal.
-2. The modal reports `copying source`, `analyzing`, `extracting`, `adjusting BPM`, `adjusting loops`, `inserting in library`, then `complete` or `failed`.
-3. Progress includes the current file and sound count when known. Partial failures retain successful tracks and report skipped sounds.
-4. The sidebar refreshes after completion, groups tracks into collapsible looper folders, and shows a prominent existing-tracks notification for duplicate imports. Double-clicking a track loads and plays it automatically.
-5. The import modal lists each selected file, its current stage, elapsed time, and final added/existing/failed result. The completed result stays visible until dismissed.
+1. Dropping SWF/EXE anywhere in the window starts an import job.
+2. File → Import Files… (Cmd+O), Open SWF…, Open Projector (EXE)… and Import
+   Audio… open native pickers for their supported file types. File → Choose
+   Library Folder… opens library setup.
+3. Progress reports stages including `copying source`, `analyzing`, `extracting`, `adjusting BPM`, `adjusting loops`, and `inserting in library`, then `complete` or `failed`.
+4. Progress includes the current file and sound count when known. Partial failures retain successful tracks and report skipped sounds.
+5. The two-pane library refreshes after completion. Its left pane lists looper groups; selecting one shows its tracks on the right. Double-clicking a track loads and plays it.
+6. Shared import progress lists each selected file, its current stage, elapsed time, and final added/existing/failed result. The completed result stays visible until dismissed.
 
 ## Failure behavior
 
@@ -31,7 +34,8 @@ Import a dropped `.swf` or projector `.exe` from anywhere in the window into a p
 
 - SWF/EXE/audio remain untrusted data and are never executed.
 - Parsing and decompression stay bounded; writes remain confined to `library/` and `loopersFlash/`.
-- This does not add cancellation, background queue persistence, or migration of prior user-selected libraries.
+- Import queue state is not persisted across app restarts; existing library data
+  remains on disk when another library is selected.
 
 ## Automated verification
 

@@ -4,39 +4,49 @@
 
 Persistent catalog of loopers/tracks. SQLite stores metadata; audio stays as
 normal files under a configurable library root. Covers import flows for
-`.swf`/`.exe` (parse → atomic copy → rows) and session-persistent cue/loop.
+`.swf`/`.exe` (parse → atomic copy → rows), custom audio, and per-track cue/loop
+slots.
 
 ## User-visible behavior
 
 1. User picks a library root (or accepts default) → app creates
-   `Loopers/`, `Custom Loops/`, `olooper.db` (migrated) inside it.
-2. Import `.swf`/`.exe` → looper folder `Loopers/<name>/` with `NN_<id>.mp3`
-   files + one row per sound. Re-import of the same file adds nothing
+   `Custom Loops/` and the migrated `olooper.db` inside it.
+2. Import `.swf`/`.exe` → a looper folder `<library>/<name>/` with extracted
+   audio files and one row per sound. Re-import of the same file adds nothing
    (dedup on `(source_hash, source_sound_id)`), reported as "already imported".
-3. Track list survives restarts with no re-analysis; missing/moved files are
+3. Track list survives restarts with no re-analysis; missing or moved files are
    flagged per-track (`exists: false`), never silently dropped or duplicated.
 4. Cue/loop/BPM edits persist per track and are never overwritten by later
    imports or re-analysis.
 5. 4 loop slots (A–D) per track, stored in `loop_slots` table. Slots persist
    across sessions. Deleting a track cascades to delete its slots.
-6. The library presents each loop with its source looper, loop name, duration,
-   and BPM. Automatically analyzed BPM is normalized by octave into 65–150 BPM;
-   user-entered BPM is never changed.
+6. The left pane lists **Favoritos** first, followed by loopers; selecting one
+   shows its tracks in the right pane. Tracks show their name, duration, and BPM. Automatically
+   analyzed BPM is normalized by octave into 65–150 BPM; user-entered BPM is
+   never changed. Tracks are alphabetical by default; clicking the BPM heading
+   sorts by BPM, clicking it again reverses the order, and clicking Loop restores
+   alphabetical order. The active track's
+   looper is selected automatically and its row is highlighted in blue.
+   The looper pane divider can be dragged to resize the left column; its width
+   is saved between launches.
 7. A source-looper group can be renamed, revealed in the file manager, or
-   removed from the catalog. Removing a group removes its tracks and loop slots
-   only; extracted audio and the preserved source file remain on disk.
+   removed. Removing a group removes its catalog rows, loop slots, library audio
+   copies and cover. Original SWF/EXE/source files remain on disk.
 8. Each loop can be marked as a persistent favorite. The visible per-loop
-   trash control removes that loop from the catalog after confirmation; it does
-   not delete the derived audio or preserved source file.
+   trash control removes that loop and its library audio copy after confirmation;
+   its original input file is not touched.
+9. Each loop has a Play button beside its name; double-clicking a row also starts
+   playback.
 
 ## Supported inputs
 
-- Rows created from `020`/`025` extraction output + custom-audio imports
-  (custom-audio copy flow arrives with its own spec; the row shape is shared).
+- Rows created from SWF/EXE extraction (`020`/`025`), custom-audio imports
+  (`050`), and Tablist catalog imports (`100`).
 
 ## Outputs
 
-- `ImportReport { looper, added, already_there, sounds }` per import.
+- `ImportReport { looper, added, already_there, failed, track_ids }` for SWF/EXE
+  imports; custom audio returns per-file results.
 - `Track { id, title, file_path, exists, duration_ms, bpm?, cue/loop…,
   provenance… }` for UI and player handoff (`player_load(track.file_path)`).
 - `LoopSlot { id, track_id, slot, label, cue_ms, loop_start_ms, loop_end_ms, enabled }`
@@ -55,25 +65,26 @@ normal files under a configurable library root. Covers import flows for
 
 ## Persistence behavior
 
-- Schema versioned via `PRAGMA user_version`; migrations 0→1→2 explicit,
-  forward-only, tested on a temp DB. Downgrades unsupported (clear error).
-- v1→v2 adds `loop_slots` table with `ON DELETE CASCADE`.
-- v2→v3 adds the editable `looper_name` catalog field.
-- v3→v4 adds the persistent `favorite` flag.
+- Schema versioned through v6 via `PRAGMA user_version`; forward migrations are
+  transactional and covered by temporary-database tests. Downgrades are unsupported.
 - `updated_at` bumps on every user edit; `imported_at` never changes.
 - Foreign keys enforced via `PRAGMA foreign_keys = ON`.
 
 ## Platform considerations
 
 - rusqlite/bundled: no system SQLite required; identical on all platforms.
-- Absolute canonical paths stored; library root relocatable by re-init
-  (missing-file flags guide the user, no silent rewrites).
+- Library paths are stored with track metadata; missing files are flagged rather
+  than silently removed. Changing the library root does not migrate its contents.
 
 ## Security implications
 
 - Looper/file names sanitized (no `..`, no separators, length-capped);
   all writes confined under the library root (prefix check after canonicalize).
 - Source content hash (SHA-256) for dedup, not for trust.
+- Deletion only removes recorded `file_path` assets after verifying they are
+  inside the library. Original sources referenced by `source_path` are never
+  deleted. Audio is moved to a temporary same-library quarantine until the
+  SQLite row removal succeeds, then purged.
 
 ## Acceptance criteria
 
@@ -83,8 +94,10 @@ normal files under a configurable library root. Covers import flows for
 - [x] Cue/loop edit → restart → edit preserved.
 - [x] Temp-DB tests: migrate, CRUD, dedup conflict, atomicity (no partial rows).
 - [x] Loop slots: CRUD works, cascade delete on track removal, schema migration v1→v2.
+- [x] Two-pane library lists Favoritos first and shows the selected group's tracks.
+- [x] Play button and double-click start the selected track.
 
 ## Non-goals
 
 - Library relocation wizard, duplicate-audio detection across different
-  sources, derenaming, playlists/favorites (future columns already reserved).
+  sources, playlists.

@@ -1,17 +1,23 @@
 use serde::{Deserialize, Serialize};
+use std::sync::{Mutex, OnceLock};
 use tauri::Emitter as _;
 use tauri::Manager as _;
-use std::sync::{Mutex, OnceLock};
 
 static CANCELLED_IMPORTS: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
 
 fn import_cancelled(job_id: &str) -> bool {
-    CANCELLED_IMPORTS.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
-        .lock().map(|jobs| jobs.contains(job_id)).unwrap_or(false)
+    CANCELLED_IMPORTS
+        .get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+        .lock()
+        .map(|jobs| jobs.contains(job_id))
+        .unwrap_or(false)
 }
 
 fn import_unmark_cancelled(job_id: &str) {
-    if let Ok(mut jobs) = CANCELLED_IMPORTS.get_or_init(|| Mutex::new(std::collections::HashSet::new())).lock() {
+    if let Ok(mut jobs) = CANCELLED_IMPORTS
+        .get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+        .lock()
+    {
         jobs.remove(job_id);
     }
 }
@@ -336,6 +342,74 @@ pub fn run() {
         .manage(player::spawn())
         .manage(std::sync::Mutex::new(None::<library::Library>))
         .setup(|app| {
+            use tauri::menu::{MenuBuilder, MenuItem, SubmenuBuilder};
+
+            let open_files = MenuItem::with_id(
+                app,
+                "import-files",
+                "Import Files…",
+                true,
+                Some("CmdOrCtrl+O"),
+            )?;
+            let open_swf = MenuItem::with_id(app, "open-swf", "Open SWF…", true, None::<&str>)?;
+            let open_exe =
+                MenuItem::with_id(app, "open-exe", "Open Projector (EXE)…", true, None::<&str>)?;
+            let import_audio =
+                MenuItem::with_id(app, "import-audio", "Import Audio…", true, None::<&str>)?;
+            let choose_library = MenuItem::with_id(
+                app,
+                "choose-library",
+                "Choose Library Folder…",
+                true,
+                None::<&str>,
+            )?;
+            let file_menu = SubmenuBuilder::new(app, "File")
+                .items(&[&open_files, &open_swf, &open_exe, &import_audio])
+                .separator()
+                .item(&choose_library)
+                .separator()
+                .close_window()
+                .build()?;
+            let app_menu = SubmenuBuilder::new(app, "oLooper")
+                .about(None)
+                .separator()
+                .services()
+                .separator()
+                .hide()
+                .hide_others()
+                .show_all()
+                .separator()
+                .quit()
+                .build()?;
+            let edit_menu = SubmenuBuilder::new(app, "Edit")
+                .undo()
+                .redo()
+                .separator()
+                .cut()
+                .copy()
+                .paste()
+                .select_all()
+                .build()?;
+            let window_menu = SubmenuBuilder::new(app, "Window")
+                .minimize()
+                .maximize()
+                .separator()
+                .fullscreen()
+                .build()?;
+            let menu = MenuBuilder::new(app)
+                .items(&[&app_menu, &file_menu, &edit_menu, &window_menu])
+                .build()?;
+            app.set_menu(menu)?;
+            app.on_menu_event(|app, event| {
+                let command = event.id().as_ref();
+                if matches!(
+                    command,
+                    "import-files" | "open-swf" | "open-exe" | "import-audio" | "choose-library"
+                ) {
+                    let _ = app.emit("olooper:menu-command", command);
+                }
+            });
+
             // Background import worker: jobs are enqueued by `import_swf` and
             // processed sequentially with their own SQLite connection, so the
             // UI thread never blocks on a multi-minute import.
@@ -376,6 +450,8 @@ pub fn run() {
             library_restore,
             library_status,
             library_list,
+            library_random_track,
+            library_tablist_import_counts,
             library_update_cue_loop,
             library_update_bpm,
             library_remove,
@@ -450,7 +526,11 @@ fn player_set_loop(
 }
 
 #[tauri::command]
-fn player_set_loop_snapped(start_ms: u64, end_ms: u64, audio: Audio<'_>) -> Result<player::PlayerStatus, String> {
+fn player_set_loop_snapped(
+    start_ms: u64,
+    end_ms: u64,
+    audio: Audio<'_>,
+) -> Result<player::PlayerStatus, String> {
     audio.set_loop_snapped(start_ms, end_ms)
 }
 
@@ -630,6 +710,21 @@ fn library_list(db: Db<'_>) -> Result<Vec<library::Track>, String> {
 }
 
 #[tauri::command]
+fn library_random_track(
+    exclude_id: Option<i64>,
+    db: Db<'_>,
+) -> Result<Option<library::Track>, String> {
+    let g = self::db(&db)?;
+    require_lib(&g)?.random_track(exclude_id)
+}
+
+#[tauri::command]
+fn library_tablist_import_counts(db: Db<'_>) -> Result<Vec<library::TablistImportCount>, String> {
+    let g = self::db(&db)?;
+    require_lib(&g)?.tablist_import_counts()
+}
+
+#[tauri::command]
 fn library_update_cue_loop(
     id: i64,
     cue_ms: i64,
@@ -667,18 +762,28 @@ fn library_set_favorite(id: i64, favorite: bool, db: Db<'_>) -> Result<library::
 }
 
 #[tauri::command]
-fn library_update_metadata(id: i64, title: String, bpm: Option<f64>, tags: String, database: Db<'_>) -> Result<library::Track, String> {
-    require_lib(&db(&database)? )?.update_metadata(id, &title, bpm, &tags)
+fn library_update_metadata(
+    id: i64,
+    title: String,
+    bpm: Option<f64>,
+    tags: String,
+    database: Db<'_>,
+) -> Result<library::Track, String> {
+    require_lib(&db(&database)?)?.update_metadata(id, &title, bpm, &tags)
 }
 
 #[tauri::command]
 fn library_mark_played(id: i64, database: Db<'_>) -> Result<(), String> {
-    require_lib(&db(&database)? )?.mark_played(id)
+    require_lib(&db(&database)?)?.mark_played(id)
 }
 
 #[tauri::command]
-fn library_export_tracks(ids: Vec<i64>, destination: String, database: Db<'_>) -> Result<usize, String> {
-    require_lib(&db(&database)? )?.export_tracks(&ids, std::path::Path::new(&destination))
+fn library_export_tracks(
+    ids: Vec<i64>,
+    destination: String,
+    database: Db<'_>,
+) -> Result<usize, String> {
+    require_lib(&db(&database)?)?.export_tracks(&ids, std::path::Path::new(&destination))
 }
 
 #[tauri::command]
@@ -772,8 +877,11 @@ fn looper_name(path: &str) -> String {
 
 #[tauri::command]
 fn cancel_import(job_id: String) -> Result<(), String> {
-    CANCELLED_IMPORTS.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
-        .lock().map_err(|e| e.to_string())?.insert(job_id);
+    CANCELLED_IMPORTS
+        .get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+        .lock()
+        .map_err(|e| e.to_string())?
+        .insert(job_id);
     Ok(())
 }
 
@@ -792,6 +900,7 @@ struct ImportJob {
     root: std::path::PathBuf,
     kind: ImportKind,
     paths: Vec<String>,
+    cover_path: Option<String>,
     job_id: String,
 }
 
@@ -833,7 +942,16 @@ fn run_container_job(app: &tauri::AppHandle, job: &ImportJob, exe: bool) {
             return;
         }
     };
-    emit_import_progress(app, &job.job_id, "analyzing", 0, 0, &copied_path, false, None);
+    emit_import_progress(
+        app,
+        &job.job_id,
+        "analyzing",
+        0,
+        0,
+        &copied_path,
+        false,
+        None,
+    );
     let source_type = if exe { "exe" } else { "swf" };
     // EXE projectors embed the SWF at an offset; plain SWF parses from zero.
     let (sounds, exe_offset, exe_length) = if exe {
@@ -925,7 +1043,10 @@ fn run_container_job(app: &tauri::AppHandle, job: &ImportJob, exe: bool) {
                 &job.job_id,
                 processed,
                 sounds.sounds.len(),
-                format!("{error}: {processed}/{} sounds processed", sounds.sounds.len()),
+                format!(
+                    "{error}: {processed}/{} sounds processed",
+                    sounds.sounds.len()
+                ),
                 Some(partial),
                 None,
             );
@@ -972,10 +1093,28 @@ fn run_custom_job(app: &tauri::AppHandle, job: &ImportJob) {
             fail("import cancelled".to_string());
             return;
         }
-        emit_import_progress(app, &job.job_id, "importing audio", i, total, path, false, None);
+        emit_import_progress(
+            app,
+            &job.job_id,
+            "importing audio",
+            i,
+            total,
+            path,
+            false,
+            None,
+        );
         let rep = lib.import_one_custom(path);
         reports.push(rep);
-        emit_import_progress(app, &job.job_id, "importing audio", i + 1, total, path, false, None);
+        emit_import_progress(
+            app,
+            &job.job_id,
+            "importing audio",
+            i + 1,
+            total,
+            path,
+            false,
+            None,
+        );
     }
     let added = reports.iter().filter(|r| r.added).count();
     emit_import_done(
@@ -1025,13 +1164,12 @@ fn run_tablist_job(app: &tauri::AppHandle, job: &ImportJob) {
     };
     let group_hash = library::sha256_hex(page.path.as_bytes());
     let page_referrer = format!("https://tablist.net/{}", page.path);
-    let cover = page.cover_path.as_deref().and_then(|path| {
-        match tablist::download_cover(path, &page_referrer) {
-            Ok(bytes) => Some(bytes),
-            Err(error) => {
-                eprintln!("[oLooper] Tablist cover was not downloaded: {error}");
-                None
-            }
+    let cover_path = job.cover_path.as_deref().or(page.cover_path.as_deref());
+    let cover = cover_path.and_then(|path| match tablist::download_cover(path, &page_referrer) {
+        Ok(bytes) => Some(bytes),
+        Err(error) => {
+            eprintln!("[oLooper] Tablist cover was not downloaded: {error}");
+            None
         }
     });
     let total = page.tracks.len();
@@ -1124,6 +1262,7 @@ fn import_swf(
             root,
             kind: ImportKind::Swf,
             paths: vec![path],
+            cover_path: None,
             job_id: job_id.clone(),
         })
         .map_err(|e| format!("import worker unavailable: {e}"))?;
@@ -1148,6 +1287,7 @@ fn import_exe(
             root,
             kind: ImportKind::Exe,
             paths: vec![path],
+            cover_path: None,
             job_id: job_id.clone(),
         })
         .map_err(|e| format!("import worker unavailable: {e}"))?;
@@ -1175,6 +1315,7 @@ fn import_custom(
             root,
             kind: ImportKind::Custom,
             paths,
+            cover_path: None,
             job_id: job_id.clone(),
         })
         .map_err(|e| format!("import worker unavailable: {e}"))?;
@@ -1184,6 +1325,7 @@ fn import_custom(
 #[tauri::command]
 fn import_tablist(
     url: String,
+    cover_path: Option<String>,
     job_id: String,
     queue: tauri::State<'_, ImportQueue>,
     db: Db<'_>,
@@ -1199,6 +1341,7 @@ fn import_tablist(
             root,
             kind: ImportKind::Tablist,
             paths: vec![url],
+            cover_path,
             job_id: job_id.clone(),
         })
         .map_err(|error| format!("import worker unavailable: {error}"))?;
@@ -1209,11 +1352,15 @@ fn import_tablist(
 async fn tablist_search(
     query: String,
     offset: usize,
+    limit: Option<usize>,
     app: tauri::AppHandle,
 ) -> Result<tablist::TablistCatalogPage, String> {
-    tauri::async_runtime::spawn_blocking(move || tablist::search_loopers(&app, &query, offset))
-        .await
-        .map_err(|error| format!("Tablist search worker failed: {error}"))?
+    tauri::async_runtime::spawn_blocking(move || match limit {
+        Some(limit) => tablist::search_loopers_with_limit(&app, &query, offset, limit),
+        None => tablist::search_loopers(&app, &query, offset),
+    })
+    .await
+    .map_err(|error| format!("Tablist search worker failed: {error}"))?
 }
 
 #[cfg(test)]

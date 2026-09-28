@@ -15,8 +15,8 @@ loop export, and a reproducible macOS release workflow.
 
 ## Library workflow
 
-- Filter/sort preferences, playback speed, and pitch-lock setting persist in
-  local application settings.
+- Filter/sort preferences persist in local application settings. Playback speed
+  resets to 100% and pitch lock turns off on each loaded track.
 - Track title, manual BPM, and tags are editable. Manual BPM remains protected
   from later analysis. Recent playback is recorded locally.
 

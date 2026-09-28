@@ -107,7 +107,11 @@ fn detect_onsets(env: &[f32], total_frames: usize) -> Vec<usize> {
 
 /// Snap to the nearest zero crossing within ±radius_frames.
 /// Returns (snapped_frame, was_zero_crossing).
-fn snap_zero_crossing_with_flag(buf: &LoopBuffer, requested: usize, radius: usize) -> (usize, bool) {
+fn snap_zero_crossing_with_flag(
+    buf: &LoopBuffer,
+    requested: usize,
+    radius: usize,
+) -> (usize, bool) {
     let frames = buf.frames();
     if frames < 2 {
         return (requested.min(frames), false);
@@ -117,12 +121,7 @@ fn snap_zero_crossing_with_flag(buf: &LoopBuffer, requested: usize, radius: usiz
     let channels = buf.channels.max(1) as usize;
     let mono = |frame: usize| -> i32 {
         (0..channels)
-            .map(|ch| {
-                buf.samples
-                    .get(frame * channels + ch)
-                    .copied()
-                    .unwrap_or(0) as i32
-            })
+            .map(|ch| buf.samples.get(frame * channels + ch).copied().unwrap_or(0) as i32)
             .sum::<i32>()
             / channels as i32
     };
@@ -160,11 +159,7 @@ fn circular_discontinuity(buf: &LoopBuffer, start_frame: usize, end_frame: usize
     let first = start_frame;
     // Mono mixdown for discontinuity measurement.
     let sample = |frame: usize, ch: usize| -> f64 {
-        buf.samples
-            .get(frame * channels + ch)
-            .copied()
-            .unwrap_or(0) as f64
-            / 32768.0
+        buf.samples.get(frame * channels + ch).copied().unwrap_or(0) as f64 / 32768.0
     };
     let mut max_jump = 0.0f64;
     for ch in 0..channels {
@@ -189,13 +184,7 @@ fn local_energy(buf: &LoopBuffer, frame: usize, radius: usize) -> f64 {
     let mut count = 0usize;
     for f in lo..hi {
         let mono: f64 = (0..channels)
-            .map(|ch| {
-                buf.samples
-                    .get(f * channels + ch)
-                    .copied()
-                    .unwrap_or(0) as f64
-                    / 32768.0
-            })
+            .map(|ch| buf.samples.get(f * channels + ch).copied().unwrap_or(0) as f64 / 32768.0)
             .sum::<f64>()
             / channels as f64;
         sum += mono * mono;
@@ -406,7 +395,10 @@ pub fn suggest(buf: &LoopBuffer, bpm_override: Option<f64>) -> AutoLoopResult {
     });
     candidates.truncate(20); // Keep top 20 for display.
 
-    let winner = candidates.first().cloned().filter(|c| c.quality >= QUALITY_THRESHOLD);
+    let winner = candidates
+        .first()
+        .cloned()
+        .filter(|c| c.quality >= QUALITY_THRESHOLD);
 
     AutoLoopResult {
         candidate: winner,

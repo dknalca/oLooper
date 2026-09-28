@@ -8,18 +8,18 @@ the catalog side needed decoupling.
 
 ## Decision
 
-- One `olooper-import` thread + `mpsc` job queue (Tauri state, wired in
-  `setup()`). `import_swf` enqueues and returns `job_id` immediately.
-- The worker opens its own `Library` connection per job; the final
-  `ImportReport` travels in the `done` progress event (`report` field).
+- One `olooper-import` thread + `mpsc` job queue handles SWF, EXE, custom-audio,
+  and Tablist jobs. Import commands enqueue and return a `job_id` immediately.
+- The worker opens its own `Library` connection per job; final reports travel
+  in the `done` progress event.
 - `Library::open` sets `PRAGMA journal_mode=WAL` + `busy_timeout=5000` so the
   worker's writes don't lock out main-connection readers.
-- Jobs run sequentially; no parallel decode in step 1.
+- Jobs run sequentially in queue order. SWF/EXE audio preparation uses bounded
+  parallel batches while filesystem and database writes stay ordered (ADR 0010).
 
 ## Consequences
 
 - Playback, library browsing, and waveform stay responsive during imports.
 - Two writers (worker imports, UI metadata edits) are serialized by SQLite;
   UI writes stay single-statement.
-- `import_exe` / `import_custom` still synchronous; migrate them next using
-  the same job shape. Revert is one commit (optional `report` event field).
+- Playback, library browsing, and waveform work remain responsive during imports.

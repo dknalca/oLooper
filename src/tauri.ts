@@ -260,6 +260,10 @@ export function libraryList(): Promise<Track[]> {
   return invoke<Track[]>("library_list");
 }
 
+export function libraryRandomTrack(excludeId: number | null): Promise<Track | null> {
+  return invoke<Track | null>("library_random_track", { excludeId });
+}
+
 export function importSwf(path: string, jobId = importJobId()): Promise<string> {
   return invoke<string>("import_swf", { path, jobId });
 }
@@ -365,6 +369,19 @@ export function listenImportProgress(
   return listen<ImportProgress>("olooper:import-progress", (event) => handler(event.payload));
 }
 
+export type AppMenuCommand =
+  | "import-files"
+  | "open-swf"
+  | "open-exe"
+  | "import-audio"
+  | "choose-library";
+
+export function listenAppMenuCommand(
+  handler: (command: AppMenuCommand) => void,
+): Promise<UnlistenFn> {
+  return listen<AppMenuCommand>("olooper:menu-command", (event) => handler(event.payload));
+}
+
 export interface CustomReport {
   file: string;
   added: boolean;
@@ -392,8 +409,17 @@ export interface TablistCatalogPage {
   skippedInvalidPaths: number;
 }
 
-export function tablistSearch(query: string, offset: number): Promise<TablistCatalogPage> {
-  return invoke<TablistCatalogPage>("tablist_search", { query, offset });
+export interface TablistImportCount {
+  source_path: string;
+  tracks: number;
+}
+
+export function tablistSearch(query: string, offset: number, limit = 24): Promise<TablistCatalogPage> {
+  return invoke<TablistCatalogPage>("tablist_search", { query, offset, limit });
+}
+
+export function libraryTablistImportCounts(): Promise<TablistImportCount[]> {
+  return invoke<TablistImportCount[]>("library_tablist_import_counts");
 }
 
 export function importCustom(paths: string[], jobId = importJobId()): Promise<string> {
@@ -421,20 +447,25 @@ export async function importCustomAndWait(paths: string[], jobId = importJobId()
   throw new Error("import finished without a report");
 }
 
-export function importTablist(url: string, jobId = importJobId()): Promise<string> {
-  return invoke<string>("import_tablist", { url, jobId });
+export function importTablist(
+  url: string,
+  jobId = importJobId(),
+  coverPath: string | null = null,
+): Promise<string> {
+  return invoke<string>("import_tablist", { url, jobId, coverPath });
 }
 
 /** Import every audio loop exposed by a Tablist looper page. */
 export async function importTablistAndWait(
   url: string,
   jobId = importJobId(),
+  coverPath: string | null = null,
 ): Promise<CustomReport[]> {
   const waiter = waitForImportDone(jobId);
   await waiter.ready;
   let done: ImportProgress;
   try {
-    await importTablist(url, jobId);
+    await importTablist(url, jobId, coverPath);
     done = await waiter.done;
   } catch (error) {
     waiter.cancel();

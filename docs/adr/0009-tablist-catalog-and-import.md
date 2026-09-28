@@ -23,6 +23,8 @@ files on `files.tablist.net`. Its loops are already loop-ready AAC/M4A tracks.
   and image bytes before storing them.
 - Double-click imports every loop in the existing background worker. Preserve
   each full track as its loop region and retain published BPM when available.
+- Prefer the largest Firestore page image for cover art, falling back to the
+  catalog's indexed thumbnail when the node omits its image array.
 - Keep audio and normalized `cover.jpg` files beside each other under the
   library root. SQLite remains catalog metadata; no schema migration is needed
   for covers.
@@ -37,5 +39,5 @@ files on `files.tablist.net`. Its loops are already loop-ready AAC/M4A tracks.
   playback remains independent of Tablist after import.
 - `src-tauri/examples/tablist_download_test.rs` probes catalog resolution,
   download headers, and audio decoding without bundling the desktop app.
-- Cover files are derived local assets and remain on disk when library rows are
-  removed, matching the existing audio-retention policy.
+- Removing a track/group deletes its library-managed audio and cover files;
+  original SWF/EXE and external source files are left untouched.

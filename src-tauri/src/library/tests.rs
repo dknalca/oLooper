@@ -106,9 +106,13 @@ fn add_list_get_dedup() {
 }
 
 #[test]
-fn looper_group_rename_and_remove_keep_audio() {
+fn looper_group_rename_and_remove_delete_derived_audio_only() {
     let root = tmp_root("group-management");
     let lib = Library::open(&root).unwrap();
+    let source_dir = root.join("loopersFlash");
+    std::fs::create_dir_all(&source_dir).unwrap();
+    let source = source_dir.join("old.swf");
+    std::fs::write(&source, b"original swf source").unwrap();
     let old_dir = root.join("Old Looper");
     std::fs::create_dir_all(&old_dir).unwrap();
     let first = old_dir.join("01_1.mp3");
@@ -122,7 +126,7 @@ fn looper_group_rename_and_remove_keep_audio() {
             "Old Looper",
             &first,
             "swf",
-            "/src/old.swf",
+            source.to_str().unwrap(),
             "group-hash",
             1,
             None,
@@ -138,7 +142,7 @@ fn looper_group_rename_and_remove_keep_audio() {
         "Old Looper",
         &second,
         "swf",
-        "/src/old.swf",
+        source.to_str().unwrap(),
         "group-hash",
         2,
         None,
@@ -149,6 +153,7 @@ fn looper_group_rename_and_remove_keep_audio() {
         0,
     )
     .unwrap();
+    std::fs::write(old_dir.join("cover.jpg"), b"cover bytes").unwrap();
     lib.set_slot(first_id, 1, "A", 0, 0, 90, true).unwrap();
 
     lib.rename_looper("group-hash", "Renamed Looper").unwrap();
@@ -164,8 +169,94 @@ fn looper_group_rename_and_remove_keep_audio() {
     assert_eq!(lib.remove_looper("group-hash").unwrap(), 2);
     assert!(lib.list_tracks().unwrap().is_empty());
     assert!(lib.get_slots(first_id).unwrap().is_empty());
-    assert!(renamed_dir.join("01_1.mp3").is_file());
+    assert!(!renamed_dir.join("01_1.mp3").exists());
+    assert!(!renamed_dir.join("02_2.mp3").exists());
+    assert!(!renamed_dir.join("cover.jpg").exists());
+    assert!(source.is_file());
     std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn group_cover_is_normalized_and_served_to_the_library_view() {
+    let root = tmp_root("group-cover");
+    let lib = Library::open(&root).unwrap();
+    let group_dir = root.join("Cover Looper");
+    std::fs::create_dir_all(&group_dir).unwrap();
+    let audio = group_dir.join("01_1.mp3");
+    std::fs::write(&audio, b"derived audio").unwrap();
+    lib.add_track(
+        "01 · Cover Looper",
+        "Cover Looper",
+        &audio,
+        "swf",
+        "/source/cover.swf",
+        "cover-group-hash",
+        1,
+        None,
+        None,
+        "mp3",
+        &wav_buf(),
+        0,
+        0,
+    )
+    .unwrap();
+
+    let mut original = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut original, 85)
+        .encode(
+            &[255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 0],
+            2,
+            2,
+            image::ExtendedColorType::Rgb8,
+        )
+        .unwrap();
+    assert!(lib.save_group_cover("cover-group-hash", &original).unwrap());
+    assert!(!lib.save_group_cover("cover-group-hash", &original).unwrap());
+
+    let data_url = lib
+        .group_cover_data_url("cover-group-hash")
+        .unwrap()
+        .unwrap();
+    let encoded = data_url.strip_prefix("data:image/jpeg;base64,").unwrap();
+    use base64::Engine as _;
+    let stored = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .unwrap();
+    let decoded = image::load_from_memory(&stored).unwrap();
+    assert_eq!((decoded.width(), decoded.height()), (512, 512));
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn track_removal_refuses_to_delete_a_file_outside_the_library_root() {
+    let root = tmp_root("delete-confine-library");
+    let outside = tmp_root("delete-confine-outside");
+    let external_audio = outside.join("source.wav");
+    write_wav(&external_audio, &[0; 8000], 8000);
+    let lib = Library::open(&root).unwrap();
+    let (id, added) = lib
+        .add_track(
+            "External",
+            "External",
+            &external_audio,
+            "custom",
+            external_audio.to_str().unwrap(),
+            "external-source",
+            0,
+            None,
+            None,
+            "wav",
+            &wav_buf(),
+            0,
+            0,
+        )
+        .unwrap();
+    assert!(added);
+    assert!(lib.remove_track(id).is_err());
+    assert!(external_audio.is_file());
+    assert!(lib.get_track(id).unwrap().is_some());
+    std::fs::remove_dir_all(&root).ok();
+    std::fs::remove_dir_all(&outside).ok();
 }
 
 #[test]
@@ -207,8 +298,8 @@ fn edits_persist_across_reopen() {
     assert!(lib.update_bpm(1, 500.0, None, true).is_err());
     assert!(lib.remove_track(1).unwrap());
     assert!(lib.get_track(1).unwrap().is_none());
-    // Audio file untouched by row removal.
-    assert!(audio.is_file());
+    // Removing a library-managed custom-audio copy frees its disk space.
+    assert!(!audio.exists());
     std::fs::remove_dir_all(&root).ok();
 }
 
@@ -294,7 +385,10 @@ fn import_reports_extraction_stage_before_a_sound_failure() {
             None,
             None,
             &swf.sounds,
-            |stage, current, total| { stages.push((stage.to_string(), current, total)); Ok(()) },
+            |stage, current, total| {
+                stages.push((stage.to_string(), current, total));
+                Ok(())
+            },
         )
         .unwrap_err();
     assert_eq!(err, "no sounds could be imported");
@@ -346,6 +440,53 @@ fn import_dedups_second_run() {
         .unwrap_err();
     assert_eq!(err, "no sounds could be imported");
     assert_eq!(lib.list_tracks().unwrap().len(), 1);
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn parallel_sound_preparation_keeps_source_order_in_library() {
+    let root = tmp_root("parallel-import-order");
+    let lib = Library::open(&root).unwrap();
+    let ids = [42u16, 7, 91, 3, 55, 18];
+    let mut sounds = Vec::new();
+    for (index, id) in ids.iter().copied().enumerate() {
+        let source = root.join(format!("source-{index}.wav"));
+        write_wav(&source, &[index as i16; 800], 8000);
+        sounds.push(crate::import::swf::Sound {
+            id,
+            format: 0,
+            codec: "wav".to_string(),
+            sample_count: 800,
+            seek_samples: 0,
+            trimmed_leading: 0,
+            frames: std::fs::read(source).unwrap(),
+        });
+    }
+
+    let report = lib
+        .import_sounds(
+            "Parallel Looper",
+            "swf",
+            "/source/parallel.swf",
+            "parallel-source-hash",
+            None,
+            None,
+            &sounds,
+        )
+        .unwrap();
+    let tracks = lib.list_tracks().unwrap();
+    assert_eq!(report.added, ids.len());
+    assert_eq!(
+        report.track_ids,
+        tracks.iter().map(|track| track.id).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        tracks
+            .iter()
+            .map(|track| track.source_sound_id)
+            .collect::<Vec<_>>(),
+        ids.iter().map(|id| *id as i64).collect::<Vec<_>>()
+    );
     std::fs::remove_dir_all(&root).ok();
 }
 
@@ -465,6 +606,11 @@ fn custom_import_copies_and_dedups() {
     assert!(!reps2[0].added);
     assert_eq!(reps2[0].track_id, Some(id));
     assert_eq!(lib.list_tracks().unwrap().len(), 1);
+    let imported_copy = PathBuf::from(&t.file_path);
+    assert!(lib.remove_track(id).unwrap());
+    assert!(!imported_copy.exists());
+    assert!(src.is_file());
+    assert!(lib.list_tracks().unwrap().is_empty());
     std::fs::remove_dir_all(&root).ok();
 }
 
@@ -595,6 +741,24 @@ fn tablist_import_preserves_full_loop_bpm_and_deduplicates() {
 }
 
 #[test]
+fn random_track_skips_the_current_track_when_another_is_playable() {
+    let root = tmp_root("random-track");
+    let lib = Library::open(&root).unwrap();
+    let first_path = root.join("first.wav");
+    let second_path = root.join("second.wav");
+    write_wav(&first_path, &[0; 16000], 8000);
+    write_wav(&second_path, &[1000; 16000], 8000);
+    let first = lib.import_one_custom(first_path.to_str().unwrap());
+    let second = lib.import_one_custom(second_path.to_str().unwrap());
+    assert!(first.added && second.added);
+
+    let random = lib.random_track(first.track_id).unwrap().unwrap();
+    assert_eq!(random.id, second.track_id.unwrap());
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
 fn import_one_custom_adds_then_dedups() {
     // Per-file entry point used by the background worker: same result as
     // the batch `import_custom`, second call reports "already in library".
@@ -633,8 +797,7 @@ fn loop_buffer_to_wav_roundtrips() {
 fn trim_mp3_gapless_returns_none_when_no_trim_needed() {
     // Both zero → no trim.
     let buf = wav_buf();
-    let wav = Library::loop_buffer_to_wav(&buf);
-    let result = Library::trim_mp3_gapless(&wav, 0, 0);
+    let result = Library::trim_mp3_gapless(&buf, 0, 0);
     assert!(result.is_none());
 }
 
@@ -643,8 +806,7 @@ fn trim_mp3_gapless_trims_valid_range() {
     // Create a WAV that decodes to 800 frames, then trim to [100, 500).
     let buf = wav_buf();
     assert_eq!(buf.frames(), 800);
-    let wav = Library::loop_buffer_to_wav(&buf);
-    let (trimmed, out_wav) = Library::trim_mp3_gapless(&wav, 100, 400).unwrap();
+    let (trimmed, out_wav) = Library::trim_mp3_gapless(&buf, 100, 400).unwrap();
     assert_eq!(trimmed.frames(), 400);
     assert_eq!(trimmed.rate, buf.rate);
     assert_eq!(trimmed.channels, buf.channels);
@@ -659,20 +821,18 @@ fn trim_mp3_gapless_trims_valid_range() {
 #[test]
 fn trim_mp3_gapless_clamps_to_buffer_end() {
     let buf = wav_buf(); // 800 frames
-    let wav = Library::loop_buffer_to_wav(&buf);
-    // Request [700, 2000) → clamped to [700, 800).
-    let (trimmed, _) = Library::trim_mp3_gapless(&wav, 700, 1300).unwrap();
+                         // Request [700, 2000) → clamped to [700, 800).
+    let (trimmed, _) = Library::trim_mp3_gapless(&buf, 700, 1300).unwrap();
     assert_eq!(trimmed.frames(), 100);
 }
 
 #[test]
 fn trim_mp3_gapless_rejects_out_of_range() {
     let buf = wav_buf(); // 800 frames
-    let wav = Library::loop_buffer_to_wav(&buf);
-    // start >= total_frames → None.
-    assert!(Library::trim_mp3_gapless(&wav, 800, 100).is_none());
+                         // start >= total_frames → None.
+    assert!(Library::trim_mp3_gapless(&buf, 800, 100).is_none());
     // seek_samples=500, sample_count=0 → valid: trim leading 500, keep rest.
-    let (trimmed, _) = Library::trim_mp3_gapless(&wav, 500, 0).unwrap();
+    let (trimmed, _) = Library::trim_mp3_gapless(&buf, 500, 0).unwrap();
     assert_eq!(trimmed.frames(), 300);
 }
 
@@ -692,7 +852,6 @@ fn open_enables_wal_mode() {
 
 #[test]
 fn second_connection_reads_while_first_writes() {
-
     // Mirrors the worker pattern: one handle imports, another lists.
     // With WAL + busy_timeout neither side may see "database is locked".
     let root = tmp_root("two-conn");

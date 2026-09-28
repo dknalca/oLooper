@@ -5,7 +5,7 @@
 //! are capped by the header-declared length.
 
 use std::fmt;
-use std::io::Read as _;
+use std::io::{Cursor, Read as _};
 
 /// Hard cap for any SWF-declared length (256 MiB). Above this we reject
 /// instead of allocating on a file-controlled size.
@@ -432,7 +432,7 @@ pub fn parse(data: &[u8]) -> Result<SwfSounds, SwfError> {
     let mut sounds = Vec::new();
     let mut skipped = Vec::new();
     let mut jpeg_tables: Option<Vec<u8>> = None;
-    let mut cover_image: Option<Vec<u8>> = None;
+    let mut cover_candidates: Vec<Vec<u8>> = Vec::new();
     let mut stream: Option<StreamSound> = None;
     let mut next_stream_id = 0x8000u16;
     let mut ended = false;
@@ -458,12 +458,9 @@ pub fn parse(data: &[u8]) -> Result<SwfSounds, SwfError> {
             jpeg_tables = Some(tag.to_vec());
         }
         if let Some(image) = jpeg_from_tag(code, tag, jpeg_tables.as_deref()) {
-            if cover_image
-                .as_ref()
-                .is_none_or(|existing| image.len() > existing.len())
-            {
-                cover_image = Some(image);
-            }
+            cover_candidates.push(image);
+            cover_candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.len()));
+            cover_candidates.truncate(MAX_COVER_CANDIDATES);
         }
         match code {
             TAG_DEFINE_SOUND => match parse_define_sound(tag) {
@@ -518,6 +515,12 @@ pub fn parse(data: &[u8]) -> Result<SwfSounds, SwfError> {
     if let Some(stream) = stream {
         finish_stream(stream, &mut sounds, &mut skipped);
     }
+    // Keep a bounded set of the largest candidates, then select the largest
+    // one that can actually be decoded. A marker-valid but truncated JPEG must
+    // not hide a smaller usable cover later in the movie.
+    let cover_image = cover_candidates
+        .into_iter()
+        .find(|candidate| decodable_cover(candidate));
 
     Ok(SwfSounds {
         version,
@@ -528,6 +531,19 @@ pub fn parse(data: &[u8]) -> Result<SwfSounds, SwfError> {
 }
 
 const MAX_COVER_IMAGE_BYTES: usize = 10 * 1024 * 1024;
+const MAX_COVER_CANDIDATES: usize = 8;
+
+fn decodable_cover(bytes: &[u8]) -> bool {
+    let Ok(mut reader) = image::ImageReader::new(Cursor::new(bytes)).with_guessed_format() else {
+        return false;
+    };
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(8192);
+    limits.max_image_height = Some(8192);
+    limits.max_alloc = Some(128 * 1024 * 1024);
+    reader.limits(limits);
+    reader.decode().is_ok()
+}
 
 fn jpeg_from_tag(code: u16, tag: &[u8], jpeg_tables: Option<&[u8]>) -> Option<Vec<u8>> {
     let image_data = match code {
@@ -566,10 +582,23 @@ fn jpeg_from_tag(code: u16, tag: &[u8], jpeg_tables: Option<&[u8]>) -> Option<Ve
 }
 
 fn valid_jpeg(image: Vec<u8>) -> Option<Vec<u8>> {
-    (image.len() <= MAX_COVER_IMAGE_BYTES
-        && image.starts_with(&[0xff, 0xd8])
-        && image.ends_with(&[0xff, 0xd9]))
-    .then_some(image)
+    if image.len() > MAX_COVER_IMAGE_BYTES {
+        return None;
+    }
+    // Some SWF JPEG2 tags concatenate the shared JPEG tables (SOI…EOI) and the
+    // image (SOI…EOI). Merge both streams into one JPEG: retain the tables and
+    // image markers, but remove the intermediate EOI/SOI pair.
+    let image = image
+        .windows(4)
+        .rposition(|window| window == [0xff, 0xd9, 0xff, 0xd8])
+        .map(|offset| {
+            let mut merged = Vec::with_capacity(image.len() - 4);
+            merged.extend_from_slice(&image[..offset]);
+            merged.extend_from_slice(&image[offset + 4..]);
+            merged
+        })
+        .unwrap_or(image);
+    (image.starts_with(&[0xff, 0xd8]) && image.ends_with(&[0xff, 0xd9])).then_some(image)
 }
 
 #[cfg(test)]

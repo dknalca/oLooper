@@ -24,4 +24,3 @@ Make existing playback, import, library selection, and CWS extraction reliable w
 
 - SWF, EXE, and audio remain untrusted data; decompression and file reads stay bounded.
 - Do not execute imported files or Flash content.
-- This does not add background imports, a waveform disk cache, or a pro-audio engine.

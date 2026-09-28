@@ -6,23 +6,28 @@ A desktop app for DJs and turntablists to extract and practice with audio loops 
 
 - **SWF extraction** — drop a `.swf`, get all embedded MP3 and ADPCM loops as practice tracks
 - **EXE projector extraction** — drop a projector `.exe`, locate the embedded SWF, same pipeline
+- **Faster SWF/EXE imports** — decode and analyze up to four extracted tracks in parallel
 - **Cover art** — extract embedded JPEG artwork from SWF/EXE or use Tablist looper artwork
-- **Custom audio import** — WAV/MP3 drop or browse, instantly playable
-- **Tablist online catalog** — browse/search public loopers, then double-click to download all tracks
+- **Custom audio import** — drop or browse supported audio files, instantly playable
+- **Tablist online catalog** — browse/search public loopers, import all tracks, or download a random looper
 - **Persistent library** — SQLite catalog (schema v6) survives restarts, deduplicates on import
-- **Practice player** — play/pause/stop, gapless region looping, volume, seek
-- **Speed control** — 50–200% playback speed in 5% steps, with optional pitch lock (WSOLA time-stretching)
+- **Practice player** — play/pause/stop, previous/next loop, gapless looping, volume, seek
+- **Practice timer** — hours/minutes/seconds counted during playback, with reset
+- **Timed random practice** — play a random local-library loop every 2 min, 5 min, or custom interval
+- **Speed control** — 50–200% playback speed in 5% steps; each new track starts at 100%
 - **BPM detection** — automatic energy-flux onset analysis, normalized to 65–150 BPM; manual BPM overrides are preserved
-- **Waveform display** — scrolling DJ-style waveform with loop overlay, click-to-seek, and persistent disk cache
-- **4 cue/loop slots** — A-D slots per track, persisted to SQLite, auto-load on select
-- **Favorites** — mark loops as favorites for quick access
-- **Keyboard shortcuts** — Space, S, arrows, L, [, ], +, -, Cmd+O for hands-free practice
-- **Library management** — search, filter (source/BPM/duration), sort, favorites-only, context menus (reveal in Finder, edit metadata, remove)
-- **Looper groups** — rename source folders, remove groups (preserves audio on disk)
-- **Import modal** — staged progress UI with per-file status, elapsed time, and cancel support
+- **Waveform display** — current loop name, scrolling waveform, loop overlay, click-to-seek, and persistent disk cache
+- **4 cue slots** — labeled CUE 1–4, persisted to SQLite, auto-load on select
+- **Two-pane library** — select a looper or **Favoritos** on the left and browse its loops on the right
+- **Favorites** — mark loops for the cross-library Favoritos view
+- **Keyboard shortcuts** — Space, S, arrows, L, +, -, Cmd+O for hands-free practice
+- **Library management** — search and filter loops; alphabetical order by default, clickable BPM sort, export, and context menus
+- **Looper groups** — rename folders; removing a track/group deletes its library audio copy and cover while preserving original source files
+- **Import progress** — per-file stage, elapsed time, and cancellation
 - **Native file dialogs** — OS-native file pickers for import and library setup
-- **Dark UI** — Tailwind CSS v4, sidebar layout, context menus, track stats
-- **Custom icon** — waveform loop "O" design with large "O" background in Dock and Finder
+- **Native app menus** — File import and library actions, standard Edit commands, and macOS window controls
+- **Dark UI** — Tailwind CSS v4, two-pane library, context menus, track stats
+- **App icon** — shared by the app bundle and in-app header
 - **macOS release** — build script produces `.app`; optional DMG packaging via `package-dmg.sh`
 
 ## Requirements
@@ -55,11 +60,14 @@ The built `.app` bundle will be at `./oLooper.app` in the project root.
 
 ```bash
 # Rust unit tests (parser, player, library, waveform, analysis)
-cd src-tauri && cargo test
+cargo test --manifest-path src-tauri/Cargo.toml
 
-# Probe Tablist downloads without building the desktop app (from src-tauri/)
-cargo run --example tablist_download_test
-# Files are saved to ../.dev/tablist-downloads/
+# Inspect SWF/EXE extraction and optionally dump audio + cover files
+cargo run --manifest-path src-tauri/Cargo.toml --example inventory -- --dump /path/to/output path/to/looper.swf
+
+# Probe Tablist downloads without building the desktop app
+cargo run --manifest-path src-tauri/Cargo.toml --example tablist_download_test -- <Tablist URL...>
+# Files are saved to .dev/tablist-downloads/
 
 # Frontend tests (Vitest)
 pnpm test
@@ -78,8 +86,6 @@ Real SWF/EXE fixtures in `loopersFlash/` (gitignored) are used for manual valida
 | `S` | Stop (return to loop start) |
 | `←` `→` | Seek ±5 seconds |
 | `L` | Toggle loop on/off |
-| `[` | Set loop start = current position |
-| `]` | Set loop end = current position |
 | `+` `-` | Change playback speed (5% steps, 50–200%) |
 | `Cmd+O` | Open file picker for import |
 
@@ -89,7 +95,7 @@ Shortcuts are disabled while typing in text fields.
 
 ```
 src/                     Frontend (React + TypeScript + Tailwind)
-├── App.tsx              Root layout (sidebar + main area)
+├── App.tsx              Root layout (player, library, Tablist catalog)
 ├── main.tsx             Entry point (CSS import)
 ├── index.css            Tailwind + design tokens
 ├── tauri.ts             Typed Tauri command bridge + dialog wrappers
@@ -97,11 +103,11 @@ src/                     Frontend (React + TypeScript + Tailwind)
 ├── hooks/               React hooks
 │   └── useKeyboardShortcuts.ts
 └── components/          UI components
-    ├── TopBar.tsx       Header with version + library init + folder picker
-    ├── Sidebar.tsx      Local track list with search/filter/sort + context menus
-    ├── TablistCatalog.tsx Online looper search, pagination + double-click import
-    ├── Player.tsx       Transport + scrub + loop + speed + A-D slot selector
-    ├── Waveform.tsx     Canvas waveform with playhead + loop overlay
+    ├── TopBar.tsx       Header with version + practice timer + library setup
+    ├── Sidebar.tsx      Two-pane local library: loopers, favorites, tracks
+    ├── TablistCatalog.tsx Online looper search, pagination + import
+    ├── Player.tsx       Transport + previous/next + speed + CUE 1–4
+    ├── Waveform.tsx     Track title + canvas waveform + playhead/loop overlay
     ├── ImportBar.tsx    File import with browse buttons + drag-drop + inline progress
     └── Logo.tsx         Waveform loop "O" logo component
 
@@ -137,7 +143,7 @@ specs/                   Feature specifications
 └── 100-tablist-import.md
 
 docs/                    Documentation
-├── adr/                 Architecture decision records (0001–0009)
+├── adr/                 Architecture decision records (0001–0010)
 └── macos-release.md     macOS signing and notarization guide
 ```
 

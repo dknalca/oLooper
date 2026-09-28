@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   getAppStatus,
   libraryDefaultRoot,
@@ -11,14 +11,50 @@ import Logo from "./Logo";
 
 interface Props {
   onLibraryReady: (root: string) => void;
+  playing: boolean;
 }
 
-export default function TopBar({ onLibraryReady }: Props) {
+export default function TopBar({ onLibraryReady, playing }: Props) {
   const [status, setStatus] = useState<AppStatus | null>(null);
   const [root, setRoot] = useState("");
   const [setupOpen, setSetupOpen] = useState(false);
   const [initializing, setInitializing] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [practiceSeconds, setPracticeSeconds] = useState(0);
+  const accumulatedMs = useRef(0);
+  const segmentStartedAt = useRef<number | null>(null);
+
+  useEffect(() => {
+    if (!playing) {
+      if (segmentStartedAt.current !== null) {
+        accumulatedMs.current += Date.now() - segmentStartedAt.current;
+        segmentStartedAt.current = null;
+        setPracticeSeconds(Math.floor(accumulatedMs.current / 1000));
+      }
+      return;
+    }
+    segmentStartedAt.current = Date.now();
+    const timer = window.setInterval(() => {
+      const currentSegment = segmentStartedAt.current === null
+        ? 0
+        : Date.now() - segmentStartedAt.current;
+      setPracticeSeconds(Math.floor((accumulatedMs.current + currentSegment) / 1000));
+    }, 250);
+    return () => {
+      window.clearInterval(timer);
+      if (segmentStartedAt.current !== null) {
+        accumulatedMs.current += Date.now() - segmentStartedAt.current;
+        segmentStartedAt.current = null;
+        setPracticeSeconds(Math.floor(accumulatedMs.current / 1000));
+      }
+    };
+  }, [playing]);
+
+  const resetPracticeTimer = () => {
+    accumulatedMs.current = 0;
+    segmentStartedAt.current = playing ? Date.now() : null;
+    setPracticeSeconds(0);
+  };
 
   useEffect(() => {
     let cancelled = false;
@@ -33,6 +69,12 @@ export default function TopBar({ onLibraryReady }: Props) {
       .catch((e) => !cancelled && setError(`Could not prepare library: ${String(e)}`));
     return () => { cancelled = true; };
   }, [onLibraryReady]);
+
+  useEffect(() => {
+    const openSetup = () => setSetupOpen(true);
+    window.addEventListener("olooper:choose-library", openSetup);
+    return () => window.removeEventListener("olooper:choose-library", openSetup);
+  }, []);
 
   const browseRoot = async () => {
     const selected = await pickDirectory();
@@ -73,6 +115,22 @@ export default function TopBar({ onLibraryReady }: Props) {
           </>
         )}
         {root && <span className="ml-auto truncate max-w-64 text-[10px] text-text-secondary" title={root}>{root}</span>}
+        <div className="flex shrink-0 items-center gap-1.5 rounded bg-elevated px-2 py-1" title="Practice time while audio is playing">
+          <span className="text-[9px] uppercase tracking-wide text-text-secondary">Practice</span>
+          <span className="font-mono text-[11px] tabular-nums text-text" aria-live="off">
+            {String(Math.floor(practiceSeconds / 3600)).padStart(2, "0")}:
+            {String(Math.floor((practiceSeconds % 3600) / 60)).padStart(2, "0")}:
+            {String(practiceSeconds % 60).padStart(2, "0")}
+          </span>
+          <button
+            onClick={resetPracticeTimer}
+            title="Reset practice timer"
+            aria-label="Reset practice timer"
+            className="rounded px-1 text-xs text-text-secondary hover:bg-border hover:text-text"
+          >
+            ↺
+          </button>
+        </div>
         {error && <span className="text-xs text-danger" role="alert">{error}</span>}
       </header>
 

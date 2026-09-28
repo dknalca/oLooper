@@ -4,10 +4,10 @@
 //! [`PlayerStatus`]. Hardware (`OutputStream`) is created lazily so unit
 //! tests run headless; all loop math is hardware-free.
 
+use std::collections::VecDeque;
 use std::io::Cursor;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::collections::VecDeque;
 
 use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink, Source as _};
 use serde::{Deserialize, Serialize};
@@ -45,7 +45,9 @@ impl LoopBuffer {
         }
     }
 
-    fn memory_bytes(&self) -> usize { self.samples.len() * std::mem::size_of::<i16>() }
+    fn memory_bytes(&self) -> usize {
+        self.samples.len() * std::mem::size_of::<i16>()
+    }
 }
 
 /// How a loop was created.
@@ -297,11 +299,7 @@ type LoadedSnapshot = Option<(String, u64, Arc<LoopBuffer>)>;
 /// A waveform job is current only if the live snapshot still matches the
 /// (path, generation) it started from. Same path but newer generation
 /// (reloaded track) also discards: the newer job owns that path now.
-fn waveform_snapshot_current(
-    loaded: &LoadedSnapshot,
-    path: &str,
-    generation: u64,
-) -> bool {
+fn waveform_snapshot_current(loaded: &LoadedSnapshot, path: &str, generation: u64) -> bool {
     loaded
         .as_ref()
         .is_some_and(|(p, g, _)| p == path && *g == generation)
@@ -319,11 +317,7 @@ fn pitch_job_current(track: &Loaded, track_generation: u64, job: u64, speed: f32
 }
 
 /// A load completion applies only if it is still the latest request.
-fn load_ready_current(
-    pending: &Option<PendingLoad>,
-    generation: u64,
-    path: &str,
-) -> bool {
+fn load_ready_current(pending: &Option<PendingLoad>, generation: u64, path: &str) -> bool {
     pending
         .as_ref()
         .is_some_and(|p| p.generation == generation && p.path == path)
@@ -383,19 +377,38 @@ impl Player {
 /// has high discontinuity.
 fn snap_zero_crossing(buf: &LoopBuffer, requested: usize) -> usize {
     let frames = buf.frames();
-    if frames < 2 { return requested.min(frames); }
+    if frames < 2 {
+        return requested.min(frames);
+    }
     let radius = (buf.rate as usize / 100).max(1);
     let lo = requested.saturating_sub(radius).min(frames - 1);
     let hi = requested.saturating_add(radius).min(frames - 1);
     let channels = buf.channels.max(1) as usize;
-    let mono = |frame: usize| (0..channels).map(|channel| buf.samples.get(frame * channels + channel).copied().unwrap_or(0) as i32).sum::<i32>() / channels as i32;
+    let mono = |frame: usize| {
+        (0..channels)
+            .map(|channel| {
+                buf.samples
+                    .get(frame * channels + channel)
+                    .copied()
+                    .unwrap_or(0) as i32
+            })
+            .sum::<i32>()
+            / channels as i32
+    };
     // For stereo, compute per-channel discontinuity at a candidate.
     let channel_discontinuity = |frame: usize| {
-        (0..channels).map(|ch| {
-            let a = buf.samples.get(frame * channels + ch).copied().unwrap_or(0) as i32;
-            let b = buf.samples.get((frame + 1) * channels + ch).copied().unwrap_or(0) as i32;
-            (a - b).unsigned_abs()
-        }).max().unwrap_or(0)
+        (0..channels)
+            .map(|ch| {
+                let a = buf.samples.get(frame * channels + ch).copied().unwrap_or(0) as i32;
+                let b = buf
+                    .samples
+                    .get((frame + 1) * channels + ch)
+                    .copied()
+                    .unwrap_or(0) as i32;
+                (a - b).unsigned_abs()
+            })
+            .max()
+            .unwrap_or(0)
     };
     let mut best: Option<(usize, u32, u32)> = None; // (frame, distance, discontinuity)
     for frame in lo..hi {
@@ -411,16 +424,25 @@ fn snap_zero_crossing(buf: &LoopBuffer, requested: usize) -> usize {
     }
     best.map(|(frame, _, _)| frame).unwrap_or_else(|| {
         // Fallback: frame of minimum local amplitude on mono.
-        (lo..=hi).min_by_key(|frame| mono(*frame).unsigned_abs()).unwrap_or(requested.min(frames))
+        (lo..=hi)
+            .min_by_key(|frame| mono(*frame).unsigned_abs())
+            .unwrap_or(requested.min(frames))
     })
 }
 
 fn stretch_buffer(buffer: &LoopBuffer, tempo: f32) -> Result<LoopBuffer, String> {
-    let samples: Vec<f32> = buffer.samples.iter().map(|sample| *sample as f32 / 32768.0).collect();
+    let samples: Vec<f32> = buffer
+        .samples
+        .iter()
+        .map(|sample| *sample as f32 / 32768.0)
+        .collect();
     let stretched = wsola::stretch(&samples, buffer.rate, buffer.channels, tempo)
         .map_err(|error| format!("cannot preserve pitch: {error}"))?;
     Ok(LoopBuffer {
-        samples: stretched.into_iter().map(|sample| (sample.clamp(-1.0, 1.0) * 32767.0) as i16).collect(),
+        samples: stretched
+            .into_iter()
+            .map(|sample| (sample.clamp(-1.0, 1.0) * 32767.0) as i16)
+            .collect(),
         channels: buffer.channels,
         rate: buffer.rate,
     })
@@ -432,9 +454,10 @@ fn stretch_buffer(buffer: &LoopBuffer, tempo: f32) -> Result<LoopBuffer, String>
 fn stretch_job(buffer: &LoopBuffer, tempo: f32) -> Result<LoopBuffer, String> {
     let started = std::time::Instant::now();
     let frames_in = buffer.frames();
-    let result =
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| stretch_buffer(buffer, tempo)))
-            .map_err(|_| "pitch processing failed".to_string())?;
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        stretch_buffer(buffer, tempo)
+    }))
+    .map_err(|_| "pitch processing failed".to_string())?;
     match &result {
         Ok(stretched) => eprintln!(
             "[olooper:metrics] op=stretch result=ok stretch_ms={} speed_pct={} frames_in={} frames_out={} rate={} ch={}",
@@ -457,7 +480,7 @@ fn stretch_job(buffer: &LoopBuffer, tempo: f32) -> Result<LoopBuffer, String> {
 
 /// Worker entry point: decode with panics converted to job errors.
 fn decode_job(data: Vec<u8>) -> Result<LoopBuffer, String> {
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| decode_owned(data)))
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| decode_bytes(&data)))
         .map_err(|_| "cannot decode audio: decoder failed".to_string())?
 }
 
@@ -692,7 +715,14 @@ impl Player {
             t.resume_frame = t.start_frame;
             let volume = t.volume;
             let speed = if t.pitch_lock { 1.0 } else { t.speed };
-            let src = LoopRegion::new(t.buf.clone(), t.start_frame, t.start_frame, t.end_frame, t.enabled, t.cursor.clone());
+            let src = LoopRegion::new(
+                t.buf.clone(),
+                t.start_frame,
+                t.start_frame,
+                t.end_frame,
+                t.enabled,
+                t.cursor.clone(),
+            );
             let sink = self.fresh_sink(volume, speed)?;
             sink.append(src);
             sink.play();
@@ -705,7 +735,11 @@ impl Player {
     }
 
     /// Set loop directly with frame-precise values (no ms conversion).
-    pub fn set_loop_frames(&mut self, start_frame: usize, end_frame: usize) -> Result<PlayerStatus, String> {
+    pub fn set_loop_frames(
+        &mut self,
+        start_frame: usize,
+        end_frame: usize,
+    ) -> Result<PlayerStatus, String> {
         let t = self.track.as_mut().ok_or("nothing loaded")?;
         let total = t.buf.frames();
         if start_frame >= end_frame || end_frame > total {
@@ -722,7 +756,14 @@ impl Player {
             t.resume_frame = t.start_frame;
             let volume = t.volume;
             let speed = if t.pitch_lock { 1.0 } else { t.speed };
-            let src = LoopRegion::new(t.buf.clone(), t.start_frame, t.start_frame, t.end_frame, t.enabled, t.cursor.clone());
+            let src = LoopRegion::new(
+                t.buf.clone(),
+                t.start_frame,
+                t.start_frame,
+                t.end_frame,
+                t.enabled,
+                t.cursor.clone(),
+            );
             let sink = self.fresh_sink(volume, speed)?;
             sink.append(src);
             sink.play();
@@ -741,7 +782,9 @@ impl Player {
         let end = ms_to_frames(end_ms, track.buf.rate).clamp(1, total.max(1));
         let start = snap_zero_crossing(&track.buf, start);
         let end = snap_zero_crossing(&track.buf, end);
-        if start >= end { return Err("snapped loop start must be before end".to_string()); }
+        if start >= end {
+            return Err("snapped loop start must be before end".to_string());
+        }
         let _ = track;
         self.set_loop_frames(start, end)
     }
@@ -763,7 +806,14 @@ impl Player {
             let cursor = t.cursor.load(Ordering::Relaxed);
             t.resume_frame = cursor;
             (
-                LoopRegion::new(t.buf.clone(), cursor, t.start_frame, t.end_frame, enabled, t.cursor.clone()),
+                LoopRegion::new(
+                    t.buf.clone(),
+                    cursor,
+                    t.start_frame,
+                    t.end_frame,
+                    enabled,
+                    t.cursor.clone(),
+                ),
                 t.volume,
                 if t.pitch_lock { 1.0 } else { t.speed },
             )
@@ -791,7 +841,14 @@ impl Player {
             let volume = t.volume;
             let enabled = t.enabled;
             let speed = if t.pitch_lock { 1.0 } else { t.speed };
-            let src = LoopRegion::new(t.buf.clone(), from, t.start_frame, t.end_frame, enabled, t.cursor.clone());
+            let src = LoopRegion::new(
+                t.buf.clone(),
+                from,
+                t.start_frame,
+                t.end_frame,
+                enabled,
+                t.cursor.clone(),
+            );
             let sink = self.fresh_sink(volume, speed)?;
             sink.append(src);
             sink.play();
@@ -946,8 +1003,14 @@ pub(crate) enum EngineCmd {
         volume_pct: f32,
         reply: Reply,
     },
-    SetSpeed { speed_pct: f32, reply: Reply },
-    SetPitchLock { enabled: bool, reply: Reply },
+    SetSpeed {
+        speed_pct: f32,
+        reply: Reply,
+    },
+    SetPitchLock {
+        enabled: bool,
+        reply: Reply,
+    },
     /// Posted by the WSOLA worker. Applied only if track, speed, lock
     /// state, and job id still match.
     PitchReady {
@@ -961,7 +1024,11 @@ pub(crate) enum EngineCmd {
         end_ms: u64,
         reply: Reply,
     },
-    SetLoopSnapped { start_ms: u64, end_ms: u64, reply: Reply },
+    SetLoopSnapped {
+        start_ms: u64,
+        end_ms: u64,
+        reply: Reply,
+    },
     SetLoopEnabled {
         enabled: bool,
         reply: Reply,
@@ -1064,8 +1131,15 @@ impl Engine {
                 } => {
                     let _ = reply.send(self.ensure().and_then(|p| p.set_loop(start_ms, end_ms)));
                 }
-                EngineCmd::SetLoopSnapped { start_ms, end_ms, reply } => {
-                    let _ = reply.send(self.ensure().and_then(|p| p.set_loop_snapped(start_ms, end_ms)));
+                EngineCmd::SetLoopSnapped {
+                    start_ms,
+                    end_ms,
+                    reply,
+                } => {
+                    let _ = reply.send(
+                        self.ensure()
+                            .and_then(|p| p.set_loop_snapped(start_ms, end_ms)),
+                    );
                 }
                 EngineCmd::SetLoopEnabled { enabled, reply } => {
                     let _ = reply.send(self.ensure().and_then(|p| p.set_loop_enabled(enabled)));
@@ -1073,7 +1147,11 @@ impl Engine {
                 EngineCmd::Seek { position_ms, reply } => {
                     let _ = reply.send(self.ensure().and_then(|p| p.seek(position_ms)));
                 }
-                EngineCmd::SetDiagnostics { loop_origin, loop_quality, reply } => {
+                EngineCmd::SetDiagnostics {
+                    loop_origin,
+                    loop_quality,
+                    reply,
+                } => {
                     if let Some(p) = self.player.as_mut() {
                         if let Some(t) = p.track.as_mut() {
                             t.loop_origin = loop_origin;
@@ -1094,9 +1172,18 @@ impl Engine {
     fn cmd_load(&mut self, path: String) -> Result<PlayerStatus, String> {
         self.generation += 1;
         let generation = self.generation;
-        if let Some(index) = self.decoded_cache.iter().position(|(cached, _)| cached == &path) {
-            let (_, buffer) = self.decoded_cache.remove(index).expect("cache index exists");
-            self.decoded_cache_bytes = self.decoded_cache_bytes.saturating_sub(buffer.memory_bytes());
+        if let Some(index) = self
+            .decoded_cache
+            .iter()
+            .position(|(cached, _)| cached == &path)
+        {
+            let (_, buffer) = self
+                .decoded_cache
+                .remove(index)
+                .expect("cache index exists");
+            self.decoded_cache_bytes = self
+                .decoded_cache_bytes
+                .saturating_sub(buffer.memory_bytes());
             self.apply_loaded(path, generation, buffer);
             return Ok(self.status());
         }
@@ -1113,7 +1200,9 @@ impl Engine {
     }
 
     fn start_pending_decode(&mut self) {
-        let Some(pending) = self.pending_load.clone() else { return; };
+        let Some(pending) = self.pending_load.clone() else {
+            return;
+        };
         self.decode_running = true;
         let tx = self.tx.clone();
         if std::thread::Builder::new()
@@ -1216,13 +1305,24 @@ impl Engine {
 
     fn cache_decoded(&mut self, path: String, buffer: Arc<LoopBuffer>) {
         self.decoded_cache.retain(|(cached, _)| cached != &path);
-        self.decoded_cache_bytes = self.decoded_cache.iter().map(|(_, cached)| cached.memory_bytes()).sum();
+        self.decoded_cache_bytes = self
+            .decoded_cache
+            .iter()
+            .map(|(_, cached)| cached.memory_bytes())
+            .sum();
         let bytes = buffer.memory_bytes();
-        if bytes > DECODE_CACHE_MAX_BYTES { return; }
+        if bytes > DECODE_CACHE_MAX_BYTES {
+            return;
+        }
         while self.decoded_cache.len() >= DECODE_CACHE_MAX_TRACKS
-            || self.decoded_cache_bytes.saturating_add(bytes) > DECODE_CACHE_MAX_BYTES {
-            let Some((_, evicted)) = self.decoded_cache.pop_front() else { break; };
-            self.decoded_cache_bytes = self.decoded_cache_bytes.saturating_sub(evicted.memory_bytes());
+            || self.decoded_cache_bytes.saturating_add(bytes) > DECODE_CACHE_MAX_BYTES
+        {
+            let Some((_, evicted)) = self.decoded_cache.pop_front() else {
+                break;
+            };
+            self.decoded_cache_bytes = self
+                .decoded_cache_bytes
+                .saturating_sub(evicted.memory_bytes());
         }
         self.decoded_cache_bytes += bytes;
         self.decoded_cache.push_back((path, buffer));
@@ -1265,25 +1365,33 @@ impl Engine {
                 // Loop points live in the active buffer timeline. WSOLA can
                 // change its frame count, so transfer them proportionally.
                 let new_start = remap_frame(t.start_frame, old_frames, new_frames);
-                let new_end = remap_frame(t.end_frame, old_frames, new_frames).max(1).min(new_frames);
+                let new_end = remap_frame(t.end_frame, old_frames, new_frames)
+                    .max(1)
+                    .min(new_frames);
                 // Keep the listening position across the buffer swap.
                 let resume_frame = remap_frame(t.resume_frame, old_frames, new_frames);
                 let from = remap_frame(t.cursor.load(Ordering::Relaxed), old_frames, new_frames);
-                let (cursor, volume, enabled) = (
-                    t.cursor.clone(),
-                    t.volume,
-                    t.enabled,
-                );
+                let (cursor, volume, enabled) = (t.cursor.clone(), t.volume, t.enabled);
                 let was_playing = p
                     .sink
                     .as_ref()
                     .is_some_and(|s| !s.is_paused() && !s.empty());
                 if was_playing {
                     // Restart on the stretched buffer at locked (1.0x) rate.
-                    let src = LoopRegion::new(new_buf.clone(), from, new_start, new_end, enabled, cursor);
+                    let src =
+                        LoopRegion::new(new_buf.clone(), from, new_start, new_end, enabled, cursor);
                     let sink = match Sink::try_new(&p.handle) {
-                        Ok(sink) => { sink.set_volume(volume); sink.set_speed(1.0); sink.pause(); sink },
-                        Err(error) => { t.pitch_pending = false; t.pitch_error = Some(error.to_string()); return; }
+                        Ok(sink) => {
+                            sink.set_volume(volume);
+                            sink.set_speed(1.0);
+                            sink.pause();
+                            sink
+                        }
+                        Err(error) => {
+                            t.pitch_pending = false;
+                            t.pitch_error = Some(error.to_string());
+                            return;
+                        }
                     };
                     sink.append(src);
                     sink.play();
@@ -1379,7 +1487,11 @@ impl EngineClient {
     }
 
     pub fn set_loop_snapped(&self, start_ms: u64, end_ms: u64) -> Result<PlayerStatus, String> {
-        self.call(|reply| EngineCmd::SetLoopSnapped { start_ms, end_ms, reply })
+        self.call(|reply| EngineCmd::SetLoopSnapped {
+            start_ms,
+            end_ms,
+            reply,
+        })
     }
 
     pub fn set_loop_enabled(&self, enabled: bool) -> Result<PlayerStatus, String> {
@@ -1395,7 +1507,11 @@ impl EngineClient {
         loop_origin: String,
         loop_quality: f64,
     ) -> Result<PlayerStatus, String> {
-        self.call(|reply| EngineCmd::SetDiagnostics { loop_origin, loop_quality, reply })
+        self.call(|reply| EngineCmd::SetDiagnostics {
+            loop_origin,
+            loop_quality,
+            reply,
+        })
     }
 
     pub fn status(&self) -> Result<PlayerStatus, String> {
@@ -1415,14 +1531,20 @@ impl EngineClient {
             return Err("track has no frames".to_string());
         }
         let channels = buf.channels.max(1) as usize;
-        let lo = center_frame.saturating_sub(radius_frames).min(total.saturating_sub(1));
+        let lo = center_frame
+            .saturating_sub(radius_frames)
+            .min(total.saturating_sub(1));
         let hi = center_frame.saturating_add(radius_frames).min(total);
         let frame_count = hi.saturating_sub(lo);
         if frame_count == 0 {
             return Err("empty sample window".to_string());
         }
         // Downsample if frame_count exceeds max_points.
-        let step = if frame_count > max_points { frame_count / max_points } else { 1 };
+        let step = if frame_count > max_points {
+            frame_count / max_points
+        } else {
+            1
+        };
         let mut samples = Vec::with_capacity((frame_count / step).min(max_points));
         let mut frame = lo;
         while frame < hi && samples.len() < max_points {
@@ -1464,7 +1586,8 @@ impl EngineClient {
             0.0
         };
         let zero_crossing_found = snapped != requested
-            || (snapped > 0 && snapped < total
+            || (snapped > 0
+                && snapped < total
                 && ((buf.samples[snapped - 1] as i32) * (buf.samples[snapped] as i32) <= 0));
         // Verify ordering after snap.
         let final_frame = match boundary {
@@ -1515,7 +1638,10 @@ impl EngineClient {
             );
             return Ok(cached);
         }
-        let _compute = self.waveform_compute_lock.lock().map_err(|e| e.to_string())?;
+        let _compute = self
+            .waveform_compute_lock
+            .lock()
+            .map_err(|e| e.to_string())?;
         // Another request may have populated the cache while this one waited.
         if let Some(cached) = cache_lookup(cache_dir, req_path, buckets) {
             return Ok(cached);
@@ -1582,7 +1708,11 @@ pub fn spawn() -> EngineClient {
         .name("olooper-audio".to_string())
         .spawn(move || Engine::new(engine_buffer, engine_tx).run(rx))
         .expect("cannot spawn audio thread");
-    EngineClient { tx, loaded_buffer, waveform_compute_lock }
+    EngineClient {
+        tx,
+        loaded_buffer,
+        waveform_compute_lock,
+    }
 }
 
 #[cfg(test)]

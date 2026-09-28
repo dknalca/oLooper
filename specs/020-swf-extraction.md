@@ -31,17 +31,20 @@ Never executes ActionScript; never requires Flash.
   carried by `SoundStreamBlock` is assembled in frame order into a derived
   track. Blocks have bounded aggregate size and malformed stream headers or
   blocks are skipped without affecting independent `DefineSound` extraction.
+- Sound decoding and BPM analysis use bounded batches of up to four threads;
+  derived-file writes and SQLite rows commit serially in source order.
 - The largest complete embedded JPEG from `DefineBits`, `DefineBitsJPEG2`,
   `DefineBitsJPEG3`, or `DefineBitsJPEG4` is offered as the looper cover. EXE
-  projectors use the cover from their validated embedded SWF.
+  projectors use the cover from their validated embedded SWF. Some JPEG2 tags
+  contain a JPEG table stream followed by the image stream; merge the table and
+  image markers before normalizing the thumbnail.
 
 ## Outputs
 
-- Extracted audio files (original bytes) written `tmp → validate → atomic rename`
-  into `Loopers/<sanitized-looper-name>/NN.mp3`.
+- MP3 frames are preserved; Flash ADPCM is written as derived PCM WAV. Validated
+  audio files are atomically written as `<library>/<looper-name>/NN_<id>.<codec>`.
 - A valid cover is normalized to a bounded JPEG thumbnail stored beside audio
-  as `cover.jpg`; the cover remains on disk with the audio when catalog rows are
-  removed.
+  as `cover.jpg`; it is removed with the final track or its group.
 - Provenance per track: `source_type=swf`, `source_path`, `source_hash` (of the
   `.swf`), `source_sound_id`, `imported_at`.
 
@@ -81,6 +84,8 @@ Never executes ActionScript; never requires Flash.
   unsupported-codec — all behave per spec.
 - [x] Synthetic ADPCM fixture decodes to a valid WAV; local ignored fixture
   `turntable_training_looper_low_res.swf` extracts its ADPCM sounds.
+- [x] JPEG2 table/image streams merge into a decodable cover; library cover
+  thumbnails persist and are served to the UI.
 - [x] Malformed inputs never panic, never write partial files.
 
 ## Non-goals

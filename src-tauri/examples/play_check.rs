@@ -4,7 +4,9 @@
 //! Loads, plays, polls status, then stops. Requires an audio device.
 
 fn main() {
-    let path = std::env::args().nth(1).expect("usage: play_check <file> [secs]");
+    let path = std::env::args()
+        .nth(1)
+        .expect("usage: play_check <file> [secs]");
     let secs: u64 = std::env::args()
         .nth(2)
         .and_then(|s| s.parse().ok())

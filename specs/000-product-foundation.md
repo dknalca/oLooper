@@ -11,18 +11,20 @@ practice with a persistent local library, prepare cue/loop metadata
 
 1. Drop/open a `.swf` → app discovers embedded audio → extracts to library → each loop playable.
 2. Drop/open a `.exe` projector → app locates embedded SWF → same pipeline; unsupported EXEs fail with a clear message.
-3. Drop WAV/MP3 → immediately practicable with default cue + loop.
+3. Drop supported audio → copied into the library and ready to practice.
 4. Library persists across restarts; missing/moved files reported, never silently duplicated.
-5. Infinite (perceptually gapless) looping with scrolling waveform, BPM/cue/loop editable.
-6. Keyboard shortcuts for hands-free practice: Space (play/pause), S (stop), arrows (seek), L (loop toggle), [ / ] (set loop points).
+5. Infinite (perceptually gapless) looping with scrolling waveform, BPM and cue/slot controls.
+6. Keyboard shortcuts for hands-free practice: Space (play/pause), S (stop), arrows (seek), L (loop toggle).
 7. 4 named cue/loop slots (A–D) per track, persisted to SQLite, auto-load on track select.
 8. Native OS file dialogs for importing SWF/EXE/audio and selecting library root.
-9. Dark UI with Tailwind CSS: sidebar + main area layout, styled transport controls, context menu for track management.
+9. File/Edit application menus, plus dark UI with Tailwind CSS: two-pane library,
+   transport controls, and track-management menus.
 
 ## Inputs / outputs
 
 - Inputs: `.swf` (FWS/CWS), `.exe` (PE projector with embedded SWF), `.wav`/`.mp3` (AIFF deferred). All untrusted.
-- Outputs: extracted audio as normal files under configurable library (`Loopers/`, `Custom Loops/`); catalog + derived metadata in SQLite.
+- Outputs: extracted audio under `<library>/<looper-name>/`, custom audio in
+  `Custom Loops/`, and catalog/derived metadata in SQLite.
 
 ## Failure behavior
 
@@ -47,11 +49,11 @@ practice with a persistent local library, prepare cue/loop metadata
 - [x] Restart preserves library without re-analysis or duplication.
 - [x] Dropped WAV plays immediately with editable cue/loop.
 - [x] Clean-macOS install runs without dev dependencies.
-- [x] Keyboard shortcuts control transport and loop editing without mouse.
+- [x] Keyboard shortcuts control transport and loop enablement without mouse.
 - [x] 4 loop slots per track persist across sessions.
 - [x] Native file pickers for import and library init.
 - [x] Dark UI with sidebar layout, context menus, track stats.
 
 ## Non-goals (MVP)
 
-- Serato metadata writing; low-latency pro audio; stems; auto loop-boundary detection; Flash execution/emulation; cloud processing.
+- Serato metadata writing; low-latency pro audio; stems; manual loop-boundary editing; Flash execution/emulation; cloud processing.

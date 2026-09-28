@@ -4,9 +4,9 @@ import {
   importCustomAndWait,
   cancelImport,
   importExeAndWait,
-  importTablistAndWait,
   importSwfAndWait,
   listenImportProgress,
+  type AppMenuCommand,
   type ImportProgress,
   pickFiles,
   type ImportReport,
@@ -24,15 +24,7 @@ interface ImportFileState {
   error: string | null;
 }
 
-interface ImportDebugInfo {
-  url: string;
-  stage: string;
-  occurredAt: string;
-  error: string;
-}
-
 export default function ImportBar({ onImported }: Props) {
-  const [tablistUrl, setTablistUrl] = useState("");
   const [busy, setBusy] = useState(false);
   const [dragging, setDragging] = useState(false);
   const [report, setReport] = useState<ImportReport | null>(null);
@@ -43,8 +35,6 @@ export default function ImportBar({ onImported }: Props) {
   const [startedAt, setStartedAt] = useState<number | null>(null);
   const [elapsed, setElapsed] = useState(0);
   const [notice, setNotice] = useState<string | null>(null);
-  const [debugDialog, setDebugDialog] = useState<ImportDebugInfo | null>(null);
-  const [debugOpen, setDebugOpen] = useState(false);
   const cancelQueue = useRef(false);
 
   const startProgress = (detail: string) => setProgress({
@@ -61,8 +51,6 @@ export default function ImportBar({ onImported }: Props) {
 
   const beginImport = (paths: string[]) => {
     cancelQueue.current = false;
-    setDebugDialog(null);
-    setDebugOpen(false);
     setFiles(paths.map((path) => ({ path, stage: "Queued", done: false, error: null })));
     setStartedAt(Date.now());
     setElapsed(0);
@@ -88,8 +76,7 @@ export default function ImportBar({ onImported }: Props) {
     let off: (() => void) | undefined;
     listenImportProgress((next) => {
       setProgress(next);
-      setFiles((current) => current.map((file, index) => fileName(file.path) === fileName(next.detail)
-        || (current.length === 1 && index === 0 && /^https:\/\/(www\.)?tablist\.net\/looper\//i.test(file.path))
+      setFiles((current) => current.map((file) => fileName(file.path) === fileName(next.detail)
         ? { ...file, stage: next.stage, done: next.done, error: next.error }
         : file));
     }).then((unlisten) => { off = unlisten; }).catch((e) => setError(`Import progress unavailable: ${String(e)}`));
@@ -244,60 +231,85 @@ export default function ImportBar({ onImported }: Props) {
     onImported();
   };
 
-  const importTablistUrl = async () => {
-    const url = tablistUrl.trim();
-    if (!url || busy) return;
+  const importFromMenu = async (command: AppMenuCommand) => {
+    if (busy) return;
+    if (command === "open-swf") {
+      await browseAndImport(importSwfAndWait, [{ name: "Flash files", extensions: ["swf"] }]);
+      return;
+    }
+    if (command === "open-exe") {
+      await browseAndImport(importExeAndWait, [{ name: "Projector files", extensions: ["exe"] }]);
+      return;
+    }
+    if (command === "import-audio") {
+      await browseAndImportCustom();
+      return;
+    }
+    if (command !== "import-files") return;
+
+    const paths = await pickFiles([
+      { name: "Flash and projector files", extensions: ["swf", "exe"] },
+      { name: "Audio", extensions: ["mp3", "wav", "flac", "ogg", "aac", "m4a"] },
+    ]);
+    if (paths.length === 0) return;
     setBusy(true);
-    beginImport([url]);
+    beginImport(paths);
     setError(null);
     setReport(null);
-    try {
-      const reports = await importTablistAndWait(url);
-      const failed = reports.filter((report) => !report.added && report.error !== "already in library");
-      const added = reports.filter((report) => report.added).length;
-      const existing = reports.filter((report) => report.error === "already in library").length;
-      if (failed.length > 0) {
-        setError(`${failed.length} track(s) failed: ${failed[0].error}`);
-        finishProgress(failed[0].error);
-      } else {
-        finishProgress();
+    let added = 0;
+    let existing = 0;
+    let failed = 0;
+    let firstError: string | null = null;
+    for (const path of paths) {
+      if (cancelQueue.current) break;
+      try {
+        const kind = importKindForPath(path);
+        if (kind === "swf") {
+          const report = await importSwfAndWait(path);
+          added += report.added;
+          existing += report.already_there;
+        } else if (kind === "exe") {
+          const report = await importExeAndWait(path);
+          added += report.added;
+          existing += report.already_there;
+        } else {
+          const reports = await importCustomAndWait([path]);
+          added += reports.filter((report) => report.added).length;
+          existing += reports.filter((report) => report.error === "already in library").length;
+          const rejected = reports.find((report) => !report.added && report.error !== "already in library");
+          if (rejected) {
+            failed++;
+            firstError ??= rejected.error ?? "audio import failed";
+          }
+        }
+      } catch (reason) {
+        failed++;
+        firstError ??= String(reason);
       }
-      if (added > 0) {
-        setDragCount(added);
-        setTimeout(() => setDragCount(null), 3000);
-      }
-      if (existing > 0) showNotice(`${existing} existing track${existing === 1 ? "" : "s"} already in library`);
-      if (reports.length > 0) setTablistUrl("");
-    } catch (reason) {
-      const message = reason instanceof Error ? reason.message : String(reason);
-      const stage = message.includes("App Check") || message.includes("reCAPTCHA")
-        ? "App Check / reCAPTCHA"
-        : message.includes("Firestore") || message.includes("looper lookup")
-          ? "Firestore looper lookup"
-          : "Tablist page resolution";
-      setError(message);
-      finishProgress(message);
-      setDebugDialog({ url, stage, occurredAt: new Date().toISOString(), error: message });
-      setDebugOpen(true);
+    }
+    if (failed > 0) {
+      setError(`${failed} file(s) failed: ${firstError}`);
+      finishProgress(firstError);
+    } else {
+      finishProgress(cancelQueue.current ? "import cancelled" : null);
+    }
+    if (existing > 0) showNotice(`${existing} existing track${existing === 1 ? "" : "s"} already in library`);
+    if (added > 0) {
+      setDragCount(added);
+      setTimeout(() => setDragCount(null), 3000);
     }
     setBusy(false);
     onImported();
   };
 
-  const copyDebugInfo = async () => {
-    if (!debugDialog) return;
-    const details = JSON.stringify({
-      ...debugDialog,
-      app: "oLooper",
-      userAgent: navigator.userAgent,
-    }, null, 2);
-    try {
-      await navigator.clipboard.writeText(details);
-      showNotice("Tablist diagnostics copied");
-    } catch {
-      setError("Could not copy diagnostics; select and copy the details manually.");
-    }
-  };
+  useEffect(() => {
+    const handleMenuCommand = (event: Event) => {
+      const command = (event as CustomEvent<AppMenuCommand>).detail;
+      void importFromMenu(command);
+    };
+    window.addEventListener("olooper:import-command", handleMenuCommand);
+    return () => window.removeEventListener("olooper:import-command", handleMenuCommand);
+  }, [busy]);
 
   return (
     <>
@@ -333,28 +345,6 @@ export default function ImportBar({ onImported }: Props) {
           label="Audio"
         />
 
-        <form
-          className="flex min-w-0 flex-1 items-center gap-1.5"
-          onSubmit={(event) => { event.preventDefault(); void importTablistUrl(); }}
-        >
-          <input
-            type="url"
-            value={tablistUrl}
-            onChange={(event) => setTablistUrl(event.target.value)}
-            disabled={busy}
-            placeholder="Tablist looper URL"
-            aria-label="Tablist looper URL"
-            className="min-w-0 flex-1 rounded border border-border bg-surface px-2 py-1 text-[10px] text-text placeholder:text-text-secondary/60 focus:border-accent focus:outline-none disabled:opacity-50"
-          />
-          <button
-            type="submit"
-            disabled={busy || !tablistUrl.trim()}
-            className="rounded bg-accent/15 px-2.5 py-1 text-[10px] font-medium text-accent transition-colors hover:bg-accent/25 disabled:opacity-30"
-          >
-            Import URL
-          </button>
-        </form>
-
         <div className="flex-1" />
 
         {progress && !progress.done && (
@@ -385,14 +375,6 @@ export default function ImportBar({ onImported }: Props) {
             >
               {error}
             </span>
-            {debugDialog && (
-              <button
-                onClick={() => setDebugOpen(true)}
-                className="shrink-0 text-[10px] text-accent underline underline-offset-2"
-              >
-                Details
-              </button>
-            )}
           </div>
         )}
       </div>
@@ -433,47 +415,6 @@ export default function ImportBar({ onImported }: Props) {
         </div>
       )}
 
-      {debugDialog && debugOpen && (
-        <div className="fixed inset-0 z-[100] flex items-center justify-center bg-app/80 p-4 backdrop-blur-sm">
-          <section
-            role="dialog"
-            aria-modal="true"
-            aria-labelledby="tablist-debug-title"
-            className="flex max-h-[85vh] w-full max-w-2xl flex-col rounded-lg border border-border bg-surface p-5 shadow-2xl"
-          >
-            <div className="flex items-start justify-between gap-4">
-              <div>
-                <h2 id="tablist-debug-title" className="text-base font-semibold text-text">Tablist import diagnostics</h2>
-                <p className="mt-1 text-xs text-text-secondary">Stage: {debugDialog.stage}</p>
-              </div>
-              <button
-                onClick={() => setDebugOpen(false)}
-                aria-label="Close diagnostics"
-                className="rounded px-2 py-1 text-xs text-text-secondary hover:bg-border hover:text-text"
-              >
-                Close
-              </button>
-            </div>
-            <p className="mt-3 break-all text-xs text-text-secondary">{debugDialog.url}</p>
-            <p className="mt-1 text-[10px] text-text-secondary">{debugDialog.occurredAt}</p>
-            <pre className="mt-3 min-h-0 flex-1 overflow-auto whitespace-pre-wrap break-words rounded border border-border bg-app p-3 font-mono text-[11px] text-danger">{debugDialog.error}</pre>
-            <div className="mt-4 flex justify-end gap-2">
-              <button
-                onClick={() => void copyDebugInfo()}
-                className="rounded bg-border px-3 py-1.5 text-xs text-text-secondary hover:text-text"
-              >
-                Copy details
-              </button>
-              <button
-                onClick={() => setDebugOpen(false)}
-                className="rounded bg-accent px-3 py-1.5 text-xs font-medium text-app"
-              >
-                Close
-              </button>
-            </div>
-          </section>
-        </div>
-      )}
     </>
   );
 }

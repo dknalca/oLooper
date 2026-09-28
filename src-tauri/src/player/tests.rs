@@ -36,7 +36,11 @@ fn loop_region_repeats_exact_boundary_frames() {
 
 #[test]
 fn zero_crossing_snap_prefers_nearest_crossing() {
-    let buf = LoopBuffer { samples: vec![-5, -2, 0, 3, 5, 2, -1, -4], channels: 1, rate: 1000 };
+    let buf = LoopBuffer {
+        samples: vec![-5, -2, 0, 3, 5, 2, -1, -4],
+        channels: 1,
+        rate: 1000,
+    };
     assert_eq!(snap_zero_crossing(&buf, 3), 3);
     assert_eq!(snap_zero_crossing(&buf, 6), 6);
 }
@@ -111,6 +115,18 @@ fn synthetic_wav_decodes_end_to_end() {
 fn malformed_m4a_returns_error_without_panicking() {
     let bytes = [0, 0, 0, 8, b'f', b't', b'y', b'p', 0, 0, 0, 0];
     assert!(decode_bytes(&bytes).is_err());
+    assert!(decode_job(bytes.to_vec()).is_err());
+}
+
+#[test]
+#[ignore = "set OLOOPER_M4A_FIXTURE to a downloaded Tablist .m4a"]
+fn tablist_m4a_fixture_decodes_through_player_load_path() {
+    let path = std::env::var("OLOOPER_M4A_FIXTURE").expect("set OLOOPER_M4A_FIXTURE");
+    let bytes = std::fs::read(path).unwrap();
+    let buffer = decode_job(bytes).expect("player decode path should support AAC in M4A");
+    assert!(buffer.frames() > 0);
+    assert_eq!(buffer.channels, 2);
+    assert_eq!(buffer.rate, 44_100);
 }
 
 #[test]

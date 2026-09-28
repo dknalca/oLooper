@@ -3,18 +3,19 @@
 ## Scope
 
 Practice playback for one loaded track: play/pause/stop, infinite loop over
-an editable region, track switching, volume, position reporting.
+the selected automatic region, track switching, volume, position reporting.
 Waveform rendering and library integration are separate specs.
 
 ## User-visible behavior
 
-1. Load a track (extracted MP3, WAV) → duration known, default loop = full
-   track, paused at start.
+1. Load a track (MP3, WAV, or supported M4A) → duration known, default loop =
+   full track, paused at start, playback speed reset to 100%.
 2. Play → audio starts; Pause freezes; Stop returns to loop start.
 3. Loop enabled (default) → region repeats without reopening the file and
    without audible gaps beyond decoder/buffer limits.
-4. User edits loop start/end in ms → takes effect immediately, clamped to
-   `[0, duration]`, start < end enforced.
+4. `AUTO` detects and snaps a suitable loop region from audio. The player UI
+   exposes loop enable/disable and automatic detection; manual boundary editing
+   is not exposed.
 5. Switch track → the new row highlights immediately and a loading state is
    published; the previous audio keeps playing until the new decode proves
    valid. File read + decode run on a background worker tagged with a load
@@ -27,8 +28,11 @@ Waveform rendering and library integration are separate specs.
    authoritative, UI only polls — buffer latency accepted in MVP). The UI
    also polls while `loading` or `pitch_preparing` is set.
 7. Keyboard shortcuts (spec 060): Space (play/pause), S (stop), arrows (seek),
-   L (loop toggle), [ / ] (set loop start/end).
-8. Cues `1`–`4`: cue `1` always seeks to the track start. Cues `2`–`4` start
+   and L (loop toggle). Previous/next transport buttons move through the
+   tracks shown in the selected library view. LOOP, AUTO, and PITCH LOCK controls
+   are currently hidden; manual loop-boundary editing is not exposed.
+8. The transport labels the saved slot buttons with **CUE**. Cues `1`–`4`:
+   cue `1` always seeks to the track start. Cues `2`–`4` start
    empty, capture the current playback position on first click, seek on later
    clicks, can be cleared, and are drawn on the waveform.
 9. `+` and `-` change playback speed in 5% steps from 50% to 200%. This is
@@ -43,15 +47,20 @@ Waveform rendering and library integration are separate specs.
    silently; WSOLA failures clear `pitch_preparing` and surface via
    `pitch_error` without changing lock state.
 11. Observability (measure before changing behavior): background jobs log
-   one `[olooper:metrics]` line each with durations for file read, decode,
-   WSOLA stretch, waveform lookup/compute/store, and engine-lock waits,
-   plus size, duration, sample rate, channels, speed %, and cache
-   hit/miss. The UI shows `Loading audio…` (track row + transport) and
-   `Preparing pitch lock…` while those jobs run.
+    one `[olooper:metrics]` line each with durations for file read, decode,
+    WSOLA stretch, waveform lookup/compute/store, and engine-lock waits,
+    plus size, duration, sample rate, channels, speed %, and cache
+    hit/miss. The UI shows `Loading audio…` (track row + transport) and
+    `Preparing pitch lock…` while those jobs run.
+12. Practice time accumulates only while audio is playing and can be reset
+    from the top bar. Optional random mode switches to another playable local
+    library track at 2-minute, 5-minute, or custom (1–1440 minute) intervals;
+    the timer repeats until disabled and avoids the current track when possible.
+13. The waveform shows the current track name in its upper-left corner.
 
 ## Supported inputs
 
-- Files rodio/Symphonia can decode (MP3 incl. extractor output, WAV).
+- Files rodio/Symphonia can decode (MP3, WAV, and Tablist AAC/M4A).
   Undecodable → typed error, previous track (if any) keeps its state.
 
 ## Outputs
@@ -63,20 +72,20 @@ Waveform rendering and library integration are separate specs.
 ## Failure behavior
 
 - No output device → clear error at first play attempt, nothing half-started.
-- Decode failure → error with path + "file left untouched" note.
+- Decode failure → error; the source file remains untouched.
 - All player errors user-facing; no panics on bad ms values (clamped).
 
 ## Persistence behavior
 
-- None in this spec (no cue/loop persistence yet — that is library work).
-  Loaded path + loop region live only in session state.
+- Playback position, playback speed, pitch-lock state, practice time, and random
+  timer settings are session-only. Speed and pitch lock reset to defaults on each track.
+  Per-track BPM and cue/loop slots persist in the library (`010`, `070`).
 
 ## Platform considerations
 
-- rodio backend (ADR 0002): perceptual gapless, latency not guaranteed.
-  Decode-on-load holds one track in memory (f32 interleaved); a 5-min stereo
-  44.1 kHz track ≈ 100 MB worst case — acceptable for practice loops, and a
-  documented limit (files > 15 min rejected with a clear message).
+- rodio backend (ADR 0002): perceptually gapless, latency not guaranteed. Input
+  files are capped at 512 MiB and 15 minutes. The decoded-track cache is bounded
+  to 128 MiB and six tracks.
 
 ## Security implications
 
@@ -88,11 +97,12 @@ Waveform rendering and library integration are separate specs.
 - [x] Load → play → loop wraps N times with no reopen and no drift
   (position advances monotonically modulo region).
 - [x] Pause/resume keeps sample-accurate region position.
-- [x] Loop edits clamp; start ≥ end rejected with message.
+- [x] AUTO chooses a snapped frame-precise loop candidate when one qualifies.
 - [x] Unit tests cover wrap math + a synthetic WAV end-to-end (no hardware).
 - [x] Manual: an extracted loop from `loopersFlash/` plays and loops audibly.
 - [x] Keyboard shortcuts control transport without mouse.
 - [x] Loop slots A–D save/load correctly; auto-load slot A on track load.
+- [x] Loading another track resets playback speed to 100%.
 
 ## Non-goals
 

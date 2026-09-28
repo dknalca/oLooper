@@ -22,6 +22,43 @@ fn finish_bits(bits: &mut Vec<u8>, current: u8, count: usize) {
     }
 }
 
+fn jpeg_fixture(width: u32, height: u32) -> Vec<u8> {
+    let pixels = (0..width * height)
+        .flat_map(|index| {
+            let x = index % width;
+            let y = index / width;
+            [(x * 7) as u8, (y * 11) as u8, (index * 3) as u8]
+        })
+        .collect::<Vec<_>>();
+    let mut bytes = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut bytes, 85)
+        .encode(&pixels, width, height, image::ExtendedColorType::Rgb8)
+        .unwrap();
+    bytes
+}
+
+fn jpeg_table_stream(jpeg: &[u8]) -> Vec<u8> {
+    let mut tables = jpeg[..2].to_vec();
+    let mut offset = 2;
+    while offset + 4 <= jpeg.len() && jpeg[offset] == 0xff {
+        let marker = jpeg[offset + 1];
+        if marker == 0xda {
+            break;
+        }
+        let length = u16::from_be_bytes([jpeg[offset + 2], jpeg[offset + 3]]) as usize;
+        let end = offset + 2 + length;
+        if end > jpeg.len() {
+            break;
+        }
+        if marker == 0xdb || marker == 0xc4 {
+            tables.extend_from_slice(&jpeg[offset..end]);
+        }
+        offset = end;
+    }
+    tables.extend_from_slice(&[0xff, 0xd9]);
+    tables
+}
+
 #[test]
 fn valid_fws_extracts_mp3_in_order() {
     let mut tags = define_sound_tag(7, FORMAT_MP3, &fake_mp3(0));
@@ -38,32 +75,54 @@ fn valid_fws_extracts_mp3_in_order() {
 
 #[test]
 fn extracts_largest_embedded_jpeg_as_swf_cover() {
-    let small = [0xff, 0xd8, 1, 2, 0xff, 0xd9];
-    let large = [0xff, 0xd8, 3, 4, 5, 6, 7, 8, 0xff, 0xd9];
+    let small = jpeg_fixture(2, 2);
+    let large = jpeg_fixture(64, 64);
     let mut small_tag = 9u16.to_le_bytes().to_vec();
+    small_tag.extend_from_slice(&jpeg_table_stream(&small));
     small_tag.extend_from_slice(&small);
     let mut large_tag = 10u16.to_le_bytes().to_vec();
+    large_tag.extend_from_slice(&jpeg_table_stream(&large));
     large_tag.extend_from_slice(&large);
     let mut tags = swf_tag(21, &small_tag);
     tags.extend(swf_tag(21, &large_tag));
 
     let parsed = parse(&fws_file(10, &tags)).unwrap();
-    assert_eq!(parsed.cover_image.as_deref(), Some(large.as_slice()));
+    let decoded = image::load_from_memory(parsed.cover_image.as_deref().unwrap()).unwrap();
+    assert_eq!((decoded.width(), decoded.height()), (64, 64));
 }
 
 #[test]
 fn reconstructs_jpeg_using_define_bits_and_jpeg_tables() {
-    let tables = [0xff, 0xd8, 1, 2, 0xff, 0xd9];
+    let jpeg = jpeg_fixture(32, 24);
+    let tables = jpeg_table_stream(&jpeg);
     let mut table_tag = swf_tag(8, &tables);
     let mut image_tag = 1u16.to_le_bytes().to_vec();
-    image_tag.extend_from_slice(&[3, 4, 0xff, 0xd9]);
+    image_tag.extend_from_slice(&jpeg[2..]);
     table_tag.extend(swf_tag(6, &image_tag));
 
     let parsed = parse(&fws_file(10, &table_tag)).unwrap();
-    assert_eq!(
-        parsed.cover_image.as_deref(),
-        Some([0xff, 0xd8, 1, 2, 3, 4, 0xff, 0xd9].as_slice())
-    );
+    let decoded = image::load_from_memory(parsed.cover_image.as_deref().unwrap()).unwrap();
+    assert_eq!((decoded.width(), decoded.height()), (32, 24));
+}
+
+#[test]
+fn invalid_largest_jpeg_does_not_hide_a_smaller_decodable_cover() {
+    let valid = jpeg_fixture(8, 6);
+    let mut invalid = vec![0x42; valid.len() + 128];
+    invalid[..2].copy_from_slice(&[0xff, 0xd8]);
+    let end = invalid.len();
+    invalid[end - 2..].copy_from_slice(&[0xff, 0xd9]);
+
+    let mut invalid_tag = 1u16.to_le_bytes().to_vec();
+    invalid_tag.extend_from_slice(&invalid);
+    let mut valid_tag = 2u16.to_le_bytes().to_vec();
+    valid_tag.extend_from_slice(&valid);
+    let mut tags = swf_tag(TAG_DEFINE_BITS_JPEG2, &invalid_tag);
+    tags.extend(swf_tag(TAG_DEFINE_BITS_JPEG2, &valid_tag));
+
+    let parsed = parse(&fws_file(10, &tags)).unwrap();
+    let decoded = image::load_from_memory(parsed.cover_image.as_deref().unwrap()).unwrap();
+    assert_eq!((decoded.width(), decoded.height()), (8, 6));
 }
 
 #[test]

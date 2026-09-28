@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import TopBar from "./components/TopBar";
 import Sidebar from "./components/Sidebar";
 import Player from "./components/Player";
@@ -6,7 +6,9 @@ import Waveform from "./components/Waveform";
 import ImportBar from "./components/ImportBar";
 import TablistCatalog from "./components/TablistCatalog";
 import useKeyboardShortcuts from "./hooks/useKeyboardShortcuts";
-import type { PlayerStatus, Track } from "./tauri";
+import { libraryRandomTrack, listenAppMenuCommand, playerLoad, playerPlay, playerStatus as getPlayerStatus, type PlayerStatus, type Track } from "./tauri";
+
+type TrackNavigator = (direction: -1 | 1) => void;
 
 export default function App() {
   useKeyboardShortcuts();
@@ -14,17 +16,56 @@ export default function App() {
   const [refreshKey, setRefreshKey] = useState(0);
   const [playerStatus, setPlayerStatus] = useState<PlayerStatus | null>(null);
   const [activeTrackId, setActiveTrackId] = useState<number | null>(null);
+  const [activeTrack, setActiveTrack] = useState<Track | null>(null);
+  const [trackNavigator, setTrackNavigator] = useState<TrackNavigator | null>(null);
   const [libraryView, setLibraryView] = useState<"local" | "tablist">("local");
+  const randomLoadGeneration = useRef(0);
 
   const onLibraryReady = useCallback(() => setLibraryReady(true), []);
   const onImported = useCallback(
     () => setRefreshKey((k) => k + 1),
     [],
   );
-  const onTrackSelected = (track: Track, status: PlayerStatus) => {
+  const onTrackSelected = useCallback((track: Track, status: PlayerStatus) => {
+    randomLoadGeneration.current += 1;
     setActiveTrackId(track.id);
+    setActiveTrack(track);
     setPlayerStatus(status);
-  };
+  }, []);
+
+  const registerTrackNavigator = useCallback((navigate: TrackNavigator | null) => {
+    setTrackNavigator(() => navigate);
+  }, []);
+
+  const onTrackLoading = useCallback(() => {
+    randomLoadGeneration.current += 1;
+  }, []);
+
+  const playRandomTrack = useCallback(async () => {
+    const generation = ++randomLoadGeneration.current;
+    const track = await libraryRandomTrack(activeTrackId);
+    if (!track) throw new Error("No playable tracks in the library");
+    if (generation !== randomLoadGeneration.current) return;
+
+    let status = await playerLoad(track.file_path);
+    setPlayerStatus(status);
+    const deadline = Date.now() + 120_000;
+    while (status.loading && Date.now() < deadline) {
+      await new Promise((resolve) => window.setTimeout(resolve, 150));
+      if (generation !== randomLoadGeneration.current) return;
+      status = await getPlayerStatus();
+      setPlayerStatus(status);
+    }
+    if (generation !== randomLoadGeneration.current) return;
+    if (status.loading) throw new Error("Random track load timed out");
+    if (status.load_error) throw new Error(status.load_error);
+    if (status.path !== track.file_path) return;
+    const playing = await playerPlay();
+    if (generation !== randomLoadGeneration.current) return;
+    setActiveTrackId(track.id);
+    setActiveTrack(track);
+    setPlayerStatus(playing);
+  }, [activeTrackId]);
 
   // Listen for olooper:imported events from keyboard shortcut handler.
   useEffect(() => {
@@ -33,17 +74,34 @@ export default function App() {
     return () => window.removeEventListener("olooper:imported", handler);
   }, [onImported]);
 
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    listenAppMenuCommand((command) => {
+      if (command === "choose-library") {
+        window.dispatchEvent(new Event("olooper:choose-library"));
+      } else {
+        window.dispatchEvent(new CustomEvent("olooper:import-command", { detail: command }));
+      }
+    }).then((dispose) => { unlisten = dispose; }).catch(() => {});
+    return () => unlisten?.();
+  }, []);
+
   return (
     <div className="h-screen flex flex-col bg-app text-text overflow-hidden">
-      <TopBar onLibraryReady={onLibraryReady} />
+      <TopBar onLibraryReady={onLibraryReady} playing={playerStatus?.playing ?? false} />
 
       <main className="flex flex-1 min-h-0 flex-col">
         <div className="h-1/5 min-h-36 shrink-0 p-3">
-          <Waveform refreshKey={refreshKey} status={playerStatus} onStatusChange={setPlayerStatus} />
+          <Waveform refreshKey={refreshKey} status={playerStatus} trackTitle={activeTrack?.title ?? null} onStatusChange={setPlayerStatus} />
         </div>
         <Player
           status={playerStatus}
           trackId={activeTrackId}
+          canRandom={libraryReady && activeTrackId !== null}
+          onRandomTrack={playRandomTrack}
+          canNavigateTracks={trackNavigator !== null}
+          onPreviousTrack={() => trackNavigator?.(-1)}
+          onNextTrack={() => trackNavigator?.(1)}
           onStatusChange={setPlayerStatus}
         />
         <section className="flex min-h-0 flex-1 flex-col border-t border-border">
@@ -63,7 +121,7 @@ export default function App() {
               onClick={() => setLibraryView("tablist")}
               className={`rounded-t px-3 py-1.5 text-[11px] ${libraryView === "tablist" ? "border border-border border-b-surface bg-surface text-text" : "text-text-secondary hover:text-text"}`}
             >
-              Tablist Online
+              Download new Loopers
             </button>
           </div>
           <div className="flex min-h-0 flex-1 flex-col">
@@ -71,10 +129,13 @@ export default function App() {
               <Sidebar
                 libraryReady={libraryReady}
                 refreshKey={refreshKey}
+                activeTrackId={activeTrackId}
+                onRegisterTrackNavigation={registerTrackNavigator}
+                onTrackLoading={onTrackLoading}
                 onTrackSelected={onTrackSelected}
               />
             ) : (
-              <TablistCatalog libraryReady={libraryReady} onImported={onImported} />
+              <TablistCatalog libraryReady={libraryReady} refreshKey={refreshKey} onImported={onImported} />
             )}
           </div>
         </section>

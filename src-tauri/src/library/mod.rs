@@ -2,11 +2,13 @@
 //!
 //! The database is metadata only. Every write path keeps looper directories and
 //! `Custom Loops/` human-browsable; file copies go `tmp → validate → rename`
-//! and row writes are transactional. Removing a track deletes its row, never
-//! the user's audio.
+//! and row writes are transactional. Removing a track deletes its library copy,
+//! but never its original source file.
 
+use std::collections::HashSet;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use rusqlite::{Connection, OptionalExtension as _};
 use serde::{Deserialize, Serialize};
@@ -124,6 +126,13 @@ pub struct Library {
     pub root: PathBuf,
 }
 
+struct QuarantinedFiles {
+    directory: PathBuf,
+    moved: Vec<(PathBuf, PathBuf)>,
+}
+
+static NEXT_DELETE_QUARANTINE: AtomicU64 = AtomicU64::new(1);
+
 impl Library {
     /// Open (creating) `root/olooper.db`, making the library root, migrating.
     /// One transaction per migration step; version set only on success.
@@ -213,6 +222,50 @@ impl Library {
 
     pub fn get_track(&self, id: i64) -> Result<Option<Track>, String> {
         Ok(self.list_tracks()?.into_iter().find(|t| t.id == id))
+    }
+
+    pub fn tablist_import_counts(&self) -> Result<Vec<TablistImportCount>, String> {
+        let mut statement = self
+            .conn
+            .prepare(
+                "SELECT source_path,COUNT(*) FROM tracks WHERE source_type='tablist' GROUP BY source_path",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map([], |row| {
+                let count: i64 = row.get(1)?;
+                Ok(TablistImportCount {
+                    source_path: row.get(0)?,
+                    tracks: count.max(0) as usize,
+                })
+            })
+            .map_err(|error| error.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())
+    }
+
+    /// Choose a playable library track at random, avoiding the current track
+    /// when another playable track is available.
+    pub fn random_track(&self, exclude_id: Option<i64>) -> Result<Option<Track>, String> {
+        let mut tracks: Vec<_> = self
+            .list_tracks()?
+            .into_iter()
+            .filter(|track| track.exists)
+            .collect();
+        if tracks.len() > 1 {
+            if let Some(exclude_id) = exclude_id {
+                tracks.retain(|track| track.id != exclude_id);
+            }
+        }
+        if tracks.is_empty() {
+            return Ok(None);
+        }
+        let random: i64 = self
+            .conn
+            .query_row("SELECT random()", [], |row| row.get(0))
+            .map_err(|error| error.to_string())?;
+        let index = random.unsigned_abs() as usize % tracks.len();
+        Ok(Some(tracks.swap_remove(index)))
     }
 
     /// Insert or return the existing row id on `(source_hash, source_sound_id)`.
@@ -315,7 +368,16 @@ impl Library {
                 "UPDATE tracks SET primary_cue_ms=?1,loop_start_ms=?2,loop_end_ms=?3,\
                  loop_enabled=?4,loop_start_frame=?5,loop_end_frame=?6,loop_origin='manual',\
                  updated_at=?7 WHERE id=?8",
-                rusqlite::params![cue_ms, start_ms, end_ms, enabled, start_frame, end_frame, now_secs(), id],
+                rusqlite::params![
+                    cue_ms,
+                    start_ms,
+                    end_ms,
+                    enabled,
+                    start_frame,
+                    end_frame,
+                    now_secs(),
+                    id
+                ],
             )
             .map_err(|e| e.to_string())?;
         self.get_track(id)?
@@ -346,14 +408,53 @@ impl Library {
             .ok_or_else(|| format!("track {id} vanished"))
     }
 
-    /// Deletes the row only. Audio files are never touched.
-    /// CASCADE deletes associated loop_slots.
+    /// Delete one catalog track and its library-managed audio copy. The source
+    /// path (original SWF/EXE or user file) is never removed.
     pub fn remove_track(&self, id: i64) -> Result<bool, String> {
-        let n = self
+        let Some(track) = self.get_track(id)? else {
+            return Ok(false);
+        };
+        let remaining: i64 = self
             .conn
-            .execute("DELETE FROM tracks WHERE id=?1", [id])
-            .map_err(|e| e.to_string())?;
-        Ok(n == 1)
+            .query_row(
+                "SELECT COUNT(*) FROM tracks WHERE source_hash=?1 AND id<>?2",
+                rusqlite::params![track.source_hash, id],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        let last_group_track = remaining == 0 && track.source_type != "custom";
+        let file_path = PathBuf::from(&track.file_path);
+        let mut candidates = vec![file_path.clone()];
+        if last_group_track {
+            if let Some(directory) = file_path.parent() {
+                candidates.push(directory.join("cover.jpg"));
+            }
+        }
+        let quarantined = self.quarantine_files(&candidates)?;
+        let changed = match self.conn.execute("DELETE FROM tracks WHERE id=?1", [id]) {
+            Ok(changed) => changed,
+            Err(error) => {
+                if let Some(quarantined) = &quarantined {
+                    self.restore_quarantined(quarantined)?;
+                }
+                return Err(error.to_string());
+            }
+        };
+        if changed != 1 {
+            if let Some(quarantined) = &quarantined {
+                self.restore_quarantined(quarantined)?;
+            }
+            return Ok(false);
+        }
+        if let Some(quarantined) = quarantined {
+            self.purge_quarantined(quarantined)?;
+        }
+        if last_group_track {
+            if let Some(directory) = file_path.parent() {
+                let _ = std::fs::remove_dir(directory);
+            }
+        }
+        Ok(true)
     }
 
     pub fn set_favorite(&self, id: i64, favorite: bool) -> Result<Track, String> {
@@ -371,42 +472,84 @@ impl Library {
             .ok_or_else(|| format!("track {id} vanished"))
     }
 
-    pub fn update_metadata(&self, id: i64, title: &str, bpm: Option<f64>, tags: &str) -> Result<Track, String> {
+    pub fn update_metadata(
+        &self,
+        id: i64,
+        title: &str,
+        bpm: Option<f64>,
+        tags: &str,
+    ) -> Result<Track, String> {
         let title = sanitize_name(title);
         if let Some(bpm) = bpm {
-            if !(20.0..=300.0).contains(&bpm) { return Err("bpm outside 20–300".to_string()); }
+            if !(20.0..=300.0).contains(&bpm) {
+                return Err("bpm outside 20–300".to_string());
+            }
         }
-        let tags = tags.split(',').map(sanitize_name).filter(|tag| tag != "untitled").collect::<Vec<_>>().join(", ");
+        let tags = tags
+            .split(',')
+            .map(sanitize_name)
+            .filter(|tag| tag != "untitled")
+            .collect::<Vec<_>>()
+            .join(", ");
         let changed = self.conn.execute("UPDATE tracks SET title=?1,bpm=?2,bpm_source=CASE WHEN ?2 IS NULL THEN bpm_source ELSE 'manual' END,tags=?3,updated_at=?4 WHERE id=?5", rusqlite::params![title, bpm, tags, now_secs(), id]).map_err(|e| e.to_string())?;
-        if changed == 0 { return Err(format!("track {id} not found")); }
-        self.get_track(id)?.ok_or_else(|| format!("track {id} vanished"))
+        if changed == 0 {
+            return Err(format!("track {id} not found"));
+        }
+        self.get_track(id)?
+            .ok_or_else(|| format!("track {id} vanished"))
     }
 
     pub fn mark_played(&self, id: i64) -> Result<(), String> {
-        let changed = self.conn.execute("UPDATE tracks SET last_played_at=?1 WHERE id=?2", rusqlite::params![now_secs(), id]).map_err(|e| e.to_string())?;
-        if changed == 0 { return Err(format!("track {id} not found")); }
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE tracks SET last_played_at=?1 WHERE id=?2",
+                rusqlite::params![now_secs(), id],
+            )
+            .map_err(|e| e.to_string())?;
+        if changed == 0 {
+            return Err(format!("track {id} not found"));
+        }
         Ok(())
     }
 
     /// Copy selected audio to a user-owned directory. Never overwrite or move a source.
     pub fn export_tracks(&self, ids: &[i64], destination: &Path) -> Result<usize, String> {
-        if ids.is_empty() { return Err("select at least one loop to export".to_string()); }
-        let destination = destination.canonicalize().map_err(|e| format!("cannot use export folder: {e}"))?;
-        if !destination.is_dir() { return Err("export destination is not a folder".to_string()); }
+        if ids.is_empty() {
+            return Err("select at least one loop to export".to_string());
+        }
+        let destination = destination
+            .canonicalize()
+            .map_err(|e| format!("cannot use export folder: {e}"))?;
+        if !destination.is_dir() {
+            return Err("export destination is not a folder".to_string());
+        }
         let mut exported = 0;
         for id in ids {
-            let track = self.get_track(*id)?.ok_or_else(|| format!("track {id} not found"))?;
+            let track = self
+                .get_track(*id)?
+                .ok_or_else(|| format!("track {id} not found"))?;
             let source = Path::new(&track.file_path);
-            if !source.is_file() { return Err(format!("audio for '{}' is missing", track.title)); }
-            let extension = source.extension().and_then(|value| value.to_str()).unwrap_or("wav");
+            if !source.is_file() {
+                return Err(format!("audio for '{}' is missing", track.title));
+            }
+            let extension = source
+                .extension()
+                .and_then(|value| value.to_str())
+                .unwrap_or("wav");
             let stem = sanitize_name(&track.title);
             let mut target = destination.join(format!("{stem}.{extension}"));
             for suffix in 2..=10_000 {
-                if !target.exists() { break; }
+                if !target.exists() {
+                    break;
+                }
                 target = destination.join(format!("{stem} ({suffix}).{extension}"));
             }
-            if target.exists() { return Err(format!("too many files named '{stem}' in export folder")); }
-            std::fs::copy(source, &target).map_err(|e| format!("cannot export '{}': {e}", track.title))?;
+            if target.exists() {
+                return Err(format!("too many files named '{stem}' in export folder"));
+            }
+            std::fs::copy(source, &target)
+                .map_err(|e| format!("cannot export '{}': {e}", track.title))?;
             exported += 1;
         }
         Ok(exported)
@@ -486,6 +629,89 @@ impl Library {
         )))
     }
 
+    /// Move only validated, library-owned files into a temporary directory so
+    /// a failed SQLite deletion can restore them without data loss.
+    fn quarantine_files(&self, candidates: &[PathBuf]) -> Result<Option<QuarantinedFiles>, String> {
+        let root = self
+            .root
+            .canonicalize()
+            .map_err(|error| format!("cannot resolve library root: {error}"))?;
+        let mut seen = HashSet::new();
+        let mut safe_files = Vec::new();
+        for candidate in candidates {
+            if !seen.insert(candidate.clone()) {
+                continue;
+            }
+            let metadata = match std::fs::symlink_metadata(candidate) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(format!("cannot inspect library file: {error}")),
+            };
+            let file_type = metadata.file_type();
+            if !file_type.is_file() && !file_type.is_symlink() {
+                return Err("refusing to delete a non-file library entry".to_string());
+            }
+            let parent = candidate
+                .parent()
+                .ok_or_else(|| "library file has no parent directory".to_string())?
+                .canonicalize()
+                .map_err(|error| format!("cannot resolve library file parent: {error}"))?;
+            if !parent.starts_with(&root) {
+                return Err("refusing to delete a file outside the library".to_string());
+            }
+            safe_files.push(candidate.clone());
+        }
+        if safe_files.is_empty() {
+            return Ok(None);
+        }
+
+        let directory = loop {
+            let sequence = NEXT_DELETE_QUARANTINE.fetch_add(1, Ordering::Relaxed);
+            let candidate = root.join(format!(".olooper-trash-{}-{sequence}", std::process::id()));
+            match std::fs::create_dir(&candidate) {
+                Ok(()) => break candidate,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(format!("cannot prepare audio deletion: {error}")),
+            }
+        };
+        let mut moved = Vec::with_capacity(safe_files.len());
+        for (index, original) in safe_files.into_iter().enumerate() {
+            let quarantined = directory.join(format!("asset-{index}"));
+            if let Err(error) = std::fs::rename(&original, &quarantined) {
+                let files = QuarantinedFiles {
+                    directory: directory.clone(),
+                    moved,
+                };
+                let restore_error = self.restore_quarantined(&files).err();
+                return Err(match restore_error {
+                    Some(restore_error) => format!(
+                        "cannot stage library file for deletion: {error}; restore failed: {restore_error}"
+                    ),
+                    None => format!("cannot stage library file for deletion: {error}"),
+                });
+            }
+            moved.push((original, quarantined));
+        }
+        Ok(Some(QuarantinedFiles { directory, moved }))
+    }
+
+    fn restore_quarantined(&self, files: &QuarantinedFiles) -> Result<(), String> {
+        for (original, quarantined) in files.moved.iter().rev() {
+            std::fs::rename(quarantined, original)
+                .map_err(|error| format!("cannot restore {}: {error}", original.display()))?;
+        }
+        std::fs::remove_dir(&files.directory).map_err(|error| error.to_string())
+    }
+
+    fn purge_quarantined(&self, files: QuarantinedFiles) -> Result<(), String> {
+        std::fs::remove_dir_all(&files.directory).map_err(|error| {
+            format!(
+                "catalog entry was removed but staged audio could not be deleted at {}: {error}",
+                files.directory.display()
+            )
+        })
+    }
+
     /// Rename the derived-audio folder and its catalog label. Source files stay untouched.
     pub fn rename_looper(&self, source_hash: &str, new_name: &str) -> Result<(), String> {
         let tracks = self.group_tracks(source_hash)?;
@@ -493,7 +719,14 @@ impl Library {
             return Err("custom loops cannot be renamed as a group".to_string());
         }
         let new_name = sanitize_name(new_name);
-        let old_dir = self.group_directory(source_hash)?;
+        // Validate through the canonical path, but keep the stored lexical path
+        // for the filesystem rename and SQL prefix update. On macOS `/var` may
+        // canonicalize to `/private/var`, while file_path rows retain `/var`.
+        self.group_directory(source_hash)?;
+        let old_dir = PathBuf::from(&tracks[0].file_path)
+            .parent()
+            .ok_or("track has no parent directory")?
+            .to_path_buf();
         let new_dir = self.root.join(&new_name);
         if old_dir == new_dir {
             return Ok(());
@@ -526,14 +759,43 @@ impl Library {
         Ok(())
     }
 
-    /// Remove metadata and slots only; preserved sources and audio stay on disk.
+    /// Remove a looper's catalog rows, derived audio, and cover. Preserved source
+    /// SWF/EXE files live elsewhere and are never included in this deletion.
     pub fn remove_looper(&self, source_hash: &str) -> Result<usize, String> {
-        let n = self
+        let tracks = self.group_tracks(source_hash)?;
+        if tracks[0].source_type == "custom" {
+            return Err("custom audio tracks cannot be removed as a looper group".to_string());
+        }
+        let mut candidates: Vec<PathBuf> = tracks
+            .iter()
+            .map(|track| PathBuf::from(&track.file_path))
+            .collect();
+        for track in &tracks {
+            if let Some(parent) = Path::new(&track.file_path).parent() {
+                candidates.push(parent.join("cover.jpg"));
+            }
+        }
+        let quarantined = self.quarantine_files(&candidates)?;
+        let n = match self
             .conn
             .execute("DELETE FROM tracks WHERE source_hash=?1", [source_hash])
-            .map_err(|e| e.to_string())?;
+        {
+            Ok(n) => n,
+            Err(error) => {
+                if let Some(quarantined) = &quarantined {
+                    self.restore_quarantined(quarantined)?;
+                }
+                return Err(error.to_string());
+            }
+        };
         if n == 0 {
+            if let Some(quarantined) = &quarantined {
+                self.restore_quarantined(quarantined)?;
+            }
             return Err("looper group not found".to_string());
+        }
+        if let Some(quarantined) = quarantined {
+            self.purge_quarantined(quarantined)?;
         }
         Ok(n)
     }
@@ -662,10 +924,8 @@ impl Library {
     /// Persist extracted sounds: files under `<looper>/` + rows.
     /// Idempotent on `(source_hash, source_sound_id)`.
     ///
-    /// Note: every sound is fully decoded for duration/rate metadata, so
-    /// importing a ~50-sound looper takes minutes in debug builds
-    /// (release is several times faster). A header-only duration scan is
-    /// future work, not MVP.
+    /// Audio decode + BPM analysis run in bounded parallel batches; file writes
+    /// and SQLite operations remain ordered on the import worker.
     #[allow(clippy::too_many_arguments)]
     pub fn import_sounds(
         &self,
@@ -721,14 +981,13 @@ impl Library {
     /// Returns `None` when seek_samples and sample_count are both zero (no trim
     /// needed) or when the declared range is invalid.
     fn trim_mp3_gapless(
-        mp3_bytes: &[u8],
+        buf: &crate::player::LoopBuffer,
         seek_samples: u16,
         sample_count: u32,
     ) -> Option<(crate::player::LoopBuffer, Vec<u8>)> {
         if seek_samples == 0 && sample_count == 0 {
             return None;
         }
-        let buf = crate::player::decode_bytes(mp3_bytes).ok()?;
         let total = buf.frames();
         let channels = buf.channels as usize;
         let start = seek_samples as usize;
@@ -767,12 +1026,27 @@ impl Library {
         F: FnMut(&str, usize, usize) -> Result<(), String>,
     {
         if sounds.is_empty() {
-            return Err((ImportReport { looper: looper.to_string(), added: 0, already_there: 0, failed: vec![], track_ids: vec![] }, "no extractable sounds".to_string()));
+            return Err((
+                ImportReport {
+                    looper: looper.to_string(),
+                    added: 0,
+                    already_there: 0,
+                    failed: vec![],
+                    track_ids: vec![],
+                },
+                "no extractable sounds".to_string(),
+            ));
         }
         let looper = sanitize_name(looper);
         let dir = self.root.join(&looper);
         std::fs::create_dir_all(&dir).map_err(|e| {
-            let partial = ImportReport { looper: looper.clone(), added: 0, already_there: 0, failed: vec![], track_ids: vec![] };
+            let partial = ImportReport {
+                looper: looper.clone(),
+                added: 0,
+                already_there: 0,
+                failed: vec![],
+                track_ids: vec![],
+            };
             (partial, format!("cannot create looper dir: {e}"))
         })?;
 
@@ -780,106 +1054,230 @@ impl Library {
         let mut already_there = 0;
         let mut failed = Vec::new();
         let mut track_ids = Vec::new();
-        let make_partial = |looper: &str, added: usize, already_there: usize, failed: Vec<FailedSound>, track_ids: Vec<i64>| {
-            ImportReport { looper: looper.to_string(), added, already_there, failed, track_ids }
+        let make_partial = |looper: &str,
+                            added: usize,
+                            already_there: usize,
+                            failed: Vec<FailedSound>,
+                            track_ids: Vec<i64>| {
+            ImportReport {
+                looper: looper.to_string(),
+                added,
+                already_there,
+                failed,
+                track_ids,
+            }
         };
-        for (i, s) in sounds.iter().enumerate() {
-            let current = i + 1;
-            let total = sounds.len();
-            // Skip known rows before touching the filesystem.
-            let known: Option<i64> = self
-                .conn
-                .query_row(
-                    "SELECT id FROM tracks WHERE source_hash=?1 AND source_sound_id=?2",
-                    rusqlite::params![source_hash, s.id as i64],
-                    |r| r.get(0),
-                )
-                .optional()
-                .map_err(|e| (make_partial(&looper, added, already_there, failed.clone(), track_ids.clone()), e.to_string()))?;
-            if let Some(id) = known {
-                already_there += 1;
-                track_ids.push(id);
-                continue;
-            }
-            if s.frames.is_empty() {
-                failed.push(FailedSound {
-                    id: s.id as i64,
-                    reason: "unsupported or empty sound".to_string(),
-                });
-                continue;
-            }
-            progress("extracting", current, total).map_err(|e| (make_partial(&looper, added, already_there, failed.clone(), track_ids.clone()), e))?;
-            let buf = match crate::player::decode_bytes(&s.frames) {
-                Ok(b) => b,
-                Err(e) => {
-                    // One corrupt sound must not kill a 50-sound import.
-                    failed.push(FailedSound {
-                        id: s.id as i64,
-                        reason: e,
-                    });
-                    continue;
-                }
-            };
-            // MP3 gapless: trim encoder priming + trailing padding when SWF
-            // provides seek_samples / sample_count.  The trimmed result is
-            // written as WAV so the player loads exact-length PCM without
-            // needing metadata at load time.
-            let (buf, file_bytes, file_codec) =
-                if s.codec == "mp3" && (s.seek_samples > 0 || s.sample_count > 0) {
-                    if let Some((trimmed, wav)) =
-                        Self::trim_mp3_gapless(&s.frames, s.seek_samples, s.sample_count)
-                    {
-                        (trimmed, wav, "wav".to_string())
-                    } else {
-                        (buf, s.frames.clone(), s.codec.clone())
-                    }
+        let total = sounds.len();
+        let workers = std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(2)
+            .clamp(1, 4);
+
+        // Decode and BPM-analyze small bounded batches in parallel. Keep all
+        // SQLite writes and atomic file copies on this worker thread and commit
+        // each batch in original SWF sound order.
+        for batch_start in (0..total).step_by(workers) {
+            let batch_end = (batch_start + workers).min(total);
+            let batch_len = batch_end - batch_start;
+            let mut known_ids = vec![None; batch_len];
+            let mut prepared: Vec<Option<Result<PreparedSound, String>>> =
+                std::iter::repeat_with(|| None).take(batch_len).collect();
+            let mut decode_indices = Vec::new();
+
+            for (slot, index) in (batch_start..batch_end).enumerate() {
+                let sound = &sounds[index];
+                let known: Option<i64> = self
+                    .conn
+                    .query_row(
+                        "SELECT id FROM tracks WHERE source_hash=?1 AND source_sound_id=?2",
+                        rusqlite::params![source_hash, sound.id as i64],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .map_err(|error| {
+                        (
+                            make_partial(
+                                &looper,
+                                added,
+                                already_there,
+                                failed.clone(),
+                                track_ids.clone(),
+                            ),
+                            error.to_string(),
+                        )
+                    })?;
+                if let Some(id) = known {
+                    known_ids[slot] = Some(id);
+                } else if sound.frames.is_empty() {
+                    prepared[slot] = Some(Err("unsupported or empty sound".to_string()));
                 } else {
-                    (buf, s.frames.clone(), s.codec.clone())
-                };
-            progress("adjusting BPM", current, total).map_err(|e| (make_partial(&looper, added, already_there, failed.clone(), track_ids.clone()), e))?;
-            let estimate = crate::analysis::estimate(&buf);
-            progress("adjusting loops", current, total).map_err(|e| (make_partial(&looper, added, already_there, failed.clone(), track_ids.clone()), e))?;
-            let dest = dir.join(format!("{:02}_{}.{}", i + 1, s.id, file_codec));
-            let final_path = self.atomic_write(&dest, &file_bytes).map_err(|e| (make_partial(&looper, added, already_there, failed.clone(), track_ids.clone()), e))?;
-            let title = format!("{:02} · {}", i + 1, looper);
-            progress("inserting in library", current, total).map_err(|e| (make_partial(&looper, added, already_there, failed.clone(), track_ids.clone()), e))?;
-            match self.add_track(
-                &title,
-                &looper,
-                &final_path,
-                source_type,
-                source_path,
-                source_hash,
-                s.id as i64,
-                exe_offset,
-                exe_length,
-                &file_codec,
-                &buf,
-                0, // seek_samples already applied
-                0, // trimmed_leading already applied
-            ) {
-                Ok((id, true)) => {
-                    if let Some(estimate) = estimate {
-                        self.update_bpm(id, estimate.bpm, Some(estimate.confidence), false).map_err(|e| (make_partial(&looper, added, already_there, failed.clone(), track_ids.clone()), e))?;
-                    }
-                    added += 1;
-                    track_ids.push(id);
+                    progress("extracting", index + 1, total).map_err(|error| {
+                        (
+                            make_partial(
+                                &looper,
+                                added,
+                                already_there,
+                                failed.clone(),
+                                track_ids.clone(),
+                            ),
+                            error,
+                        )
+                    })?;
+                    decode_indices.push((slot, index));
                 }
-                Ok((id, false)) => {
-                    // Raced or re-imported: drop the duplicate file.
-                    let _ = std::fs::remove_file(&final_path);
+            }
+
+            let decoded_batch = std::thread::scope(|scope| {
+                let handles: Vec<_> = decode_indices
+                    .iter()
+                    .map(|(slot, index)| {
+                        let sound = &sounds[*index];
+                        let slot = *slot;
+                        (slot, scope.spawn(move || prepare_sound(sound)))
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|(slot, handle)| {
+                        let result = handle
+                            .join()
+                            .unwrap_or_else(|_| Err("audio decode worker panicked".to_string()));
+                        (slot, result)
+                    })
+                    .collect::<Vec<_>>()
+            });
+            for (slot, result) in decoded_batch {
+                prepared[slot] = Some(result);
+            }
+
+            for (slot, index) in (batch_start..batch_end).enumerate() {
+                let sound = &sounds[index];
+                if let Some(id) = known_ids[slot] {
                     already_there += 1;
                     track_ids.push(id);
+                    continue;
                 }
-                Err(e) => {
-                    let _ = std::fs::remove_file(&final_path);
-                    return Err((make_partial(&looper, added, already_there, failed, track_ids), e));
+                let item = match prepared[slot]
+                    .take()
+                    .unwrap_or_else(|| Err("audio was not prepared".to_string()))
+                {
+                    Ok(item) => item,
+                    Err(reason) => {
+                        failed.push(FailedSound {
+                            id: sound.id as i64,
+                            reason,
+                        });
+                        continue;
+                    }
+                };
+                let current = index + 1;
+                progress("adjusting BPM", current, total).map_err(|error| {
+                    (
+                        make_partial(
+                            &looper,
+                            added,
+                            already_there,
+                            failed.clone(),
+                            track_ids.clone(),
+                        ),
+                        error,
+                    )
+                })?;
+                progress("adjusting loops", current, total).map_err(|error| {
+                    (
+                        make_partial(
+                            &looper,
+                            added,
+                            already_there,
+                            failed.clone(),
+                            track_ids.clone(),
+                        ),
+                        error,
+                    )
+                })?;
+                let dest = dir.join(format!("{:02}_{}.{}", index + 1, sound.id, item.file_codec));
+                let final_path = self
+                    .atomic_write(&dest, &item.file_bytes)
+                    .map_err(|error| {
+                        (
+                            make_partial(
+                                &looper,
+                                added,
+                                already_there,
+                                failed.clone(),
+                                track_ids.clone(),
+                            ),
+                            error,
+                        )
+                    })?;
+                let title = format!("{:02} · {}", index + 1, looper);
+                progress("inserting in library", current, total).map_err(|error| {
+                    (
+                        make_partial(
+                            &looper,
+                            added,
+                            already_there,
+                            failed.clone(),
+                            track_ids.clone(),
+                        ),
+                        error,
+                    )
+                })?;
+                match self.add_track(
+                    &title,
+                    &looper,
+                    &final_path,
+                    source_type,
+                    source_path,
+                    source_hash,
+                    sound.id as i64,
+                    exe_offset,
+                    exe_length,
+                    &item.file_codec,
+                    &item.buffer,
+                    0,
+                    0,
+                ) {
+                    Ok((id, true)) => {
+                        if let Some(estimate) = item.estimate {
+                            self.update_bpm(id, estimate.bpm, Some(estimate.confidence), false)
+                                .map_err(|error| {
+                                    (
+                                        make_partial(
+                                            &looper,
+                                            added,
+                                            already_there,
+                                            failed.clone(),
+                                            track_ids.clone(),
+                                        ),
+                                        error,
+                                    )
+                                })?;
+                        }
+                        added += 1;
+                        track_ids.push(id);
+                    }
+                    Ok((id, false)) => {
+                        let _ = std::fs::remove_file(&final_path);
+                        already_there += 1;
+                        track_ids.push(id);
+                    }
+                    Err(error) => {
+                        let _ = std::fs::remove_file(&final_path);
+                        return Err((
+                            make_partial(&looper, added, already_there, failed, track_ids),
+                            error,
+                        ));
+                    }
                 }
             }
         }
         if added == 0 && already_there == 0 {
             let _ = std::fs::remove_dir(&dir); // don't leave empty dirs
-            return Err((make_partial(&looper, 0, 0, failed, track_ids), "no sounds could be imported".to_string()));
+            return Err((
+                make_partial(&looper, 0, 0, failed, track_ids),
+                "no sounds could be imported".to_string(),
+            ));
         }
         Ok(ImportReport {
             looper,
@@ -899,6 +1297,12 @@ pub struct CustomReport {
     pub bpm: Option<f64>,
     pub bpm_confidence: Option<f64>,
     pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TablistImportCount {
+    pub source_path: String,
+    pub tracks: usize,
 }
 
 impl Library {
@@ -1202,6 +1606,36 @@ impl Library {
             error: None,
         }
     }
+}
+
+struct PreparedSound {
+    buffer: crate::player::LoopBuffer,
+    file_bytes: Vec<u8>,
+    file_codec: String,
+    estimate: Option<crate::analysis::BpmEstimate>,
+}
+
+fn prepare_sound(sound: &Sound) -> Result<PreparedSound, String> {
+    let buffer = crate::player::decode_bytes(&sound.frames)?;
+    let (buffer, file_bytes, file_codec) =
+        if sound.codec == "mp3" && (sound.seek_samples > 0 || sound.sample_count > 0) {
+            if let Some((trimmed, wav)) =
+                Library::trim_mp3_gapless(&buffer, sound.seek_samples, sound.sample_count)
+            {
+                (trimmed, wav, "wav".to_string())
+            } else {
+                (buffer, sound.frames.clone(), sound.codec.clone())
+            }
+        } else {
+            (buffer, sound.frames.clone(), sound.codec.clone())
+        };
+    let estimate = crate::analysis::estimate(&buffer);
+    Ok(PreparedSound {
+        buffer,
+        file_bytes,
+        file_codec,
+        estimate,
+    })
 }
 
 const MAX_COVER_INPUT_BYTES: usize = 10 * 1024 * 1024;

@@ -9,11 +9,12 @@ computation; rendering is canvas-only (no audio decoding per frame).
 ## User-visible behavior
 
 1. Loading a track computes peaks once (backend); the waveform appears with
-   the loop region shaded and a fixed center playhead.
+   the track name in the upper-left corner, loop region shaded, and a fixed
+   center playhead.
 2. During playback the waveform scrolls; position display stays in sync
    (native position polled at 4 Hz, UI interpolates between polls).
 3. Click (or tap) on the waveform seeks there; looping continues per the
-   enabled flag. Loop edits re-shade immediately.
+   enabled flag. AUTO loop changes update the shaded region.
 4. Tracks shorter than the view window render whole; longer tracks render a
    ~30 s window around the position.
 5. The waveform occupies the upper fifth of the workspace. The transport,
