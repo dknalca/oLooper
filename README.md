@@ -25,18 +25,6 @@ Whether you're digging through classic Flash loopers or building a personal crat
 
 It is designed for **scratch DJs, beat jugglers, and turntablists** who want to spend less time managing loop files and more time practicing.
 
-## Take a look
-
-<p align="center">
-  <img src="docs/screenshots/practice-player.svg" alt="oLooper practice player preview with waveform, gapless loop, transport controls, speed, and cue pads" width="900" />
-</p>
-<p align="center"><em>Shape a practice session: see the waveform, set a tight loop, and work your cues.</em></p>
-
-<p align="center">
-  <img src="docs/screenshots/library-preview.svg" alt="oLooper library preview with looper collections, Favorites, BPM, and track list" width="900" />
-</p>
-<p align="center"><em>Keep SWF/EXE looper packs and your own audio together in a searchable practice library.</em></p>
-
 ## What oLooper does
 
 ### Bring your loopers into one library
