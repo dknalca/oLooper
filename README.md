@@ -11,7 +11,7 @@ A desktop app for DJs and turntablists to extract and practice with audio loops 
 - **Custom audio import** — drop or browse supported audio files, instantly playable
 - **Tablist online catalog** — browse/search public loopers, import all tracks, or download a random looper
 - **Persistent library** — SQLite catalog (schema v6) survives restarts, deduplicates on import
-- **Practice player** — play/pause/stop, previous/next loop, gapless looping, volume, seek
+- **Practice player** — play/pause/stop, previous/next loop, gapless looping, volume, seek, expandable manual/AUTO loop controls
 - **Practice timer** — hours/minutes/seconds counted during playback, with reset
 - **Timed random practice** — play a random local-library loop every 2 min, 5 min, or custom interval
 - **Speed control** — 50–200% playback speed in 5% steps; each new track starts at 100%

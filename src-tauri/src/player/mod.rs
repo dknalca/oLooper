@@ -141,15 +141,15 @@ pub fn decode_bytes(data: &[u8]) -> Result<LoopBuffer, String> {
     // seek during initialization for Tablist's M4A files. Decode ISO BMFF
     // directly through Symphonia instead of letting that adapter panic.
     if data.get(4..8) == Some(b"ftyp") {
-        return decode_isomp4(data).map(trim_aac_priming_silence);
+        return decode_isomp4(data).map(trim_aac_edge_silence);
     }
     decode_owned(data.to_vec())
 }
 
-/// Tablist AAC/M4A files commonly contain a short, exactly silent encoder
-/// pre-roll but omit gapless metadata. Trim only a bounded near-zero prefix from
-/// the playback buffer; the downloaded source file remains unchanged.
-fn trim_aac_priming_silence(buffer: LoopBuffer) -> LoopBuffer {
+/// Tablist AAC/M4A files can omit encoder pre-roll/padding metadata while
+/// retaining short near-zero regions at the file edges. Trim only bounded
+/// near-silence from the playback buffer; the downloaded source stays intact.
+fn trim_aac_edge_silence(buffer: LoopBuffer) -> LoopBuffer {
     const WINDOW_MS: usize = 10;
     const MAX_PRIMING_MS: usize = 150;
     const SILENCE_PEAK: i32 = 64;
@@ -160,20 +160,43 @@ fn trim_aac_priming_silence(buffer: LoopBuffer) -> LoopBuffer {
     if rate == 0 || frames == 0 {
         return buffer;
     }
-    let window_frames = (rate * WINDOW_MS / 1000).max(1);
-    let search_frames = (rate * MAX_PRIMING_MS / 1000).min(frames);
-    let first_audible = (0..search_frames).step_by(window_frames).find(|&start| {
-        let end = (start + window_frames).min(frames);
-        buffer.samples[start * channels..end * channels]
-            .iter()
-            .any(|sample| (*sample as i32).abs() > SILENCE_PEAK)
-    });
-    let Some(trim_frames) = first_audible.filter(|&start| start > 0) else {
-        return buffer;
+    let window_frames = (rate.saturating_mul(WINDOW_MS) / 1000).max(1);
+    let search_frames = (rate.saturating_mul(MAX_PRIMING_MS) / 1000).min(frames);
+    let frame_has_audio = |frame: usize| {
+        (0..channels)
+            .any(|channel| (buffer.samples[frame * channels + channel] as i32).abs() > SILENCE_PEAK)
     };
+    let leading_window = (0..search_frames)
+        .step_by(window_frames)
+        .find(|&start| (start..(start + window_frames).min(frames)).any(frame_has_audio));
+    let trim_start = leading_window
+        .and_then(|start| {
+            (start..(start + window_frames).min(frames)).find(|&frame| frame_has_audio(frame))
+        })
+        .filter(|&start| start > 0)
+        .unwrap_or(0);
+    let trim_end = (0..search_frames)
+        .step_by(window_frames)
+        .find_map(|trimmed| {
+            let end = frames - trimmed;
+            let start = end
+                .saturating_sub(window_frames)
+                .max(frames - search_frames);
+            (start..end)
+                .rev()
+                .find(|&frame| frame_has_audio(frame))
+                .map(|frame| frame + 1)
+        })
+        .unwrap_or(frames);
+    if trim_start == 0 && trim_end == frames {
+        return buffer;
+    }
+    if trim_end <= trim_start {
+        return buffer;
+    }
 
     LoopBuffer {
-        samples: buffer.samples[trim_frames * channels..].to_vec(),
+        samples: buffer.samples[trim_start * channels..trim_end * channels].to_vec(),
         channels: buffer.channels,
         rate: buffer.rate,
     }

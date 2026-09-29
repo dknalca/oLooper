@@ -9,6 +9,7 @@ use sha2::{Digest as _, Sha256};
 /// Bounds for client-requested bucket counts (allocation safety).
 pub const MIN_BUCKETS: usize = 64;
 pub const MAX_BUCKETS: usize = 8192;
+const CACHE_ALGORITHM_VERSION: u8 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WaveformData {
@@ -84,7 +85,8 @@ fn cache_key(path: &std::path::Path, buckets: usize) -> Result<String, String> {
         "{:x}",
         Sha256::digest(
             format!(
-                "{}:{}:{modified}:{}",
+                "v{}:{}:{}:{modified}:{}",
+                CACHE_ALGORITHM_VERSION,
                 canonical.display(),
                 meta.len(),
                 clamp_buckets(buckets)

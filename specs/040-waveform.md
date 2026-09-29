@@ -14,7 +14,9 @@ computation; rendering is canvas-only (no audio decoding per frame).
 2. During playback the waveform scrolls; position display stays in sync
    (native position polled at 4 Hz, UI interpolates between polls).
 3. Click (or tap) on the waveform seeks there; looping continues per the
-   enabled flag. AUTO loop changes update the shaded region.
+   enabled flag. When Loop controls are expanded, dragging either loop edge
+   adjusts that boundary and applies it on pointer release. AUTO loop changes
+   update the shaded region.
 4. Tracks shorter than the view window render whole; longer tracks render a
    ~30 s window around the position.
 5. The waveform occupies the upper fifth of the workspace. The transport,
@@ -52,7 +54,8 @@ computation; rendering is canvas-only (no audio decoding per frame).
 
 - Peaks are cached under the selected library's `.olooper-cache/waveforms/`
   directory. Cache keys include canonical path, file size, modification time,
-  and bucket count, so replacing a track invalidates its prior waveform.
+  bucket count, and decoder/cache algorithm version, so replacing a track or
+  changing decoded PCM normalization invalidates its prior waveform.
 - Cache entries are derived data only, written atomically and capped by the
   existing bucket limit. Every request logs one `[olooper:metrics]` line
   with lookup/compute/store durations, lock waits, bucket count, audio

@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import {
   playerSeek,
+  playerSetLoopSnapped,
   playerWaveformPeaks,
   type PlayerStatus,
   type LoopSlot,
@@ -12,19 +13,23 @@ interface Props {
   refreshKey: number;
   status: PlayerStatus | null;
   trackTitle: string | null;
+  loopEditing: boolean;
   onStatusChange: (status: PlayerStatus) => void;
 }
 
-export default function Waveform({ refreshKey, status, trackTitle, onStatusChange }: Props) {
+export default function Waveform({ refreshKey, status, trackTitle, loopEditing, onStatusChange }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const wrapRef = useRef<HTMLDivElement>(null);
   const statusRef = useRef<PlayerStatus | null>(null);
   const waveRef = useRef<WaveformData | null>(null);
   const cuesRef = useRef<LoopSlot[]>([]);
   const zoomRef = useRef(1);
+  const previewRef = useRef<{ start: number; end: number } | null>(null);
+  const loopEditingRef = useRef(loopEditing);
   const [error, setError] = useState<string | null>(null);
   const [generating, setGenerating] = useState(false);
   const [zoom, setZoom] = useState(1);
+  const [dragging, setDragging] = useState<"start" | "end" | null>(null);
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; time: number } | null>(null);
   const loadedPath = status?.path ?? null;
 
@@ -33,6 +38,14 @@ export default function Waveform({ refreshKey, status, trackTitle, onStatusChang
   }, [status]);
 
   useEffect(() => { zoomRef.current = zoom; }, [zoom]);
+
+  useEffect(() => {
+    loopEditingRef.current = loopEditing;
+    if (!loopEditing) {
+      previewRef.current = null;
+      setDragging(null);
+    }
+  }, [loopEditing]);
 
   useEffect(() => {
     if (!contextMenu) return;
@@ -112,7 +125,7 @@ export default function Waveform({ refreshKey, status, trackTitle, onStatusChang
       const pos = st.playing
         ? lastPos + (performance.now() - lastPoll)
         : lastPos;
-        render(canvas, wave, st, pos, cuesRef.current, zoomRef.current);
+        render(canvas, wave, st, pos, cuesRef.current, zoomRef.current, previewRef.current, loopEditingRef.current);
     };
     raf = requestAnimationFrame(draw);
     return () => cancelAnimationFrame(raf);
@@ -133,7 +146,51 @@ export default function Waveform({ refreshKey, status, trackTitle, onStatusChang
   const onPointerDown = (e: React.PointerEvent<HTMLCanvasElement>) => {
     if (e.button !== 0) return;
     const time = timeAtPointer(e);
-    if (time !== null) playerSeek(time).then(onStatusChange).catch((err) => setError(String(err)));
+    const canvas = canvasRef.current;
+    const st = statusRef.current;
+    const wave = waveRef.current;
+    if (time === null || !canvas || !st || !wave) return;
+    if (loopEditing) {
+      const rect = canvas.getBoundingClientRect();
+      const view = Math.min(wave.duration_ms, Math.max(20, wave.duration_ms / zoomRef.current));
+      const start = windowStart(st.position_ms, wave.duration_ms, view);
+      const xOf = (ms: number) => ((ms - start) / view) * rect.width;
+      const pointerX = e.clientX - rect.left;
+      const startDistance = Math.abs(pointerX - xOf(st.loop_start_ms));
+      const endDistance = Math.abs(pointerX - xOf(st.loop_end_ms));
+      const boundary = Math.min(startDistance, endDistance) <= 12
+        ? (startDistance <= endDistance ? "start" : "end")
+        : null;
+      if (boundary) {
+        e.preventDefault();
+        e.currentTarget.setPointerCapture(e.pointerId);
+        previewRef.current = { start: st.loop_start_ms, end: st.loop_end_ms };
+        setDragging(boundary);
+        return;
+      }
+    }
+    playerSeek(time).then(onStatusChange).catch((err) => setError(String(err)));
+  };
+
+  const onPointerMove = (e: React.PointerEvent<HTMLCanvasElement>) => {
+    if (!dragging || !previewRef.current) return;
+    const time = timeAtPointer(e);
+    if (time === null) return;
+    const preview = { ...previewRef.current };
+    if (dragging === "start") preview.start = Math.max(0, Math.min(time, preview.end - 1));
+    else preview.end = Math.min(statusRef.current?.duration_ms ?? time, Math.max(time, preview.start + 1));
+    previewRef.current = preview;
+  };
+
+  const onPointerUp = (e: React.PointerEvent<HTMLCanvasElement>) => {
+    if (!dragging || !previewRef.current) return;
+    const preview = previewRef.current;
+    previewRef.current = null;
+    setDragging(null);
+    if (e.currentTarget.hasPointerCapture(e.pointerId)) e.currentTarget.releasePointerCapture(e.pointerId);
+    playerSetLoopSnapped(preview.start, preview.end)
+      .then(onStatusChange)
+      .catch((reason: unknown) => setError(String(reason)));
   };
 
   const openWaveformMenu = (event: React.MouseEvent<HTMLCanvasElement>) => {
@@ -180,7 +237,10 @@ export default function Waveform({ refreshKey, status, trackTitle, onStatusChang
           ref={canvasRef}
           onPointerDown={onPointerDown}
           onContextMenu={openWaveformMenu}
-          className="h-full w-full cursor-crosshair bg-[#0e0e0e]"
+          onPointerMove={onPointerMove}
+          onPointerUp={onPointerUp}
+          onPointerCancel={() => { previewRef.current = null; setDragging(null); }}
+          className={`h-full w-full bg-[#0e0e0e] ${loopEditing ? "cursor-col-resize" : "cursor-crosshair"}`}
         />
         {contextMenu && status?.loaded && (
           <div
@@ -229,6 +289,8 @@ function render(
   posMs: number,
   cues: LoopSlot[],
   zoom: number,
+  preview: { start: number; end: number } | null,
+  loopEditing: boolean,
 ) {
   const dpr = window.devicePixelRatio || 1;
   const width = canvas.clientWidth;
@@ -248,14 +310,18 @@ function render(
   const peakAt = (t: number) =>
     wave.peaks[Math.min(wave.peaks.length - 1, Math.floor((t / wave.duration_ms) * wave.peaks.length))];
 
-  // Loop region shade.
+  const loopStart = preview?.start ?? st.loop_start_ms;
+  const loopEnd = preview?.end ?? st.loop_end_ms;
   if (st.loop_enabled) {
-    const x0 = Math.max(0, xOf(st.loop_start_ms));
-    const x1 = Math.min(width, xOf(st.loop_end_ms));
+    const x0 = Math.max(0, xOf(loopStart));
+    const x1 = Math.min(width, xOf(loopEnd));
     ctx.fillStyle = "rgba(52, 211, 153, 0.12)";
     ctx.fillRect(x0, 0, Math.max(0, x1 - x0), height);
-    // Loop edge lines
-    ctx.strokeStyle = "rgba(52, 211, 153, 0.3)";
+  }
+  if (st.loop_enabled || loopEditing) {
+    const x0 = xOf(loopStart);
+    const x1 = xOf(loopEnd);
+    ctx.strokeStyle = loopEditing ? "rgba(74, 163, 255, 0.9)" : "rgba(52, 211, 153, 0.3)";
     ctx.lineWidth = 1;
     if (x0 >= 0 && x0 <= width) {
       ctx.beginPath();
@@ -268,6 +334,15 @@ function render(
       ctx.moveTo(x1, 0);
       ctx.lineTo(x1, height);
       ctx.stroke();
+    }
+    if (loopEditing) {
+      ctx.fillStyle = "#4aa3ff";
+      for (const [x, label] of [[x0, "START"], [x1, "END"]] as const) {
+        if (x < 0 || x > width) continue;
+        ctx.fillRect(x - 3, 0, 6, 10);
+        ctx.font = "9px sans-serif";
+        ctx.fillText(label, Math.min(width - 32, Math.max(4, x + 5)), 19);
+      }
     }
   }
 

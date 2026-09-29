@@ -112,17 +112,21 @@ fn synthetic_wav_decodes_end_to_end() {
 }
 
 #[test]
-fn trims_short_aac_priming_silence_from_playback_buffer() {
+fn trims_short_aac_edge_silence_from_playback_buffer() {
     let mut samples = vec![0i16; 40];
-    samples.extend_from_slice(&[1000; 80]);
+    samples.extend_from_slice(&[10; 5]);
+    samples.extend_from_slice(&[1000; 75]);
+    samples.extend_from_slice(&[5; 6]);
+    samples.extend_from_slice(&[0; 30]);
     let buffer = LoopBuffer {
         samples,
         channels: 1,
         rate: 1000,
     };
-    let trimmed = trim_aac_priming_silence(buffer);
-    assert_eq!(trimmed.frames(), 80);
+    let trimmed = trim_aac_edge_silence(buffer);
+    assert_eq!(trimmed.frames(), 75);
     assert_eq!(trimmed.samples[0], 1000);
+    assert_eq!(trimmed.samples.last(), Some(&1000));
 }
 
 #[test]
@@ -134,10 +138,7 @@ fn leaves_long_or_silent_aac_prefixes_untouched() {
         channels: 1,
         rate: 1000,
     };
-    assert_eq!(
-        trim_aac_priming_silence(long.clone()).frames(),
-        long.frames()
-    );
+    assert_eq!(trim_aac_edge_silence(long.clone()).frames(), long.frames());
 
     let silence = LoopBuffer {
         samples: vec![0; 100],
@@ -145,7 +146,7 @@ fn leaves_long_or_silent_aac_prefixes_untouched() {
         rate: 1000,
     };
     assert_eq!(
-        trim_aac_priming_silence(silence.clone()).frames(),
+        trim_aac_edge_silence(silence.clone()).frames(),
         silence.frames()
     );
 }

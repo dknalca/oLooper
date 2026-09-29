@@ -6,6 +6,9 @@ import {
   playerPause,
   playerPlay,
   playerSeek,
+  playerAutoLoop,
+  playerSetLoopEnabled,
+  playerSetLoopSnapped,
   playerSetSpeed,
   playerSetVolume,
   playerStatus,
@@ -32,12 +35,18 @@ interface Props {
   canNavigateTracks: boolean;
   onPreviousTrack: () => void;
   onNextTrack: () => void;
+  loopEditing: boolean;
+  onToggleLoopEditing: () => void;
   onStatusChange: (status: PlayerStatus) => void;
 }
 
-export default function Player({ status: st, trackId, canRandom, onRandomTrack, canNavigateTracks, onPreviousTrack, onNextTrack, onStatusChange }: Props) {
+export default function Player({ status: st, trackId, canRandom, onRandomTrack, canNavigateTracks, onPreviousTrack, onNextTrack, loopEditing, onToggleLoopEditing, onStatusChange }: Props) {
   const [error, setError] = useState<string | null>(null);
   const scrubRef = useRef<HTMLDivElement>(null);
+  const loopStartRef = useRef<HTMLInputElement>(null);
+  const loopEndRef = useRef<HTMLInputElement>(null);
+  const [loopStart, setLoopStart] = useState("0");
+  const [loopEnd, setLoopEnd] = useState("");
   const [isScrubbing, setIsScrubbing] = useState(false);
   const [randomEnabled, setRandomEnabled] = useState(false);
   const [randomInterval, setRandomInterval] = useState<"2" | "5" | "custom">("2");
@@ -87,6 +96,16 @@ export default function Player({ status: st, trackId, canRandom, onRandomTrack, 
   const statusRef = useRef(st);
 
   useEffect(() => { statusRef.current = st; }, [st]);
+
+  useEffect(() => {
+    if (!st?.loaded) {
+      setLoopStart("0");
+      setLoopEnd("");
+      return;
+    }
+    if (document.activeElement !== loopStartRef.current) setLoopStart(String(st.loop_start_ms));
+    if (document.activeElement !== loopEndRef.current) setLoopEnd(String(st.loop_end_ms));
+  }, [st?.path, st?.loaded, st?.loop_start_ms, st?.loop_end_ms]);
 
   useEffect(() => {
     window.dispatchEvent(new CustomEvent<LoopSlot[]>("olooper:cues", { detail: slots }));
@@ -211,6 +230,26 @@ export default function Player({ status: st, trackId, canRandom, onRandomTrack, 
       setSlots((current) => current.filter((item) => item.slot !== slot));
       if (activeSlot === slot) setActiveSlot(1);
     }).catch((e) => setError(String(e)));
+  };
+
+  const applyManualLoop = () => {
+    const start = Number(loopStart);
+    const end = Number(loopEnd);
+    if (!Number.isFinite(start) || !Number.isFinite(end)) {
+      setError("Loop boundaries must be valid times in milliseconds.");
+      return;
+    }
+    run(playerSetLoopSnapped(start, end));
+  };
+
+  const detectLoop = () => {
+    run(playerAutoLoop().then((result) => {
+      if (!result.candidate) throw new Error("No suitable loop found");
+      return playerSetLoopSnapped(
+        Math.round(result.candidate.start_frame * 1000 / result.sample_rate),
+        Math.round(result.candidate.end_frame * 1000 / result.sample_rate),
+      );
+    }));
   };
 
   useEffect(() => {
@@ -362,7 +401,7 @@ export default function Player({ status: st, trackId, canRandom, onRandomTrack, 
           <div className="w-px h-5 bg-border" />
 
           {/* Cue selector */}
-         {loaded && trackId && (
+        {loaded && trackId && (
            <div className="flex items-center gap-1">
              <span className="mr-1 text-[9px] font-semibold uppercase tracking-wide text-text-secondary">CUE</span>
              {SLOT_LABELS.map((label, i) => {
@@ -402,6 +441,15 @@ export default function Player({ status: st, trackId, canRandom, onRandomTrack, 
             })}
           </div>
         )}
+
+        <button
+          onClick={onToggleLoopEditing}
+          aria-expanded={loopEditing}
+          aria-controls="loop-edit-controls"
+          disabled={!loaded}
+          title={loopEditing ? "Hide loop editing controls" : "Show loop editing controls"}
+          className={`rounded px-2 py-1 text-[10px] font-medium transition-colors disabled:opacity-30 ${loopEditing ? "bg-accent/20 text-accent" : "bg-border text-text-secondary hover:text-text"}`}
+        >{loopEditing ? "Loop controls ▲" : "Loop controls ▼"}</button>
 
         <div className="flex items-center gap-1.5">
           <button
@@ -448,6 +496,58 @@ export default function Player({ status: st, trackId, canRandom, onRandomTrack, 
           <span className="text-[10px] text-danger truncate max-w-64" role="alert">{shownError}</span>
         )}
       </div>
+      {loopEditing && (
+        <div id="loop-edit-controls" className="flex flex-wrap items-center gap-2 border-t border-border pt-2">
+          <button
+            onClick={() => run(playerSetLoopEnabled(!st?.loop_enabled))}
+            disabled={!loaded}
+            aria-pressed={st?.loop_enabled ?? false}
+            className={`rounded px-2 py-1 text-[10px] font-medium disabled:opacity-40 ${st?.loop_enabled ? "bg-success/20 text-success" : "bg-border text-text-secondary hover:text-text"}`}
+          >{st?.loop_enabled ? "LOOP ON" : "LOOP OFF"}</button>
+          <button
+            onClick={detectLoop}
+            disabled={!loaded}
+            className="rounded bg-border px-2 py-1 text-[10px] text-text-secondary hover:text-text disabled:opacity-40"
+          >AUTO</button>
+          <label className="flex items-center gap-1 text-[10px] text-text-secondary">
+            Start
+            <input
+              ref={loopStartRef}
+              type="number"
+              min={0}
+              max={st?.duration_ms ?? 0}
+              value={loopStart}
+              onChange={(event) => setLoopStart(event.target.value)}
+              disabled={!loaded}
+              aria-label="Loop start in milliseconds"
+              className="w-20 rounded border border-border bg-elevated px-1.5 py-1 text-center font-mono text-text disabled:opacity-40"
+            />
+            ms
+          </label>
+          <span className="text-[10px] text-text-secondary">–</span>
+          <label className="flex items-center gap-1 text-[10px] text-text-secondary">
+            End
+            <input
+              ref={loopEndRef}
+              type="number"
+              min={0}
+              max={st?.duration_ms ?? 0}
+              value={loopEnd}
+              onChange={(event) => setLoopEnd(event.target.value)}
+              disabled={!loaded}
+              aria-label="Loop end in milliseconds"
+              className="w-20 rounded border border-border bg-elevated px-1.5 py-1 text-center font-mono text-text disabled:opacity-40"
+            />
+            ms
+          </label>
+          <button
+            onClick={applyManualLoop}
+            disabled={!loaded}
+            className="rounded bg-accent/15 px-2.5 py-1 text-[10px] font-medium text-accent hover:bg-accent/25 disabled:opacity-40"
+          >Apply</button>
+          <span className="text-[10px] text-text-secondary">Drag a loop edge on the waveform to adjust it.</span>
+        </div>
+      )}
     </div>
   );
 }

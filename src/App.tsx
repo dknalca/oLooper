@@ -20,6 +20,7 @@ export default function App() {
   const [trackNavigator, setTrackNavigator] = useState<TrackNavigator | null>(null);
   const [libraryView, setLibraryView] = useState<"local" | "tablist">("local");
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
+  const [loopEditing, setLoopEditing] = useState(false);
   const randomLoadGeneration = useRef(0);
 
   const onLibraryReady = useCallback(() => setLibraryReady(true), []);
@@ -104,7 +105,7 @@ export default function App() {
 
       <main className="flex flex-1 min-h-0 flex-col">
         <div className="h-1/5 min-h-36 shrink-0 p-3">
-          <Waveform refreshKey={refreshKey} status={playerStatus} trackTitle={activeTrack?.title ?? null} onStatusChange={setPlayerStatus} />
+          <Waveform refreshKey={refreshKey} status={playerStatus} trackTitle={activeTrack?.title ?? null} loopEditing={loopEditing} onStatusChange={setPlayerStatus} />
         </div>
         <Player
           status={playerStatus}
@@ -114,6 +115,8 @@ export default function App() {
           canNavigateTracks={trackNavigator !== null}
           onPreviousTrack={() => trackNavigator?.(-1)}
           onNextTrack={() => trackNavigator?.(1)}
+          loopEditing={loopEditing}
+          onToggleLoopEditing={() => setLoopEditing((editing) => !editing)}
           onStatusChange={setPlayerStatus}
         />
         <section className="flex min-h-0 flex-1 flex-col border-t border-border">

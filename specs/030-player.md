@@ -29,8 +29,9 @@ Waveform rendering and library integration are separate specs.
    also polls while `loading` or `pitch_preparing` is set.
 7. Keyboard shortcuts (spec 060): Space (play/pause), S (stop), arrows (seek),
    and L (loop toggle). Previous/next transport buttons move through the
-   tracks shown in the selected library view. LOOP, AUTO, and PITCH LOCK controls
-   are currently hidden; manual loop-boundary editing is not exposed.
+   tracks shown in the selected library view. Loop enablement, AUTO detection,
+   and manual boundaries are in the collapsible Loop controls panel. PITCH LOCK
+   remains hidden.
 8. The transport labels the saved slot buttons with **CUE**. Cues `1`–`4`:
     cue `1` always seeks to the track start. Cues `2`–`4` start empty, capture
     the current playback position on first click, seek on later clicks, can be
@@ -61,7 +62,7 @@ Waveform rendering and library integration are separate specs.
 ## Supported inputs
 
 - Files rodio/Symphonia can decode (MP3, WAV, and Tablist AAC/M4A). M4A playback
-  trims up to 150 ms of near-zero leading AAC pre-roll; other formats are intact.
+  trims up to 150 ms of near-zero AAC padding at either edge; other formats are intact.
   Undecodable → typed error, previous track (if any) keeps its state.
 
 ## Outputs
