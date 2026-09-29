@@ -25,6 +25,20 @@ Whether you're digging through classic Flash loopers or building a personal crat
 
 It is designed for **scratch DJs, beat jugglers, and turntablists** who want to spend less time managing loop files and more time practicing.
 
+## Screenshots
+
+<p align="center">
+  <img src="docs/screenshots/library.png" alt="Screenshot of the running oLooper app showing the Favorites crate, waveform, BPM, and local loop library" width="900" />
+</p>
+<p align="center"><em>Keep a crate of favorite breaks and see BPM and waveform detail at a glance.</em></p>
+
+<p align="center">
+  <img src="docs/screenshots/practice-player.png" alt="Screenshot of the running oLooper app showing the waveform, loop bounds, CUEs, and manual loop controls" width="900" />
+</p>
+<p align="center"><em>Set loop boundaries, work your cues, and run the break back.</em></p>
+
+<p align="center"><sub>These are real captures of oLooper running. Track names and audio in the screenshots are generated demo material, not downloads from Tablist or a user's library.</sub></p>
+
 ## What oLooper does
 
 ### Bring your loopers into one library
