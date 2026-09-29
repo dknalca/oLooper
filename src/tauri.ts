@@ -374,7 +374,8 @@ export type AppMenuCommand =
   | "open-swf"
   | "open-exe"
   | "import-audio"
-  | "choose-library";
+  | "choose-library"
+  | "show-shortcuts";
 
 export function listenAppMenuCommand(
   handler: (command: AppMenuCommand) => void,

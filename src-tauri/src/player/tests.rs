@@ -112,6 +112,45 @@ fn synthetic_wav_decodes_end_to_end() {
 }
 
 #[test]
+fn trims_short_aac_priming_silence_from_playback_buffer() {
+    let mut samples = vec![0i16; 40];
+    samples.extend_from_slice(&[1000; 80]);
+    let buffer = LoopBuffer {
+        samples,
+        channels: 1,
+        rate: 1000,
+    };
+    let trimmed = trim_aac_priming_silence(buffer);
+    assert_eq!(trimmed.frames(), 80);
+    assert_eq!(trimmed.samples[0], 1000);
+}
+
+#[test]
+fn leaves_long_or_silent_aac_prefixes_untouched() {
+    let mut long_silence = vec![0i16; 180];
+    long_silence.extend_from_slice(&[1000; 20]);
+    let long = LoopBuffer {
+        samples: long_silence,
+        channels: 1,
+        rate: 1000,
+    };
+    assert_eq!(
+        trim_aac_priming_silence(long.clone()).frames(),
+        long.frames()
+    );
+
+    let silence = LoopBuffer {
+        samples: vec![0; 100],
+        channels: 1,
+        rate: 1000,
+    };
+    assert_eq!(
+        trim_aac_priming_silence(silence.clone()).frames(),
+        silence.frames()
+    );
+}
+
+#[test]
 fn malformed_m4a_returns_error_without_panicking() {
     let bytes = [0, 0, 0, 8, b'f', b't', b'y', b'p', 0, 0, 0, 0];
     assert!(decode_bytes(&bytes).is_err());

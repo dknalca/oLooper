@@ -18,8 +18,9 @@ slots.
    flagged per-track (`exists: false`), never silently dropped or duplicated.
 4. Cue/loop/BPM edits persist per track and are never overwritten by later
    imports or re-analysis.
-5. 4 loop slots (A–D) per track, stored in `loop_slots` table. Slots persist
-   across sessions. Deleting a track cascades to delete its slots.
+5. Four numbered cue slots per track are stored in `loop_slots`. Cues 2–4
+   persist across sessions; cue 1 is the fixed track start. Removing a track
+   cascades to delete its saved cues.
 6. The left pane lists **Favoritos** first, followed by loopers; selecting one
    shows its tracks in the right pane. Tracks show their name, duration, and BPM. Automatically
    analyzed BPM is normalized by octave into 65–150 BPM; user-entered BPM is

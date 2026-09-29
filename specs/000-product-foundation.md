@@ -15,7 +15,8 @@ practice with a persistent local library, prepare cue/loop metadata
 4. Library persists across restarts; missing/moved files reported, never silently duplicated.
 5. Infinite (perceptually gapless) looping with scrolling waveform, BPM and cue/slot controls.
 6. Keyboard shortcuts for hands-free practice: Space (play/pause), S (stop), arrows (seek), L (loop toggle).
-7. 4 named cue/loop slots (A–D) per track, persisted to SQLite, auto-load on track select.
+7. Four numbered CUE controls per track; cues 2–4 persist to SQLite and cue 1
+   always returns to track start.
 8. Native OS file dialogs for importing SWF/EXE/audio and selecting library root.
 9. File/Edit application menus, plus dark UI with Tailwind CSS: two-pane library,
    transport controls, and track-management menus.

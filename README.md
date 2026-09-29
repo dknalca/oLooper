@@ -17,10 +17,10 @@ A desktop app for DJs and turntablists to extract and practice with audio loops 
 - **Speed control** — 50–200% playback speed in 5% steps; each new track starts at 100%
 - **BPM detection** — automatic energy-flux onset analysis, normalized to 65–150 BPM; manual BPM overrides are preserved
 - **Waveform display** — current loop name, scrolling waveform, loop overlay, click-to-seek, and persistent disk cache
-- **4 cue slots** — labeled CUE 1–4, persisted to SQLite, auto-load on select
+- **CUE 1–4** — cue 1 is track start; cues 2–4 are saved per track
 - **Two-pane library** — select a looper or **Favoritos** on the left and browse its loops on the right
 - **Favorites** — mark loops for the cross-library Favoritos view
-- **Keyboard shortcuts** — Space, S, arrows, L, +, -, Cmd+O for hands-free practice
+- **Keyboard shortcuts** — Space, S, arrows, L, cues 1–4, Shift+2–4 to clear, +/−, Cmd+O; Help menu lists them
 - **Library management** — search and filter loops; alphabetical order by default, clickable BPM sort, export, and context menus
 - **Looper groups** — rename folders; removing a track/group deletes its library audio copy and cover while preserving original source files
 - **Import progress** — per-file stage, elapsed time, and cancellation

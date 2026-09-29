@@ -1,20 +1,20 @@
-# 070 — Loop Slots
+# 070 — Cue Slots
 
 ## Scope
 
-Multiple named cue/loop points per track, persisted to SQLite.
-Four slots (A–D) allow the user to save and recall different loop
-regions without overwriting each other.
+Four numbered cue slots per track, persisted to SQLite. Cue 1 is fixed at the
+track start; cues 2–4 save and recall positions without replacing one another.
 
 ## User-visible behavior
 
-1. When a track is loaded, the player shows four slot buttons: A B C D.
-2. Clicking an empty slot saves the current cue/loop values to that slot.
-3. Clicking a filled slot loads its cue/loop values into the player.
-4. The active slot is highlighted; slots with saved data show a distinct
-   visual style (filled dot / colored background).
-5. Loading a track auto-loads slot A if it exists and is enabled.
-6. Slot data persists across sessions in the SQLite database.
+1. The player shows buttons CUE 1–4. Cue 1 always seeks to the track start.
+2. Clicking an empty cue 2–4 saves the current playback position and loop data.
+3. Clicking a saved cue seeks to its saved playback position.
+4. The active cue is highlighted; saved cues have a distinct visual style.
+5. Cues 2–4 persist across sessions in SQLite; loading a track does not
+   automatically seek to a saved cue.
+6. Pressing `1`–`4` recalls a cue or saves it if empty. `Shift+2`–`Shift+4`
+   deletes a saved cue. `Shift+1` seeks to cue 1; cue 1 cannot be deleted.
 
 ## Architecture
 
@@ -52,8 +52,8 @@ Tauri commands: `library_get_slots`, `library_set_slot`, `library_delete_slot`.
 ### Frontend
 
 - `src/tauri.ts`: `LoopSlot` interface, `libraryGetSlots`, `librarySetSlot`, `libraryDeleteSlot` wrappers.
-- `src/components/Player.tsx`: slot selector buttons, save/load logic, auto-load slot A on track load.
-- Track ID passed via `olooper:track-loaded` custom event from Sidebar.
+- `src/components/Player.tsx`: CUE 1–4 controls and keyboard save/load/delete actions.
+- App passes the active library track ID to Player.
 
 ## Failure behavior
 
@@ -75,12 +75,11 @@ Tauri commands: `library_get_slots`, `library_set_slot`, `library_delete_slot`.
 
 ## Acceptance criteria
 
-- [x] Four slot buttons (A–D) appear when a track is loaded.
-- [x] Clicking empty slot saves current loop values; button style changes.
-- [x] Clicking filled slot loads its values into the player.
-- [x] Slot A auto-loads on track load if it exists.
-- [x] Slots persist across app restarts.
-- [x] Deleting a track removes its slots (cascade).
+- [x] Four CUE 1–4 buttons appear when a track is loaded.
+- [x] CUE 1 seeks to the start; empty cues 2–4 save the current position.
+- [x] Clicking or pressing a saved cue seeks to its saved position.
+- [x] Shift+2–4 deletes the saved cue; cues persist across restarts.
+- [x] Deleting a track removes its cues (cascade).
 - [x] Schema v1 → v2 migration creates the table without data loss.
 
 ## Non-goals

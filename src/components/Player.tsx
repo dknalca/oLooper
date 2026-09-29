@@ -82,7 +82,11 @@ export default function Player({ status: st, trackId, canRandom, onRandomTrack, 
 
   // Loop slots
   const [slots, setSlots] = useState<LoopSlot[]>([]);
+  const [slotsTrackId, setSlotsTrackId] = useState<number | null>(null);
   const [activeSlot, setActiveSlot] = useState<number>(1);
+  const statusRef = useRef(st);
+
+  useEffect(() => { statusRef.current = st; }, [st]);
 
   useEffect(() => {
     window.dispatchEvent(new CustomEvent<LoopSlot[]>("olooper:cues", { detail: slots }));
@@ -121,14 +125,26 @@ export default function Player({ status: st, trackId, canRandom, onRandomTrack, 
 
   // Load slots when trackId changes.
   useEffect(() => {
+    let cancelled = false;
+    setSlots([]);
+    setSlotsTrackId(null);
+    setActiveSlot(1);
     if (!trackId) {
-      setSlots([]);
-      return;
+      return () => { cancelled = true; };
     }
-    libraryGetSlots(trackId).then((saved) => {
-      setSlots(saved.filter((slot) => slot.slot > 1 && slot.enabled));
-    }).catch(() => setSlots([]));
-  }, [trackId, run]);
+    libraryGetSlots(trackId)
+      .then((saved) => {
+        if (cancelled) return;
+        setSlots(saved.filter((slot) => slot.slot > 1 && slot.enabled));
+      })
+      .catch(() => {
+        if (!cancelled) setSlots([]);
+      })
+      .finally(() => {
+        if (!cancelled) setSlotsTrackId(trackId);
+      });
+    return () => { cancelled = true; };
+  }, [trackId]);
 
   const scrub = (e: React.MouseEvent<HTMLDivElement>) => {
     if (!scrubRef.current || !st?.loaded || st.duration_ms <= 0) return;
@@ -160,11 +176,12 @@ export default function Player({ status: st, trackId, canRandom, onRandomTrack, 
   }, [isScrubbing, st?.loaded, st?.duration_ms]);
 
   const saveToSlot = (slot: number) => {
-    if (!trackId) return;
+    if (!trackId || slotsTrackId !== trackId) return;
     const label = SLOT_LABELS[slot - 1];
-    const cueMs = st?.position_ms ?? 0;
-    const startMs = st?.loop_start_ms ?? 0;
-    const endMs = st?.loop_end_ms ?? 0;
+    const current = statusRef.current;
+    const cueMs = current?.position_ms ?? 0;
+    const startMs = current?.loop_start_ms ?? 0;
+    const endMs = current?.loop_end_ms ?? 0;
     librarySetSlot(trackId, slot, label, cueMs, startMs, endMs, true)
       .then((saved) => {
         setSlots((prev) => {
@@ -181,6 +198,7 @@ export default function Player({ status: st, trackId, canRandom, onRandomTrack, 
   };
 
   const loadSlot = (slot: number) => {
+    if (slotsTrackId !== trackId) return;
     const s = slots.find((sl) => sl.slot === slot);
     if (!s) return;
     setActiveSlot(slot);
@@ -188,12 +206,34 @@ export default function Player({ status: st, trackId, canRandom, onRandomTrack, 
   };
 
   const clearSlot = (slot: number) => {
-    if (!trackId || slot === 1) return;
+    if (!trackId || slotsTrackId !== trackId || slot === 1) return;
     libraryDeleteSlot(trackId, slot).then(() => {
       setSlots((current) => current.filter((item) => item.slot !== slot));
       if (activeSlot === slot) setActiveSlot(1);
     }).catch((e) => setError(String(e)));
   };
+
+  useEffect(() => {
+    const handleCueShortcut = (event: Event) => {
+      const { slot, clear } = (event as CustomEvent<{ slot: number; clear: boolean }>).detail;
+      if (!trackId || !st?.loaded || !Number.isInteger(slot) || slot < 1 || slot > 4) return;
+      setActiveSlot(slot);
+      if (slot === 1) {
+        // CUE 1 is the fixed track-start cue, so Shift+1 returns to its default.
+        run(playerSeek(0));
+      } else if (clear) {
+        clearSlot(slot);
+      } else if (slotsTrackId !== trackId) {
+        return;
+      } else if (slots.some((saved) => saved.slot === slot)) {
+        loadSlot(slot);
+      } else {
+        saveToSlot(slot);
+      }
+    };
+    window.addEventListener("olooper:cue-shortcut", handleCueShortcut);
+    return () => window.removeEventListener("olooper:cue-shortcut", handleCueShortcut);
+  }, [trackId, st?.loaded, activeSlot, slots, slotsTrackId, run]);
 
   const posFrac = st?.loaded && st.duration_ms > 0 ? st.position_ms / st.duration_ms : 0;
   const loaded = st?.loaded ?? false;
@@ -327,12 +367,14 @@ export default function Player({ status: st, trackId, canRandom, onRandomTrack, 
              <span className="mr-1 text-[9px] font-semibold uppercase tracking-wide text-text-secondary">CUE</span>
              {SLOT_LABELS.map((label, i) => {
               const slotNum = i + 1;
-              const hasData = slotNum === 1 || slots.some((s) => s.slot === slotNum);
+              const slotsReady = slotsTrackId === trackId;
+              const hasData = slotNum === 1 || (slotsReady && slots.some((s) => s.slot === slotNum));
               const isActive = activeSlot === slotNum;
               return (
                 <span key={label} className="flex items-center">
                 <button
                   onClick={() => {
+                    if (slotNum > 1 && !slotsReady) return;
                     setActiveSlot(slotNum);
                     if (slotNum === 1) {
                       run(playerSeek(0));
@@ -343,7 +385,8 @@ export default function Player({ status: st, trackId, canRandom, onRandomTrack, 
                     }
                   }}
                   title={hasData ? `Jump to cue ${label}` : `Set cue ${label} at current position`}
-                  className={`w-6 h-6 rounded text-[10px] font-bold transition-colors ${
+                  disabled={slotNum > 1 && !slotsReady}
+                  className={`w-6 h-6 rounded text-[10px] font-bold transition-colors disabled:opacity-40 ${
                     isActive
                       ? "bg-accent text-app"
                       : hasData

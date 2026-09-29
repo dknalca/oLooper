@@ -3,9 +3,10 @@
 ## Goal
 
 Browse the public Tablist looper catalog from the library, then import every
-audio entry from a looper. A Tablist loop is already prepared for repetition:
-preserve its entire duration and published BPM; do not run oLooper's
-loop-boundary suggestion.
+audio entry from a looper. Tablist loops are already prepared for repetition:
+preserve their program duration and published BPM, trim only a short near-silent
+AAC encoder pre-roll during decoding, and do not run oLooper's loop-boundary
+suggestion.
 
 ## Verified Tablist behavior
 
@@ -45,7 +46,9 @@ loop-boundary suggestion.
   progress/errors. Never fetch arbitrary hosts from untrusted page data.
 - Tablist stores tracks as AAC in M4A containers. Include Symphonia AAC/ISO-MP4
   decoding; rodio's built-in MP4 adapter panics during initialization on these
-  files, so `player::decode_bytes` handles ISO-BMFF directly.
+  files, so `player::decode_bytes` handles ISO-BMFF directly. M4A decoding trims
+  up to 150 ms of near-zero leading AAC pre-roll; the downloaded source stays
+  unchanged and a long or entirely silent intro is not trimmed.
 - Use the first page image's largest available path (`path800`, then smaller
   variants) as the group's local `cover.jpg`; fall back to the Meilisearch
   `image` thumbnail when Firestore omits its `images` field. Normalize covers

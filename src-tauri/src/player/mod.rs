@@ -141,9 +141,42 @@ pub fn decode_bytes(data: &[u8]) -> Result<LoopBuffer, String> {
     // seek during initialization for Tablist's M4A files. Decode ISO BMFF
     // directly through Symphonia instead of letting that adapter panic.
     if data.get(4..8) == Some(b"ftyp") {
-        return decode_isomp4(data);
+        return decode_isomp4(data).map(trim_aac_priming_silence);
     }
     decode_owned(data.to_vec())
+}
+
+/// Tablist AAC/M4A files commonly contain a short, exactly silent encoder
+/// pre-roll but omit gapless metadata. Trim only a bounded near-zero prefix from
+/// the playback buffer; the downloaded source file remains unchanged.
+fn trim_aac_priming_silence(buffer: LoopBuffer) -> LoopBuffer {
+    const WINDOW_MS: usize = 10;
+    const MAX_PRIMING_MS: usize = 150;
+    const SILENCE_PEAK: i32 = 64;
+
+    let channels = buffer.channels.max(1) as usize;
+    let rate = buffer.rate as usize;
+    let frames = buffer.frames();
+    if rate == 0 || frames == 0 {
+        return buffer;
+    }
+    let window_frames = (rate * WINDOW_MS / 1000).max(1);
+    let search_frames = (rate * MAX_PRIMING_MS / 1000).min(frames);
+    let first_audible = (0..search_frames).step_by(window_frames).find(|&start| {
+        let end = (start + window_frames).min(frames);
+        buffer.samples[start * channels..end * channels]
+            .iter()
+            .any(|sample| (*sample as i32).abs() > SILENCE_PEAK)
+    });
+    let Some(trim_frames) = first_audible.filter(|&start| start > 0) else {
+        return buffer;
+    };
+
+    LoopBuffer {
+        samples: buffer.samples[trim_frames * channels..].to_vec(),
+        channels: buffer.channels,
+        rate: buffer.rate,
+    }
 }
 
 fn decode_isomp4(data: &[u8]) -> Result<LoopBuffer, String> {
@@ -155,13 +188,12 @@ fn decode_isomp4(data: &[u8]) -> Result<LoopBuffer, String> {
     let source = MediaSourceStream::new(Box::new(Cursor::new(data.to_vec())), Default::default());
     let mut hint = Hint::new();
     hint.with_extension("m4a");
+    let format_options = FormatOptions {
+        enable_gapless: true,
+        ..FormatOptions::default()
+    };
     let mut probed = symphonia::default::get_probe()
-        .format(
-            &hint,
-            source,
-            &FormatOptions::default(),
-            &MetadataOptions::default(),
-        )
+        .format(&hint, source, &format_options, &MetadataOptions::default())
         .map_err(|error| format!("cannot inspect M4A audio: {error}"))?;
     let track = probed
         .format
@@ -190,7 +222,14 @@ fn decode_isomp4(data: &[u8]) -> Result<LoopBuffer, String> {
         rate = decoded.spec().rate;
         let mut interleaved = SampleBuffer::<i16>::new(decoded.capacity() as u64, *decoded.spec());
         interleaved.copy_interleaved_ref(decoded);
-        samples.extend_from_slice(interleaved.samples());
+        let decoded_samples = interleaved.samples();
+        let channels = channels.max(1) as usize;
+        let frame_count = decoded_samples.len() / channels;
+        let trim_start = (packet.trim_start() as usize).min(frame_count);
+        let trim_end = (packet.trim_end() as usize).min(frame_count - trim_start);
+        let start_sample = trim_start * channels;
+        let end_sample = (frame_count - trim_end) * channels;
+        samples.extend_from_slice(&decoded_samples[start_sample..end_sample]);
     }
     if samples.is_empty() || channels == 0 || rate == 0 {
         return Err("M4A stream contains no decodable audio frames".to_string());

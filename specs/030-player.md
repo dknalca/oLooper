@@ -32,9 +32,9 @@ Waveform rendering and library integration are separate specs.
    tracks shown in the selected library view. LOOP, AUTO, and PITCH LOCK controls
    are currently hidden; manual loop-boundary editing is not exposed.
 8. The transport labels the saved slot buttons with **CUE**. Cues `1`–`4`:
-   cue `1` always seeks to the track start. Cues `2`–`4` start
-   empty, capture the current playback position on first click, seek on later
-   clicks, can be cleared, and are drawn on the waveform.
+    cue `1` always seeks to the track start. Cues `2`–`4` start empty, capture
+    the current playback position on first click, seek on later clicks, can be
+    cleared with Shift+cue, and are drawn on the waveform.
 9. `+` and `-` change playback speed in 5% steps from 50% to 200%. This is
    vinyl-style playback, so pitch changes with speed unless pitch lock is on.
 10. Pitch lock is non-blocking: enabling it (or changing speed while locked)
@@ -60,7 +60,8 @@ Waveform rendering and library integration are separate specs.
 
 ## Supported inputs
 
-- Files rodio/Symphonia can decode (MP3, WAV, and Tablist AAC/M4A).
+- Files rodio/Symphonia can decode (MP3, WAV, and Tablist AAC/M4A). M4A playback
+  trims up to 150 ms of near-zero leading AAC pre-roll; other formats are intact.
   Undecodable → typed error, previous track (if any) keeps its state.
 
 ## Outputs
@@ -101,7 +102,7 @@ Waveform rendering and library integration are separate specs.
 - [x] Unit tests cover wrap math + a synthetic WAV end-to-end (no hardware).
 - [x] Manual: an extracted loop from `loopersFlash/` plays and loops audibly.
 - [x] Keyboard shortcuts control transport without mouse.
-- [x] Loop slots A–D save/load correctly; auto-load slot A on track load.
+- [x] CUE 1–4 recall/save as documented; saved cues 2–4 persist per track.
 - [x] Loading another track resets playback speed to 100%.
 
 ## Non-goals

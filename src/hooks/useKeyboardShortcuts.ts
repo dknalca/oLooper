@@ -49,6 +49,15 @@ export default function useKeyboardShortcuts() {
       // Skip other modified shortcuts (allow Cmd+C, Cmd+V, etc.).
       if (e.metaKey || e.ctrlKey || e.altKey) return;
 
+      const cueMatch = /^(?:Digit|Numpad)([1-4])$/.exec(e.code);
+      if (cueMatch) {
+        e.preventDefault();
+        window.dispatchEvent(new CustomEvent("olooper:cue-shortcut", {
+          detail: { slot: Number(cueMatch[1]), clear: e.shiftKey },
+        }));
+        return;
+      }
+
       switch (e.code) {
         case "Space": {
           e.preventDefault();

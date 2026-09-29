@@ -396,15 +396,28 @@ pub fn run() {
                 .separator()
                 .fullscreen()
                 .build()?;
+            let shortcuts = MenuItem::with_id(
+                app,
+                "show-shortcuts",
+                "Keyboard Shortcuts…",
+                true,
+                None::<&str>,
+            )?;
+            let help_menu = SubmenuBuilder::new(app, "Help").item(&shortcuts).build()?;
             let menu = MenuBuilder::new(app)
-                .items(&[&app_menu, &file_menu, &edit_menu, &window_menu])
+                .items(&[&app_menu, &file_menu, &edit_menu, &window_menu, &help_menu])
                 .build()?;
             app.set_menu(menu)?;
             app.on_menu_event(|app, event| {
                 let command = event.id().as_ref();
                 if matches!(
                     command,
-                    "import-files" | "open-swf" | "open-exe" | "import-audio" | "choose-library"
+                    "import-files"
+                        | "open-swf"
+                        | "open-exe"
+                        | "import-audio"
+                        | "choose-library"
+                        | "show-shortcuts"
                 ) {
                     let _ = app.emit("olooper:menu-command", command);
                 }
