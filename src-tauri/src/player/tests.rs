@@ -42,6 +42,22 @@ fn routes_mono_source_to_both_channels_of_selected_pair() {
 }
 
 #[test]
+fn output_reconfiguration_keeps_a_paused_transport_paused() {
+    let (sink, _queue) = Sink::new_idle();
+    let source = LoopRegion::new(mono(vec![1, 2]), 0, 0, 2, true, cursor());
+    queue_routed_source(&sink, source, 2, 0, false);
+    assert!(sink.is_paused());
+}
+
+#[test]
+fn output_reconfiguration_resumes_a_playing_transport() {
+    let (sink, _queue) = Sink::new_idle();
+    let source = LoopRegion::new(mono(vec![1, 2]), 0, 0, 2, true, cursor());
+    queue_routed_source(&sink, source, 2, 0, true);
+    assert!(!sink.is_paused());
+}
+
+#[test]
 fn loop_region_wraps_without_gaps() {
     let buf = mono(vec![0, 1, 2, 3, 4, 5]);
     let c = cursor();

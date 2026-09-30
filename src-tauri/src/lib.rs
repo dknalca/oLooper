@@ -86,45 +86,30 @@ fn portable_root() -> Result<std::path::PathBuf, String> {
     portable_root_for_executable(&executable)
 }
 
-fn portable_library_root() -> Result<std::path::PathBuf, String> {
-    Ok(portable_root()?.join("library"))
-}
-
 fn suggested_library_root(home: &std::path::Path) -> std::path::PathBuf {
     home.join("Documents").join("oLooper_data")
 }
 
-fn portable_sources_root() -> Result<std::path::PathBuf, String> {
-    Ok(portable_root()?.join("loopersFlash"))
-}
-
-fn library_selection_path() -> Result<std::path::PathBuf, String> {
+fn legacy_library_selection_path() -> Result<std::path::PathBuf, String> {
     Ok(portable_root()?.join("olooper-library.json"))
 }
 
-fn save_library_root(root: &str) -> Result<(), String> {
-    let path = library_selection_path()?;
-    let tmp = path.with_extension("json.tmp");
-    let data = serde_json::to_vec(&SavedLibraryRoot {
-        root: root.to_string(),
-    })
-    .map_err(|e| format!("cannot serialize library selection: {e}"))?;
-    std::fs::write(&tmp, data).map_err(|e| format!("cannot save library selection: {e}"))?;
-    if let Err(e) = std::fs::rename(&tmp, &path) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(format!("cannot save library selection: {e}"));
-    }
-    Ok(())
+/// Read and remove the selection file written beside the app by older builds.
+/// New builds persist the selected path as an application preference instead.
+fn take_legacy_library_root() -> Result<Option<String>, String> {
+    let path = legacy_library_selection_path()?;
+    take_legacy_library_root_from(&path)
 }
 
-fn saved_library_root() -> Result<Option<String>, String> {
-    let path = library_selection_path()?;
+fn take_legacy_library_root_from(path: &std::path::Path) -> Result<Option<String>, String> {
     if !path.exists() {
         return Ok(None);
     }
     let data = std::fs::read(&path).map_err(|e| format!("cannot read library selection: {e}"))?;
     let saved: SavedLibraryRoot =
         serde_json::from_slice(&data).map_err(|e| format!("cannot read library selection: {e}"))?;
+    std::fs::remove_file(&path)
+        .map_err(|e| format!("cannot remove old library selection file: {e}"))?;
     Ok(Some(saved.root))
 }
 
@@ -181,11 +166,10 @@ fn emit_import_done(
     );
 }
 
-fn copy_dropped_source(path: &str, data: &[u8]) -> Result<String, String> {
-    let source_dir = portable_sources_root()?;
-    std::fs::create_dir_all(&source_dir).map_err(|e| {
-        format!("cannot create loopersFlash beside the app; move the app to a writable folder: {e}")
-    })?;
+fn copy_dropped_source(root: &std::path::Path, path: &str, data: &[u8]) -> Result<String, String> {
+    let source_dir = root.join("loopersFlash");
+    std::fs::create_dir_all(&source_dir)
+        .map_err(|e| format!("cannot create loopersFlash inside the selected library: {e}"))?;
     copy_dropped_source_to(&source_dir, path, data)
 }
 
@@ -476,7 +460,6 @@ pub fn run() {
             player_set_diagnostics,
             library_default_root,
             library_init,
-            library_portable_init,
             library_restore,
             library_status,
             library_list,
@@ -671,25 +654,13 @@ fn require_lib<'a>(
         .ok_or_else(|| "library not initialized".to_string())
 }
 
-fn init_portable_library(db: &Db<'_>) -> Result<String, String> {
-    let root = portable_library_root()?;
-    let lib = library::Library::open(&root).map_err(|e| {
-        format!("cannot open library beside the app; move the app to a writable folder: {e}")
-    })?;
-    let canonical = lib.root.canonicalize().map_err(|e| e.to_string())?;
-    *db.lock().map_err(|e| e.to_string())? = Some(lib);
-    Ok(canonical.to_string_lossy().to_string())
-}
-
 #[tauri::command]
 fn library_default_root() -> Result<String, String> {
     let home = std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(std::path::PathBuf::from);
-    let root = match home {
-        Some(home) => suggested_library_root(&home),
-        None => portable_library_root()?,
-    };
+        .map(std::path::PathBuf::from)
+        .ok_or_else(|| "cannot determine the user's home directory".to_string())?;
+    let root = suggested_library_root(&home);
     Ok(root.to_string_lossy().to_string())
 }
 
@@ -698,14 +669,17 @@ fn library_init(root: String, db: Db<'_>) -> Result<String, String> {
     let lib = library::Library::open(std::path::Path::new(&root))?;
     let canonical = lib.root.canonicalize().map_err(|e| e.to_string())?;
     let root = canonical.to_string_lossy().to_string();
-    save_library_root(&root)?;
     *db.lock().map_err(|e| e.to_string())? = Some(lib);
     Ok(root)
 }
 
 #[tauri::command]
-fn library_restore(db: Db<'_>) -> Result<Option<String>, String> {
-    let Some(root) = saved_library_root()? else {
+fn library_restore(root: Option<String>, db: Db<'_>) -> Result<Option<String>, String> {
+    let root = match root {
+        Some(root) => Some(root),
+        None => take_legacy_library_root()?,
+    };
+    let Some(root) = root else {
         return Ok(None);
     };
     let path = std::path::Path::new(&root);
@@ -716,11 +690,6 @@ fn library_restore(db: Db<'_>) -> Result<Option<String>, String> {
     let canonical = lib.root.canonicalize().map_err(|e| e.to_string())?;
     *db.lock().map_err(|e| e.to_string())? = Some(lib);
     Ok(Some(canonical.to_string_lossy().to_string()))
-}
-
-#[tauri::command]
-fn library_portable_init(db: Db<'_>) -> Result<String, String> {
-    init_portable_library(&db)
 }
 
 #[tauri::command]
@@ -1029,7 +998,7 @@ fn run_container_job(app: &tauri::AppHandle, job: &ImportJob, exe: bool) {
             return;
         }
     };
-    let copied_path = match copy_dropped_source(path, &data) {
+    let copied_path = match copy_dropped_source(&job.root, path, &data) {
         Ok(path) => path,
         Err(e) => {
             fail(e);
@@ -1509,6 +1478,34 @@ mod tests {
     }
 
     #[test]
+    fn legacy_app_side_library_selection_is_migrated_and_removed() {
+        let dir = std::env::temp_dir().join(format!(
+            "olooper-legacy-selection-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let selection = dir.join("olooper-library.json");
+        std::fs::write(
+            &selection,
+            serde_json::to_vec(&SavedLibraryRoot {
+                root: "/Users/dj/Documents/oLooper_data".to_string(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            take_legacy_library_root_from(&selection).unwrap(),
+            Some("/Users/dj/Documents/oLooper_data".to_string()),
+        );
+        assert!(!selection.exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn source_copy_preserves_bytes_deduplicates_and_avoids_collisions() {
         let root = std::env::temp_dir().join(format!(
             "olooper-source-copy-{}",
@@ -1519,16 +1516,21 @@ mod tests {
         ));
         std::fs::create_dir_all(&root).unwrap();
 
-        let first = copy_dropped_source_to(&root, "/drop/My Looper.swf", b"first").unwrap();
+        let library_root = root.join("selected-library");
+        let source_root = library_root.join("loopersFlash");
+        let first = copy_dropped_source(&library_root, "/drop/My Looper.swf", b"first").unwrap();
         assert_eq!(std::fs::read(&first).unwrap(), b"first");
+        assert!(std::path::Path::new(&first).starts_with(&library_root));
 
-        let repeated = copy_dropped_source_to(&root, "/drop/My Looper.swf", b"first").unwrap();
+        let repeated = copy_dropped_source(&library_root, "/drop/My Looper.swf", b"first").unwrap();
         assert_eq!(repeated, first);
 
-        let collision = copy_dropped_source_to(&root, "/drop/My Looper.swf", b"second").unwrap();
+        let collision =
+            copy_dropped_source(&library_root, "/drop/My Looper.swf", b"second").unwrap();
         assert_ne!(collision, first);
         assert!(collision.ends_with("My Looper (2).swf"));
         assert_eq!(std::fs::read(collision).unwrap(), b"second");
+        assert!(source_root.is_dir());
 
         std::fs::remove_dir_all(root).unwrap();
     }

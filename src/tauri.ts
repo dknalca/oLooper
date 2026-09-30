@@ -263,10 +263,6 @@ function importJobId(): string {
   return crypto.randomUUID();
 }
 
-export function libraryPortableInit(): Promise<string> {
-  return invoke<string>("library_portable_init");
-}
-
 export function libraryDefaultRoot(): Promise<string> {
   return invoke<string>("library_default_root");
 }
@@ -275,8 +271,8 @@ export function libraryInit(root: string): Promise<string> {
   return invoke<string>("library_init", { root });
 }
 
-export function libraryRestore(): Promise<string | null> {
-  return invoke<string | null>("library_restore");
+export function libraryRestore(root: string | null): Promise<string | null> {
+  return invoke<string | null>("library_restore", { root });
 }
 
 export function libraryList(): Promise<Track[]> {

@@ -74,5 +74,5 @@ loop-boundary suggestion.
   play and loop across the full file. The direct-Rust Firestore endpoint itself
   is expected to reject requests without the webview-issued App Check token.
 - Fast network/decoder probe without building the app: from `src-tauri/`, run
-  `cargo run --example tablist_download_test -- <Tablist URL...>`; downloads
+  `cargo run --example tablist_download_test --features manual-tablist-probe -- <Tablist URL...>`; downloads
   appear under `../.dev/tablist-downloads/`.

@@ -1,6 +1,6 @@
 [package]
 name = "olooper"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 rust-version = "1.87"
 
@@ -19,12 +19,21 @@ midir = "0.10"
 cpal = "0.15"
 rodio = { version = "0.20", features = ["symphonia-aac", "symphonia-isomp4"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
-reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "rustls", "system-proxy"] }
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "rustls-no-provider", "system-proxy"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 sha2 = "0.10"
 symphonia = { version = "0.5", default-features = false, features = ["aac", "isomp4"] }
 wsola = "0.1"
 
+[[example]]
+name = "tablist_download_test"
+test = false
+required-features = ["manual-tablist-probe"]
+
 [dev-dependencies]
+
+[features]
+manual-tablist-probe = []
 
 # Keep extracted-MP3 imports usable in dev bundles: Symphonia's decode loop is
 # CPU-bound and otherwise runs in fully unoptimized debug mode.

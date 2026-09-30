@@ -8,8 +8,8 @@ Import a dropped `.swf` or projector `.exe` from anywhere in the window into a p
 
 - Development builds use the directory containing the executable.
 - macOS app bundles use the directory containing `oLooper.app`, never `oLooper.app/Contents`.
-- Sources are atomically copied to `loopersFlash/` beside the app bundle/executable.
-- The first launch asks the user to confirm a library directory, suggesting `~/Documents/oLooper_data`. The selected path is saved in portable configuration beside the app.
+- Dropped SWF/EXE sources are atomically copied to `<selected-library>/loopersFlash/`.
+- The first launch asks the user to confirm a library directory, suggesting `~/Documents/oLooper_data`. The selected path is remembered in application preferences, not beside the app bundle.
 - Extracted files are atomically written to `<selected-library>/<sanitized-looper-name>/NN_<sound-id>.mp3`.
 - `<selected-library>/olooper.db` stores catalog data. Existing configurable libraries are not migrated automatically; they remain intact and can be imported again.
 
@@ -28,12 +28,12 @@ Import a dropped `.swf` or projector `.exe` from anywhere in the window into a p
 
 - Invalid extension, malformed content, inaccessible roots, or failed writes show a clear error and leave the source untouched.
 - No partial extracted output is left after a failed individual write. Existing files and catalog rows are never overwritten.
-- If the directory beside an installed app is not writable, import fails with a message to move the app to a writable folder.
+- If the selected library is not writable, import fails with a message to choose a writable library folder.
 
 ## Security and non-goals
 
 - SWF/EXE/audio remain untrusted data and are never executed.
-- Parsing and decompression stay bounded; writes remain confined to `library/` and `loopersFlash/`.
+- Parsing and decompression stay bounded; imported data and copied sources remain confined to the selected library root.
 - Import queue state is not persisted across app restarts; existing library data
   remains on disk when another library is selected.
 

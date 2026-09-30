@@ -1,6 +1,7 @@
 //! Public Tablist.net weblooper lookup and audio downloads.
 
 use std::io::Read;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use reqwest::blocking::{Client, Response};
@@ -464,6 +465,12 @@ pub fn download_cover(path: &str, page_url: &str) -> Result<Vec<u8>, String> {
 }
 
 fn client_for(host: &'static str) -> Result<Client, String> {
+    static RUSTLS_PROVIDER: OnceLock<()> = OnceLock::new();
+    RUSTLS_PROVIDER.get_or_init(|| {
+        if rustls::crypto::CryptoProvider::get_default().is_none() {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+        }
+    });
     Client::builder()
         .timeout(Duration::from_secs(45))
         .redirect(redirect::Policy::custom(move |attempt| {
@@ -626,6 +633,11 @@ fn field_number(fields: &Value, name: &str) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn secure_reqwest_client_builds_with_the_selected_rustls_provider() {
+        assert!(client_for("files.tablist.net").is_ok());
+    }
 
     #[test]
     fn accepts_only_tablist_looper_pages() {

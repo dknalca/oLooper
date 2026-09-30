@@ -59,9 +59,12 @@ export default function TopBar({ onLibraryReady, playing, onAudioOptions }: Prop
 
   useEffect(() => {
     let cancelled = false;
-    Promise.all([getAppStatus(), libraryDefaultRoot(), libraryRestore()])
+    const rememberedRoot = localStorage.getItem("olooper.library.root");
+    Promise.all([getAppStatus(), libraryDefaultRoot(), libraryRestore(rememberedRoot)])
       .then(([appStatus, defaultRoot, savedRoot]) => {
         if (cancelled) return;
+        if (savedRoot) localStorage.setItem("olooper.library.root", savedRoot);
+        else if (rememberedRoot) localStorage.removeItem("olooper.library.root");
         setRoot(savedRoot ?? defaultRoot);
         setStatus({ ...appStatus, library_set: savedRoot !== null });
         if (savedRoot) onLibraryReady(savedRoot);
@@ -88,6 +91,7 @@ export default function TopBar({ onLibraryReady, playing, onAudioOptions }: Prop
     libraryInit(root)
       .then((libraryRoot) => {
         setStatus((current) => current ? { ...current, library_set: true } : current);
+        localStorage.setItem("olooper.library.root", libraryRoot);
         setRoot(libraryRoot);
         setSetupOpen(false);
         onLibraryReady(libraryRoot);
@@ -111,7 +115,7 @@ export default function TopBar({ onLibraryReady, playing, onAudioOptions }: Prop
               onClick={() => setSetupOpen(true)}
               className={`text-[10px] px-1.5 py-0.5 rounded ${status.library_set ? "bg-success/20 text-success" : "bg-danger/20 text-danger"}`}
             >
-              {status.library_set ? "library ready" : "set library"}
+              {status.library_set ? "change library" : "set library"}
             </button>
           </>
         )}

@@ -204,6 +204,26 @@ impl rodio::Source for RoutedLoopRegion {
     }
 }
 
+fn queue_routed_source(
+    sink: &Sink,
+    source: LoopRegion,
+    output_channels: u16,
+    first_channel: u16,
+    resume_playback: bool,
+) {
+    // Sink::try_new starts playing immediately, so always pause before
+    // appending. Restore playback only when the transport was running.
+    sink.pause();
+    sink.append(RoutedLoopRegion::new(
+        source,
+        output_channels,
+        first_channel,
+    ));
+    if resume_playback {
+        sink.play();
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AudioOutputDevice {
     pub id: String,
@@ -283,7 +303,15 @@ fn open_output(
                 required_channels
             )
         })?;
-        let rate = if config.min_sample_rate().0 <= 48_000 && config.max_sample_rate().0 >= 48_000 {
+        let preferred_rate = device
+            .default_output_config()
+            .map(|config| config.sample_rate().0)
+            .unwrap_or(48_000);
+        let rate = if config.min_sample_rate().0 <= preferred_rate
+            && config.max_sample_rate().0 >= preferred_rate
+        {
+            preferred_rate
+        } else if config.min_sample_rate().0 <= 48_000 && config.max_sample_rate().0 >= 48_000 {
             48_000
         } else {
             config.min_sample_rate().0
@@ -294,6 +322,11 @@ fn open_output(
             .map_err(|error| format!("cannot open selected audio channels: {error}"))?;
         (stream, handle, channels)
     };
+    if channels < required_channels {
+        return Err(format!(
+            "selected output pair requires {required_channels} channels, but the device opened {channels}"
+        ));
+    }
     Ok((stream, handle, channels))
 }
 
@@ -600,6 +633,11 @@ impl Player {
             .as_ref()
             .is_some_and(|sink| !sink.is_paused() && !sink.empty());
         let had_sink = self.sink.is_some();
+        if was_playing {
+            if let Some(sink) = &self.sink {
+                sink.pause();
+            }
+        }
         let new_sink = if had_sink {
             if let Some(track) = self.track.as_mut() {
                 let from = track.cursor.load(Ordering::Relaxed);
@@ -612,17 +650,26 @@ impl Player {
                     track.enabled,
                     track.cursor.clone(),
                 );
-                let sink = Sink::try_new(&handle).map_err(|error| error.to_string())?;
+                let sink = match Sink::try_new(&handle) {
+                    Ok(sink) => sink,
+                    Err(error) => {
+                        if was_playing {
+                            if let Some(sink) = &self.sink {
+                                sink.play();
+                            }
+                        }
+                        return Err(error.to_string());
+                    }
+                };
                 sink.set_volume(track.volume);
                 sink.set_speed(if track.pitch_lock { 1.0 } else { track.speed });
-                sink.append(RoutedLoopRegion::new(
+                queue_routed_source(
+                    &sink,
                     source,
                     output_channels,
                     selection.first_channel,
-                ));
-                if was_playing {
-                    sink.play();
-                }
+                    false,
+                );
                 Some(sink)
             } else {
                 None
@@ -636,6 +683,11 @@ impl Player {
         self._stream = stream;
         self.output_channels = output_channels;
         self.first_channel = selection.first_channel;
+        if was_playing {
+            if let Some(sink) = &self.sink {
+                sink.play();
+            }
+        }
         Ok(())
     }
 
