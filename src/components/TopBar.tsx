@@ -12,9 +12,10 @@ import Logo from "./Logo";
 interface Props {
   onLibraryReady: (root: string) => void;
   playing: boolean;
+  onAudioOptions: () => void;
 }
 
-export default function TopBar({ onLibraryReady, playing }: Props) {
+export default function TopBar({ onLibraryReady, playing, onAudioOptions }: Props) {
   const [status, setStatus] = useState<AppStatus | null>(null);
   const [root, setRoot] = useState("");
   const [setupOpen, setSetupOpen] = useState(false);
@@ -114,6 +115,14 @@ export default function TopBar({ onLibraryReady, playing }: Props) {
             </button>
           </>
         )}
+        <button
+          onClick={onAudioOptions}
+          aria-label="Audio output settings"
+          title="Choose audio output device and stereo pair"
+          className="rounded px-2 py-1 text-[10px] text-text-secondary hover:bg-border hover:text-text"
+        >
+          ♫ Audio
+        </button>
         {root && <span className="ml-auto truncate max-w-64 text-[10px] text-text-secondary" title={root}>{root}</span>}
         <div className="flex shrink-0 items-center gap-1.5 rounded bg-elevated px-2 py-1" title="Practice time while audio is playing">
           <span className="text-[9px] uppercase tracking-wide text-text-secondary">Practice</span>
@@ -138,7 +147,7 @@ export default function TopBar({ onLibraryReady, playing }: Props) {
         <div className="fixed inset-0 z-[70] flex items-center justify-center bg-app/80 backdrop-blur-sm">
           <div className="w-[28rem] rounded-lg border border-border bg-surface p-5 shadow-2xl">
             <h2 className="text-base font-semibold text-text">Choose your library folder</h2>
-            <p className="mt-1 text-xs text-text-secondary">Audio will be stored here. The suggested portable location is `./library` next to oLooper.</p>
+            <p className="mt-1 text-xs text-text-secondary">Audio will be stored here. The suggested location is `~/Documents/oLooper_data`; you can choose another folder.</p>
             <div className="mt-4 flex gap-2">
               <input
                 aria-label="Library root path"

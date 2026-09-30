@@ -87,6 +87,29 @@ export function playerStatus(): Promise<PlayerStatus> {
   return invoke<PlayerStatus>("player_status");
 }
 
+export interface AudioOutputDevice {
+  id: string;
+  name: string;
+  channels: number;
+  is_default: boolean;
+}
+
+export interface AudioOutputSelection {
+  deviceName: string | null;
+  firstChannel: number;
+}
+
+export function audioOutputDevices(): Promise<AudioOutputDevice[]> {
+  return invoke<AudioOutputDevice[]>("audio_output_devices");
+}
+
+export function audioSetOutput(selection: AudioOutputSelection): Promise<PlayerStatus> {
+  return invoke<PlayerStatus>("audio_set_output", {
+    deviceName: selection.deviceName,
+    firstChannel: selection.firstChannel,
+  });
+}
+
 export function playerSeek(positionMs: number): Promise<PlayerStatus> {
   return invoke<PlayerStatus>("player_seek", { positionMs });
 }
@@ -375,12 +398,68 @@ export type AppMenuCommand =
   | "open-exe"
   | "import-audio"
   | "choose-library"
-  | "show-shortcuts";
+  | "show-shortcuts"
+  | "audio-options"
+  | "midi-options";
 
 export function listenAppMenuCommand(
   handler: (command: AppMenuCommand) => void,
 ): Promise<UnlistenFn> {
   return listen<AppMenuCommand>("olooper:menu-command", (event) => handler(event.payload));
+}
+
+export type MidiAction =
+  | "play-pause"
+  | "stop"
+  | "previous"
+  | "next"
+  | "toggle-loop"
+  | "auto-loop"
+  | "speed-up"
+  | "speed-down"
+  | "cue-1"
+  | "cue-2"
+  | "cue-3"
+  | "cue-4"
+  | "clear-cue-2"
+  | "clear-cue-3"
+  | "clear-cue-4";
+
+export interface MidiInputInfo {
+  id: string;
+  name: string;
+}
+
+export interface MidiBinding {
+  inputId: string;
+  inputName: string;
+  kind: "note" | "cc";
+  channel: number;
+  number: number;
+}
+
+export interface MidiMessage extends MidiBinding {
+  value: number;
+}
+
+export function midiListInputs(): Promise<MidiInputInfo[]> {
+  return invoke<MidiInputInfo[]>("midi_list_inputs");
+}
+
+export function midiConnectedInput(): Promise<MidiInputInfo | null> {
+  return invoke<MidiInputInfo | null>("midi_connected_input");
+}
+
+export function midiConnect(inputId: string): Promise<MidiInputInfo> {
+  return invoke<MidiInputInfo>("midi_connect", { inputId });
+}
+
+export function midiDisconnect(): Promise<void> {
+  return invoke<void>("midi_disconnect");
+}
+
+export function listenMidiMessage(handler: (message: MidiMessage) => void): Promise<UnlistenFn> {
+  return listen<MidiMessage>("olooper:midi-message", (event) => handler(event.payload));
 }
 
 export interface CustomReport {

@@ -58,6 +58,13 @@ Waveform rendering and library integration are separate specs.
     library track at 2-minute, 5-minute, or custom (1–1440 minute) intervals;
     the timer repeats until disabled and avoids the current track when possible.
 13. The waveform shows the current track name in its upper-left corner.
+14. Audio output follows the system default unless a device and stereo output
+    pair are selected in **oLooper → Audio Output…**. For multichannel devices,
+    decoded mono is duplicated to the chosen pair and stereo is routed left and
+    right to that pair; all other output channels are silent. Changing the
+    selection applies immediately and restarts current playback at its current
+    frame without changing track, loop, speed, volume, or play/pause state.
+    The selection persists locally across launches. See spec 120.
 
 ## Supported inputs
 
@@ -74,6 +81,8 @@ Waveform rendering and library integration are separate specs.
 ## Failure behavior
 
 - No output device → clear error at first play attempt, nothing half-started.
+- A disconnected selected device or unavailable channel pair reports an error
+  and leaves the previous output and playback state intact.
 - Decode failure → error; the source file remains untouched.
 - All player errors user-facing; no panics on bad ms values (clamped).
 
@@ -105,6 +114,8 @@ Waveform rendering and library integration are separate specs.
 - [x] Keyboard shortcuts control transport without mouse.
 - [x] CUE 1–4 recall/save as documented; saved cues 2–4 persist per track.
 - [x] Loading another track resets playback speed to 100%.
+- [ ] Stereo output can follow the system default or route to any supported
+  stereo channel pair on a selected device.
 
 ## Non-goals
 

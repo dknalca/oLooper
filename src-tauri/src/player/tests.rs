@@ -17,6 +17,31 @@ fn cursor() -> Arc<AtomicUsize> {
 }
 
 #[test]
+fn routes_stereo_source_to_selected_multichannel_pair() {
+    let buffer = Arc::new(LoopBuffer {
+        samples: vec![10, 11, 20, 21],
+        channels: 2,
+        rate: 44_100,
+    });
+    let source = LoopRegion::new(buffer, 0, 0, 2, false, cursor());
+    let routed = RoutedLoopRegion::new(source, 4, 1);
+    assert_eq!(rodio::Source::channels(&routed), 4);
+    assert_eq!(routed.collect::<Vec<_>>(), vec![0, 10, 11, 0, 0, 20, 21, 0]);
+}
+
+#[test]
+fn routes_mono_source_to_both_channels_of_selected_pair() {
+    let buffer = Arc::new(LoopBuffer {
+        samples: vec![7, 9],
+        channels: 1,
+        rate: 44_100,
+    });
+    let source = LoopRegion::new(buffer, 0, 0, 2, false, cursor());
+    let routed = RoutedLoopRegion::new(source, 3, 1);
+    assert_eq!(routed.collect::<Vec<_>>(), vec![0, 7, 7, 0, 9, 9]);
+}
+
+#[test]
 fn loop_region_wraps_without_gaps() {
     let buf = mono(vec![0, 1, 2, 3, 4, 5]);
     let c = cursor();

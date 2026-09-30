@@ -9,6 +9,7 @@ use std::io::Cursor;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
+use cpal::traits::{DeviceTrait, HostTrait};
 use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink, Source as _};
 use serde::{Deserialize, Serialize};
 
@@ -133,6 +134,167 @@ impl rodio::Source for LoopRegion {
     fn total_duration(&self) -> Option<std::time::Duration> {
         None
     }
+}
+
+/// Routes a mono/stereo practice source to a selected stereo pair in a
+/// multichannel output stream, leaving every other channel silent.
+struct RoutedLoopRegion {
+    inner: LoopRegion,
+    input_channels: usize,
+    output_channels: u16,
+    first_channel: usize,
+    output_channel: usize,
+    left: Option<i16>,
+    right: Option<i16>,
+}
+
+impl RoutedLoopRegion {
+    fn new(inner: LoopRegion, output_channels: u16, first_channel: u16) -> Self {
+        Self {
+            input_channels: inner.channels().max(1) as usize,
+            inner,
+            output_channels,
+            first_channel: first_channel as usize,
+            output_channel: 0,
+            left: None,
+            right: None,
+        }
+    }
+}
+
+impl Iterator for RoutedLoopRegion {
+    type Item = i16;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.output_channel == 0 {
+            self.left = Some(self.inner.next()?);
+            self.right = Some(if self.input_channels > 1 {
+                self.inner.next()?
+            } else {
+                self.left.unwrap_or_default()
+            });
+            for _ in 2..self.input_channels {
+                self.inner.next()?;
+            }
+        }
+        let channel = self.output_channel;
+        self.output_channel = (self.output_channel + 1) % self.output_channels as usize;
+        if channel == self.first_channel {
+            self.left
+        } else if channel == self.first_channel + 1 {
+            self.right
+        } else {
+            Some(0)
+        }
+    }
+}
+
+impl rodio::Source for RoutedLoopRegion {
+    fn current_frame_len(&self) -> Option<usize> {
+        None
+    }
+    fn channels(&self) -> u16 {
+        self.output_channels
+    }
+    fn sample_rate(&self) -> u32 {
+        self.inner.sample_rate()
+    }
+    fn total_duration(&self) -> Option<std::time::Duration> {
+        self.inner.total_duration()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AudioOutputDevice {
+    pub id: String,
+    pub name: String,
+    pub channels: u16,
+    pub is_default: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OutputSelection {
+    /// None means follow the operating system's current default output.
+    pub device_name: Option<String>,
+    /// Zero-based first channel of the stereo pair.
+    pub first_channel: u16,
+}
+
+pub fn list_output_devices() -> Result<Vec<AudioOutputDevice>, String> {
+    let host = cpal::default_host();
+    let default_name = host
+        .default_output_device()
+        .and_then(|device| device.name().ok());
+    let devices = host.output_devices().map_err(|error| error.to_string())?;
+    let mut outputs = Vec::new();
+    for device in devices {
+        let Ok(name) = device.name() else { continue };
+        let channels = device
+            .supported_output_configs()
+            .map_err(|error| error.to_string())?
+            .map(|config| config.channels())
+            .max()
+            .unwrap_or(0);
+        outputs.push(AudioOutputDevice {
+            id: name.clone(),
+            is_default: default_name.as_deref() == Some(name.as_str()),
+            name,
+            channels,
+        });
+    }
+    outputs.sort_by(|left, right| left.name.cmp(&right.name));
+    Ok(outputs)
+}
+
+fn open_output(
+    selection: &OutputSelection,
+) -> Result<(OutputStream, OutputStreamHandle, u16), String> {
+    let host = cpal::default_host();
+    let device = if let Some(name) = &selection.device_name {
+        host.output_devices()
+            .map_err(|error| error.to_string())?
+            .find(|device| device.name().is_ok_and(|device_name| device_name == *name))
+            .ok_or_else(|| format!("audio output device is unavailable: {name}"))?
+    } else {
+        host.default_output_device()
+            .ok_or_else(|| "no default audio output device".to_string())?
+    };
+
+    let required_channels = selection.first_channel.saturating_add(2);
+    let (stream, handle, channels) = if selection.first_channel == 0 {
+        let channels = device
+            .default_output_config()
+            .map_err(|error| error.to_string())?
+            .channels();
+        let (stream, handle) = OutputStream::try_from_device(&device)
+            .map_err(|error| format!("cannot open audio output: {error}"))?;
+        (stream, handle, channels)
+    } else {
+        let mut configs: Vec<_> = device
+            .supported_output_configs()
+            .map_err(|error| error.to_string())?
+            .filter(|config| config.channels() >= required_channels)
+            .collect();
+        configs.sort_by_key(|config| config.channels());
+        let config = configs.into_iter().next().ok_or_else(|| {
+            format!(
+                "device does not expose output channels {}–{}",
+                selection.first_channel + 1,
+                required_channels
+            )
+        })?;
+        let rate = if config.min_sample_rate().0 <= 48_000 && config.max_sample_rate().0 >= 48_000 {
+            48_000
+        } else {
+            config.min_sample_rate().0
+        };
+        let config = config.with_sample_rate(cpal::SampleRate(rate));
+        let channels = config.channels();
+        let (stream, handle) = OutputStream::try_from_device_config(&device, config)
+            .map_err(|error| format!("cannot open selected audio channels: {error}"))?;
+        (stream, handle, channels)
+    };
+    Ok((stream, handle, channels))
 }
 
 /// Decode any rodio-supported bytes into a buffer. Hardware-free.
@@ -403,6 +565,8 @@ struct PendingLoad {
 pub struct Player {
     handle: OutputStreamHandle,
     _stream: OutputStream,
+    output_channels: u16,
+    first_channel: u16,
     sink: Option<Sink>,
     track: Option<Loaded>,
     /// Channel back to the engine loop, so background workers (decode,
@@ -412,17 +576,67 @@ pub struct Player {
 }
 
 impl Player {
-    pub(crate) fn new(tx: std::sync::mpsc::Sender<EngineCmd>) -> Result<Self, String> {
-        let (_stream, handle) =
-            OutputStream::try_default().map_err(|e| format!("no audio output: {e}"))?;
+    pub(crate) fn new(
+        tx: std::sync::mpsc::Sender<EngineCmd>,
+        selection: &OutputSelection,
+    ) -> Result<Self, String> {
+        let (_stream, handle, output_channels) = open_output(selection)?;
         Ok(Self {
             handle,
             _stream,
+            output_channels,
+            first_channel: selection.first_channel,
             sink: None,
             track: None,
             tx,
             pitch_seq: 0,
         })
+    }
+
+    fn set_output(&mut self, selection: &OutputSelection) -> Result<(), String> {
+        let (stream, handle, output_channels) = open_output(selection)?;
+        let was_playing = self
+            .sink
+            .as_ref()
+            .is_some_and(|sink| !sink.is_paused() && !sink.empty());
+        let had_sink = self.sink.is_some();
+        let new_sink = if had_sink {
+            if let Some(track) = self.track.as_mut() {
+                let from = track.cursor.load(Ordering::Relaxed);
+                track.resume_frame = from;
+                let source = LoopRegion::new(
+                    track.buf.clone(),
+                    from,
+                    track.start_frame,
+                    track.end_frame,
+                    track.enabled,
+                    track.cursor.clone(),
+                );
+                let sink = Sink::try_new(&handle).map_err(|error| error.to_string())?;
+                sink.set_volume(track.volume);
+                sink.set_speed(if track.pitch_lock { 1.0 } else { track.speed });
+                sink.append(RoutedLoopRegion::new(
+                    source,
+                    output_channels,
+                    selection.first_channel,
+                ));
+                if was_playing {
+                    sink.play();
+                }
+                Some(sink)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        self.sink = new_sink;
+        self.handle = handle;
+        self._stream = stream;
+        self.output_channels = output_channels;
+        self.first_channel = selection.first_channel;
+        Ok(())
     }
 
     fn fresh_sink(&mut self, volume: f32, speed: f32) -> Result<Sink, String> {
@@ -601,7 +815,11 @@ impl Player {
             t.cursor.clone(),
         );
         let sink = self.fresh_sink(volume, speed)?;
-        sink.append(src);
+        sink.append(RoutedLoopRegion::new(
+            src,
+            self.output_channels,
+            self.first_channel,
+        ));
         sink.play();
         self.sink = Some(sink);
         Ok(self.status())
@@ -786,7 +1004,11 @@ impl Player {
                 t.cursor.clone(),
             );
             let sink = self.fresh_sink(volume, speed)?;
-            sink.append(src);
+            sink.append(RoutedLoopRegion::new(
+                src,
+                self.output_channels,
+                self.first_channel,
+            ));
             sink.play();
             self.sink = Some(sink);
         } else {
@@ -827,7 +1049,11 @@ impl Player {
                 t.cursor.clone(),
             );
             let sink = self.fresh_sink(volume, speed)?;
-            sink.append(src);
+            sink.append(RoutedLoopRegion::new(
+                src,
+                self.output_channels,
+                self.first_channel,
+            ));
             sink.play();
             self.sink = Some(sink);
         } else {
@@ -881,7 +1107,11 @@ impl Player {
             )
         };
         let sink = self.fresh_sink(volume, speed)?;
-        sink.append(src);
+        sink.append(RoutedLoopRegion::new(
+            src,
+            self.output_channels,
+            self.first_channel,
+        ));
         sink.play();
         self.sink = Some(sink);
         Ok(self.status())
@@ -912,7 +1142,11 @@ impl Player {
                 t.cursor.clone(),
             );
             let sink = self.fresh_sink(volume, speed)?;
-            sink.append(src);
+            sink.append(RoutedLoopRegion::new(
+                src,
+                self.output_channels,
+                self.first_channel,
+            ));
             sink.play();
             self.sink = Some(sink);
         }
@@ -1021,6 +1255,7 @@ impl PlayerStatus {
 /// channel; `EngineClient` is `Send + Sync` and safe in Tauri state.
 pub struct Engine {
     player: Option<Player>,
+    output_selection: OutputSelection,
     /// Cloned into background workers so completions re-enter this loop.
     tx: std::sync::mpsc::Sender<EngineCmd>,
     pending_volume: f32,
@@ -1104,6 +1339,10 @@ pub(crate) enum EngineCmd {
         loop_quality: f64,
         reply: Reply,
     },
+    SetOutput {
+        selection: OutputSelection,
+        reply: Reply,
+    },
     Status {
         reply: Reply,
     },
@@ -1116,6 +1355,7 @@ impl Engine {
     ) -> Self {
         Self {
             player: None,
+            output_selection: OutputSelection::default(),
             tx,
             pending_volume: 0.8,
             generation: 0,
@@ -1131,7 +1371,7 @@ impl Engine {
     fn ensure(&mut self) -> Result<&mut Player, String> {
         if self.player.is_none() {
             let tx = self.tx.clone();
-            self.player = Some(Player::new(tx)?);
+            self.player = Some(Player::new(tx, &self.output_selection)?);
         }
         Ok(self.player.as_mut().expect("just created"))
     }
@@ -1222,11 +1462,35 @@ impl Engine {
                     }
                     let _ = reply.send(Ok(self.status()));
                 }
+                EngineCmd::SetOutput { selection, reply } => {
+                    let result = self.cmd_set_output(selection);
+                    let _ = reply.send(result.map(|()| self.status()));
+                }
                 EngineCmd::Status { reply } => {
                     let _ = reply.send(Ok(self.status()));
                 }
             }
         }
+    }
+
+    fn cmd_set_output(&mut self, selection: OutputSelection) -> Result<(), String> {
+        let devices = list_output_devices()?;
+        let device = match &selection.device_name {
+            Some(name) => devices.iter().find(|device| &device.id == name),
+            None => devices.iter().find(|device| device.is_default),
+        }
+        .ok_or_else(|| "selected audio output is unavailable".to_string())?;
+        if selection.first_channel.saturating_add(2) > device.channels {
+            return Err(format!(
+                "selected output pair is unavailable on {}",
+                device.name
+            ));
+        }
+        if let Some(player) = self.player.as_mut() {
+            player.set_output(&selection)?;
+        }
+        self.output_selection = selection;
+        Ok(())
     }
 
     /// Start a background decode and return a loading status instantly.
@@ -1455,7 +1719,11 @@ impl Engine {
                             return;
                         }
                     };
-                    sink.append(src);
+                    sink.append(RoutedLoopRegion::new(
+                        src,
+                        p.output_channels,
+                        p.first_channel,
+                    ));
                     sink.play();
                     p.sink = Some(sink);
                 }
@@ -1510,6 +1778,10 @@ impl EngineClient {
             .send(mk(tx))
             .map_err(|_| "audio engine stopped".to_string())?;
         rx.recv().map_err(|_| "audio engine stopped".to_string())?
+    }
+
+    pub fn set_output(&self, selection: OutputSelection) -> Result<PlayerStatus, String> {
+        self.call(|reply| EngineCmd::SetOutput { selection, reply })
     }
 
     pub fn load(&self, path: String) -> Result<PlayerStatus, String> {

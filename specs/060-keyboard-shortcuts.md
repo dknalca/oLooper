@@ -77,4 +77,4 @@ No global shortcuts plugin; listener runs only while the app window is focused.
 ## Non-goals
 
 - Global shortcuts (work when app is not focused), custom key remapping,
-  macro recording, MIDI controller input.
+  macro recording. MIDI controller mapping is specified in `110`.

@@ -7,7 +7,7 @@
 
 - The Tauri bundle identifier is `com.olooper`, without the `.app` bundle suffix.
 - User loopers are stored beside the executable or macOS app bundle in `loopersFlash/`.
-- On first launch, the user confirms a library root, defaulting to `library/` beside the app. Its portable selection file is stored beside the app, not in identifier-derived app data.
+- On first launch, the user confirms a library root, defaulting to `~/Documents/oLooper_data`. Its portable selection file is stored beside the app, not in identifier-derived app data.
 
 ## Consequences
 

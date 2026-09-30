@@ -26,6 +26,7 @@ pub mod analysis;
 pub mod autoloop;
 pub mod import;
 pub mod library;
+pub mod midi;
 pub mod player;
 pub mod tablist;
 pub mod waveform;
@@ -87,6 +88,10 @@ fn portable_root() -> Result<std::path::PathBuf, String> {
 
 fn portable_library_root() -> Result<std::path::PathBuf, String> {
     Ok(portable_root()?.join("library"))
+}
+
+fn suggested_library_root(home: &std::path::Path) -> std::path::PathBuf {
+    home.join("Documents").join("oLooper_data")
 }
 
 fn portable_sources_root() -> Result<std::path::PathBuf, String> {
@@ -341,6 +346,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .manage(player::spawn())
         .manage(std::sync::Mutex::new(None::<library::Library>))
+        .manage(Mutex::new(midi::MidiManager::default()))
         .setup(|app| {
             use tauri::menu::{MenuBuilder, MenuItem, SubmenuBuilder};
 
@@ -363,6 +369,10 @@ pub fn run() {
                 true,
                 None::<&str>,
             )?;
+            let midi_options =
+                MenuItem::with_id(app, "midi-options", "MIDI Options…", true, None::<&str>)?;
+            let audio_options =
+                MenuItem::with_id(app, "audio-options", "Audio Output…", true, None::<&str>)?;
             let file_menu = SubmenuBuilder::new(app, "File")
                 .items(&[&open_files, &open_swf, &open_exe, &import_audio])
                 .separator()
@@ -372,6 +382,9 @@ pub fn run() {
                 .build()?;
             let app_menu = SubmenuBuilder::new(app, "oLooper")
                 .about(None)
+                .separator()
+                .item(&audio_options)
+                .item(&midi_options)
                 .separator()
                 .services()
                 .separator()
@@ -418,6 +431,8 @@ pub fn run() {
                         | "import-audio"
                         | "choose-library"
                         | "show-shortcuts"
+                        | "audio-options"
+                        | "midi-options"
                 ) {
                     let _ = app.emit("olooper:menu-command", command);
                 }
@@ -441,6 +456,8 @@ pub fn run() {
             inspect_swf,
             inspect_exe,
             player_load,
+            audio_output_devices,
+            audio_set_output,
             player_play,
             player_pause,
             player_stop,
@@ -479,6 +496,10 @@ pub fn run() {
             library_get_slots,
             library_set_slot,
             library_delete_slot,
+            midi_list_inputs,
+            midi_connected_input,
+            midi_connect,
+            midi_disconnect,
             import_swf,
             import_exe,
             import_custom,
@@ -497,6 +518,23 @@ type Audio<'a> = tauri::State<'a, player::EngineClient>;
 #[tauri::command]
 fn player_load(path: String, audio: Audio<'_>) -> Result<player::PlayerStatus, String> {
     audio.load(path)
+}
+
+#[tauri::command]
+fn audio_output_devices() -> Result<Vec<player::AudioOutputDevice>, String> {
+    player::list_output_devices()
+}
+
+#[tauri::command]
+fn audio_set_output(
+    device_name: Option<String>,
+    first_channel: u16,
+    audio: Audio<'_>,
+) -> Result<player::PlayerStatus, String> {
+    audio.set_output(player::OutputSelection {
+        device_name,
+        first_channel,
+    })
 }
 
 #[tauri::command]
@@ -645,7 +683,14 @@ fn init_portable_library(db: &Db<'_>) -> Result<String, String> {
 
 #[tauri::command]
 fn library_default_root() -> Result<String, String> {
-    Ok(portable_library_root()?.to_string_lossy().to_string())
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(std::path::PathBuf::from);
+    let root = match home {
+        Some(home) => suggested_library_root(&home),
+        None => portable_library_root()?,
+    };
+    Ok(root.to_string_lossy().to_string())
 }
 
 #[tauri::command]
@@ -859,6 +904,42 @@ fn library_set_slot(
 fn library_delete_slot(track_id: i64, slot: i64, db: Db<'_>) -> Result<bool, String> {
     let g = self::db(&db)?;
     require_lib(&g)?.delete_slot(track_id, slot)
+}
+
+#[tauri::command]
+fn midi_list_inputs() -> Result<Vec<midi::MidiInputInfo>, String> {
+    midi::list_inputs()
+}
+
+#[tauri::command]
+fn midi_connected_input(
+    state: tauri::State<'_, Mutex<midi::MidiManager>>,
+) -> Result<Option<midi::MidiInputInfo>, String> {
+    state
+        .lock()
+        .map(|manager| manager.connected_input())
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn midi_connect(
+    input_id: String,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, Mutex<midi::MidiManager>>,
+) -> Result<midi::MidiInputInfo, String> {
+    state
+        .lock()
+        .map_err(|error| error.to_string())?
+        .connect(&app, &input_id)
+}
+
+#[tauri::command]
+fn midi_disconnect(state: tauri::State<'_, Mutex<midi::MidiManager>>) -> Result<(), String> {
+    state
+        .lock()
+        .map_err(|error| error.to_string())?
+        .disconnect();
+    Ok(())
 }
 
 #[tauri::command]
@@ -1416,6 +1497,14 @@ mod tests {
         assert_eq!(
             portable_root_for_executable(executable).unwrap(),
             std::path::PathBuf::from("/tmp/olooper"),
+        );
+    }
+
+    #[test]
+    fn first_run_library_suggestion_uses_documents_folder() {
+        assert_eq!(
+            suggested_library_root(std::path::Path::new("/Users/dj")),
+            std::path::PathBuf::from("/Users/dj/Documents/oLooper_data"),
         );
     }
 

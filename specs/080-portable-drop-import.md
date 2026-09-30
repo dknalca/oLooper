@@ -9,7 +9,7 @@ Import a dropped `.swf` or projector `.exe` from anywhere in the window into a p
 - Development builds use the directory containing the executable.
 - macOS app bundles use the directory containing `oLooper.app`, never `oLooper.app/Contents`.
 - Sources are atomically copied to `loopersFlash/` beside the app bundle/executable.
-- The first launch asks the user to confirm a library directory, suggesting `library/` beside the app bundle/executable. The selected path is saved in portable configuration beside the app.
+- The first launch asks the user to confirm a library directory, suggesting `~/Documents/oLooper_data`. The selected path is saved in portable configuration beside the app.
 - Extracted files are atomically written to `<selected-library>/<sanitized-looper-name>/NN_<sound-id>.mp3`.
 - `<selected-library>/olooper.db` stores catalog data. Existing configurable libraries are not migrated automatically; they remain intact and can be imported again.
 

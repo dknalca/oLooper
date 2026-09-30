@@ -5,10 +5,81 @@ import Player from "./components/Player";
 import Waveform from "./components/Waveform";
 import ImportBar from "./components/ImportBar";
 import TablistCatalog from "./components/TablistCatalog";
+import MidiSettingsDialog, { MIDI_ACTIONS } from "./components/MidiSettingsDialog";
+import AudioSettingsDialog from "./components/AudioSettingsDialog";
 import useKeyboardShortcuts from "./hooks/useKeyboardShortcuts";
-import { libraryRandomTrack, listenAppMenuCommand, playerLoad, playerPlay, playerStatus as getPlayerStatus, type PlayerStatus, type Track } from "./tauri";
+import {
+  libraryRandomTrack,
+  libraryList,
+  libraryMarkPlayed,
+  audioSetOutput,
+  listenAppMenuCommand,
+  listenMidiMessage,
+  midiConnect,
+  midiDisconnect,
+  playerAutoLoop,
+  playerLoad,
+  playerPause,
+  playerPlay,
+  playerSetLoopEnabled,
+  playerSetLoopSnapped,
+  playerSetSpeed,
+  playerSetDiagnostics,
+  playerStatus as getPlayerStatus,
+  playerStop,
+  type MidiAction,
+  type MidiBinding,
+  type AudioOutputSelection,
+  type PlayerStatus,
+  type Track,
+} from "./tauri";
+import { firstMidiStartTrack } from "./midiPlayback";
 
 type TrackNavigator = (direction: -1 | 1) => void;
+type MidiBindings = Partial<Record<MidiAction, MidiBinding>>;
+
+function readAudioSelection(): AudioOutputSelection {
+  try {
+    const value: unknown = JSON.parse(localStorage.getItem("olooper.audio.output") ?? "null");
+    if (!value || typeof value !== "object") return { deviceName: null, firstChannel: 0 };
+    const selection = value as Partial<AudioOutputSelection>;
+    if (
+      (selection.deviceName === null || typeof selection.deviceName === "string")
+      && Number.isInteger(selection.firstChannel)
+      && (selection.firstChannel ?? -1) >= 0
+      && (selection.firstChannel ?? 0) <= 62
+    ) return { deviceName: selection.deviceName ?? null, firstChannel: selection.firstChannel! };
+  } catch { /* Use the system default when the local preference is invalid. */ }
+  return { deviceName: null, firstChannel: 0 };
+}
+
+function readMidiBindings(): MidiBindings {
+  try {
+    const parsed: unknown = JSON.parse(localStorage.getItem("olooper.midi.bindings") ?? "{}");
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+    const values = parsed as Record<string, unknown>;
+    const bindings: MidiBindings = {};
+    for (const { id } of MIDI_ACTIONS) {
+      const value = values[id];
+      if (!value || typeof value !== "object") continue;
+      const binding = value as Partial<MidiBinding>;
+      if (
+        typeof binding.inputId === "string" && typeof binding.inputName === "string"
+        && (binding.kind === "note" || binding.kind === "cc")
+        && Number.isInteger(binding.channel) && binding.channel! >= 1 && binding.channel! <= 16
+        && Number.isInteger(binding.number) && binding.number! >= 0 && binding.number! <= 127
+      ) bindings[id] = binding as MidiBinding;
+    }
+    return bindings;
+  } catch {
+    return {};
+  }
+}
+
+function sameMidiBinding(left: MidiBinding, right: MidiBinding): boolean {
+  return left.inputId === right.inputId && left.kind === right.kind
+    && left.channel === right.channel && left.number === right.number;
+}
 
 export default function App() {
   useKeyboardShortcuts();
@@ -21,9 +92,27 @@ export default function App() {
   const [libraryView, setLibraryView] = useState<"local" | "tablist">("local");
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
   const [loopEditing, setLoopEditing] = useState(false);
+  const [midiOptionsOpen, setMidiOptionsOpen] = useState(false);
+  const [audioOptionsOpen, setAudioOptionsOpen] = useState(false);
+  const [audioSelection, setAudioSelection] = useState<AudioOutputSelection>(readAudioSelection);
+  const [midiInputId, setMidiInputId] = useState<string | null>(() => localStorage.getItem("olooper.midi.input"));
+  const [midiBindings, setMidiBindings] = useState<MidiBindings>(readMidiBindings);
+  const [midiLearningAction, setMidiLearningAction] = useState<MidiAction | null>(null);
+  const [midiLearningConflict, setMidiLearningConflict] = useState<MidiAction | null>(null);
   const randomLoadGeneration = useRef(0);
+  const midiBindingsRef = useRef(midiBindings);
+  const midiLearningActionRef = useRef(midiLearningAction);
+  const midiActionHandlerRef = useRef<(action: MidiAction) => void>(() => {});
+  midiBindingsRef.current = midiBindings;
+  midiLearningActionRef.current = midiLearningAction;
 
   const onLibraryReady = useCallback(() => setLibraryReady(true), []);
+
+  useEffect(() => {
+    audioSetOutput(audioSelection).catch(() => {});
+    // Set the saved output before the first playback request.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
   const onImported = useCallback(
     () => setRefreshKey((k) => k + 1),
     [],
@@ -69,6 +158,75 @@ export default function App() {
     setPlayerStatus(playing);
   }, [activeTrackId]);
 
+  const playFirstLibraryTrack = useCallback(async () => {
+    const generation = ++randomLoadGeneration.current;
+    const tracks = await libraryList();
+    if (generation !== randomLoadGeneration.current) return;
+    const track = firstMidiStartTrack(tracks, localStorage.getItem("olooper.library.sort"));
+    if (!track) return;
+
+    let status = await playerLoad(track.file_path);
+    setPlayerStatus(status);
+    const deadline = Date.now() + 120_000;
+    while (status.loading && Date.now() < deadline) {
+      await new Promise((resolve) => window.setTimeout(resolve, 150));
+      if (generation !== randomLoadGeneration.current) return;
+      status = await getPlayerStatus();
+      setPlayerStatus(status);
+    }
+    if (generation !== randomLoadGeneration.current) return;
+    if (status.loading || status.load_error || status.path !== track.file_path) return;
+    playerSetDiagnostics(track.loop_origin, track.loop_quality).catch(() => {});
+    const playing = await playerPlay();
+    if (generation !== randomLoadGeneration.current) return;
+    onTrackSelected(track, playing);
+    libraryMarkPlayed(track.id).then(onImported).catch(() => {});
+  }, [onImported, onTrackSelected]);
+
+  const executeMidiAction = useCallback((action: MidiAction) => {
+    if (action === "play-pause" && !playerStatus?.loaded) {
+      playFirstLibraryTrack().catch(() => {});
+      return;
+    }
+    if (!playerStatus?.loaded) return;
+    const publishStatus = (request: Promise<PlayerStatus>) => {
+      request.then(setPlayerStatus).catch(() => {});
+    };
+    if (action === "play-pause") {
+      publishStatus(playerStatus.playing ? playerPause() : playerPlay());
+    } else if (action === "stop") {
+      publishStatus(playerStop());
+    } else if (action === "previous") {
+      trackNavigator?.(-1);
+    } else if (action === "next") {
+      trackNavigator?.(1);
+    } else if (action === "toggle-loop") {
+      publishStatus(playerSetLoopEnabled(!playerStatus.loop_enabled));
+    } else if (action === "speed-down") {
+      publishStatus(playerSetSpeed(Math.max(50, playerStatus.speed_pct - 5)));
+    } else if (action === "speed-up") {
+      publishStatus(playerSetSpeed(Math.min(200, playerStatus.speed_pct + 5)));
+    } else if (action === "auto-loop") {
+      playerAutoLoop()
+        .then((result) => {
+          if (!result.candidate) throw new Error("No suitable loop found");
+          return playerSetLoopSnapped(
+            Math.round(result.candidate.start_frame * 1000 / result.sample_rate),
+            Math.round(result.candidate.end_frame * 1000 / result.sample_rate),
+          );
+        })
+        .then(setPlayerStatus)
+        .catch(() => {});
+    } else if (action.startsWith("clear-cue-")) {
+      const slot = Number(action.slice("clear-cue-".length));
+      window.dispatchEvent(new CustomEvent("olooper:cue-shortcut", { detail: { slot, clear: true } }));
+    } else if (action.startsWith("cue-")) {
+      const slot = Number(action.slice("cue-".length));
+      window.dispatchEvent(new CustomEvent("olooper:cue-shortcut", { detail: { slot, clear: false } }));
+    }
+  }, [playerStatus, playFirstLibraryTrack, trackNavigator]);
+  midiActionHandlerRef.current = executeMidiAction;
+
   // Listen for olooper:imported events from keyboard shortcut handler.
   useEffect(() => {
     const handler = () => onImported();
@@ -77,10 +235,77 @@ export default function App() {
   }, [onImported]);
 
   useEffect(() => {
+    localStorage.setItem("olooper.midi.bindings", JSON.stringify(midiBindings));
+  }, [midiBindings]);
+
+  useEffect(() => {
+    if (midiInputId) localStorage.setItem("olooper.midi.input", midiInputId);
+    else localStorage.removeItem("olooper.midi.input");
+  }, [midiInputId]);
+
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    let cancelled = false;
+    listenMidiMessage((message) => {
+      const learning = midiLearningActionRef.current;
+      if (learning) {
+        const binding: MidiBinding = {
+          inputId: message.inputId,
+          inputName: message.inputName,
+          kind: message.kind,
+          channel: message.channel,
+          number: message.number,
+        };
+        const conflict = Object.entries(midiBindingsRef.current).find(([action, assigned]) =>
+          action !== learning && assigned && sameMidiBinding(assigned, binding),
+        )?.[0] as MidiAction | undefined;
+        setMidiLearningConflict(conflict ?? null);
+        setMidiBindings((current) => {
+          const next = { ...current };
+          for (const [action, assigned] of Object.entries(next)) {
+            if (action !== learning && assigned && sameMidiBinding(assigned, binding)) {
+              delete next[action as MidiAction];
+            }
+          }
+          next[learning] = binding;
+          return next;
+        });
+        setMidiLearningAction(null);
+        return;
+      }
+
+      const assignment = Object.entries(midiBindingsRef.current).find(([, binding]) =>
+        binding && binding.inputId === message.inputId
+          && binding.kind === message.kind
+          && binding.channel === message.channel
+          && binding.number === message.number,
+      );
+      if (assignment) midiActionHandlerRef.current(assignment[0] as MidiAction);
+    }).then((dispose) => {
+      if (cancelled) {
+        dispose();
+        return;
+      }
+      unlisten = dispose;
+      const savedInput = localStorage.getItem("olooper.midi.input");
+      if (savedInput) midiConnect(savedInput).catch(() => {});
+    }).catch(() => {});
+    return () => {
+      cancelled = true;
+      unlisten?.();
+      midiDisconnect().catch(() => {});
+    };
+  }, []);
+
+  useEffect(() => {
     let unlisten: (() => void) | undefined;
     listenAppMenuCommand((command) => {
       if (command === "show-shortcuts") {
         setShortcutsOpen(true);
+      } else if (command === "midi-options") {
+        setMidiOptionsOpen(true);
+      } else if (command === "audio-options") {
+        setAudioOptionsOpen(true);
       } else if (command === "choose-library") {
         window.dispatchEvent(new Event("olooper:choose-library"));
       } else {
@@ -101,7 +326,7 @@ export default function App() {
 
   return (
     <div className="h-screen flex flex-col bg-app text-text overflow-hidden">
-      <TopBar onLibraryReady={onLibraryReady} playing={playerStatus?.playing ?? false} />
+      <TopBar onLibraryReady={onLibraryReady} playing={playerStatus?.playing ?? false} onAudioOptions={() => setAudioOptionsOpen(true)} />
 
       <main className="flex flex-1 min-h-0 flex-col">
         <div className="h-1/5 min-h-36 shrink-0 p-3">
@@ -200,6 +425,37 @@ export default function App() {
           </section>
         </div>
       )}
+      <MidiSettingsDialog
+        open={midiOptionsOpen}
+        inputId={midiInputId}
+        bindings={midiBindings}
+        learningAction={midiLearningAction}
+        conflictAction={midiLearningConflict}
+        onInputIdChange={setMidiInputId}
+        onLearningChange={(action) => {
+          setMidiLearningConflict(null);
+          setMidiLearningAction(action);
+        }}
+        onClearBinding={(action) => {
+          setMidiLearningConflict(null);
+          setMidiBindings((current) => {
+            const next = { ...current };
+            delete next[action];
+            return next;
+          });
+        }}
+        onClose={() => {
+          setMidiOptionsOpen(false);
+          setMidiLearningAction(null);
+          setMidiLearningConflict(null);
+        }}
+      />
+      <AudioSettingsDialog
+        open={audioOptionsOpen}
+        selection={audioSelection}
+        onSelectionChange={setAudioSelection}
+        onClose={() => setAudioOptionsOpen(false)}
+      />
     </div>
   );
 }
