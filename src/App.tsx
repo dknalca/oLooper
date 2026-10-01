@@ -113,6 +113,12 @@ export default function App() {
     // Set the saved output before the first playback request.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  const refreshPlayerAfterAudioTest = useCallback(() => {
+    window.setTimeout(() => {
+      getPlayerStatus().then(setPlayerStatus).catch(() => {});
+    }, 1100);
+  }, []);
   const onImported = useCallback(
     () => setRefreshKey((k) => k + 1),
     [],
@@ -454,6 +460,8 @@ export default function App() {
         open={audioOptionsOpen}
         selection={audioSelection}
         onSelectionChange={setAudioSelection}
+        onPlayerStatusChange={setPlayerStatus}
+        onOutputTestStarted={refreshPlayerAfterAudioTest}
         onClose={() => setAudioOptionsOpen(false)}
       />
     </div>

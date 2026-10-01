@@ -61,10 +61,11 @@ Waveform rendering and library integration are separate specs.
 14. Audio output follows the system default unless a device and stereo output
     pair are selected in **oLooper → Audio Output…**. For multichannel devices,
     decoded mono is duplicated to the chosen pair and stereo is routed left and
-    right to that pair; all other output channels are silent. Changing the
-    selection applies immediately and restarts current playback at its current
-    frame without changing track, loop, speed, volume, or play/pause state.
-    The selection persists locally across launches. See spec 120.
+    right to that pair; all other output channels are silent. Entering Audio
+    Output stops playback at the loop start to avoid route changes while audio
+    is active. Closing the dialog resumes from that loop start only if playback
+    was active on entry. Track, loop, speed, and volume remain unchanged. The
+    device and its stereo pair persist locally. See spec 120.
 
 ## Supported inputs
 

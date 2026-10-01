@@ -6,10 +6,11 @@
 
 use std::collections::VecDeque;
 use std::io::Cursor;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use cpal::traits::{DeviceTrait, HostTrait};
+use rodio::source::EmptyCallback;
 use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink, Source as _};
 use serde::{Deserialize, Serialize};
 
@@ -144,21 +145,83 @@ struct RoutedLoopRegion {
     output_channels: u16,
     first_channel: usize,
     output_channel: usize,
+    meter: Arc<OutputMeter>,
+    meter_frames: usize,
+    left_peak: u16,
+    right_peak: u16,
     left: Option<i16>,
     right: Option<i16>,
 }
 
+struct OutputMeter {
+    left_peak: AtomicUsize,
+    right_peak: AtomicUsize,
+    gain_bits: AtomicU32,
+}
+
+impl Default for OutputMeter {
+    fn default() -> Self {
+        Self {
+            left_peak: AtomicUsize::new(0),
+            right_peak: AtomicUsize::new(0),
+            gain_bits: AtomicU32::new(1.0f32.to_bits()),
+        }
+    }
+}
+
+impl OutputMeter {
+    fn set_gain(&self, gain: f32) {
+        self.gain_bits
+            .store(gain.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
+    }
+
+    fn publish(&self, left: u16, right: u16) {
+        fn update_peak(peak: &AtomicUsize, sample: u16) {
+            let current = peak.load(Ordering::Relaxed);
+            let decayed = (current as f32 * 0.995) as usize;
+            peak.store(decayed.max(sample as usize), Ordering::Relaxed);
+        }
+        update_peak(&self.left_peak, left);
+        update_peak(&self.right_peak, right);
+    }
+
+    fn take_percentages(&self) -> (f32, f32) {
+        let left = self.left_peak.load(Ordering::Relaxed);
+        let right = self.right_peak.load(Ordering::Relaxed);
+        (
+            (left.min(i16::MAX as usize) as f32 * 100.0) / i16::MAX as f32,
+            (right.min(i16::MAX as usize) as f32 * 100.0) / i16::MAX as f32,
+        )
+    }
+}
+
 impl RoutedLoopRegion {
-    fn new(inner: LoopRegion, output_channels: u16, first_channel: u16) -> Self {
+    fn new(
+        inner: LoopRegion,
+        output_channels: u16,
+        first_channel: u16,
+        meter: Arc<OutputMeter>,
+    ) -> Self {
         Self {
             input_channels: inner.channels().max(1) as usize,
             inner,
             output_channels,
             first_channel: first_channel as usize,
             output_channel: 0,
+            meter,
+            meter_frames: 0,
+            left_peak: 0,
+            right_peak: 0,
             left: None,
             right: None,
         }
+    }
+
+    fn publish_meter_block(&mut self) {
+        self.meter.publish(self.left_peak, self.right_peak);
+        self.meter_frames = 0;
+        self.left_peak = 0;
+        self.right_peak = 0;
     }
 }
 
@@ -167,7 +230,11 @@ impl Iterator for RoutedLoopRegion {
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.output_channel == 0 {
-            self.left = Some(self.inner.next()?);
+            let Some(left) = self.inner.next() else {
+                self.publish_meter_block();
+                return None;
+            };
+            self.left = Some(left);
             self.right = Some(if self.input_channels > 1 {
                 self.inner.next()?
             } else {
@@ -175,6 +242,17 @@ impl Iterator for RoutedLoopRegion {
             });
             for _ in 2..self.input_channels {
                 self.inner.next()?;
+            }
+            let gain = f32::from_bits(self.meter.gain_bits.load(Ordering::Relaxed));
+            self.left_peak = self
+                .left_peak
+                .max((left.unsigned_abs() as f32 * gain) as u16);
+            self.right_peak = self
+                .right_peak
+                .max((self.right.unwrap_or_default().unsigned_abs() as f32 * gain) as u16);
+            self.meter_frames += 1;
+            if self.meter_frames >= 256 {
+                self.publish_meter_block();
             }
         }
         let channel = self.output_channel;
@@ -209,6 +287,7 @@ fn queue_routed_source(
     source: LoopRegion,
     output_channels: u16,
     first_channel: u16,
+    meter: Arc<OutputMeter>,
     resume_playback: bool,
 ) {
     // Sink::try_new starts playing immediately, so always pause before
@@ -218,9 +297,40 @@ fn queue_routed_source(
         source,
         output_channels,
         first_channel,
+        meter,
     ));
     if resume_playback {
         sink.play();
+    }
+}
+
+const OUTPUT_TEST_RATE: u32 = 48_000;
+const OUTPUT_TEST_TONE_FRAMES: usize = 14_400; // 300 ms
+const OUTPUT_TEST_GAP_FRAMES: usize = 4_800; // 100 ms
+
+fn output_test_buffer() -> LoopBuffer {
+    let total_frames = OUTPUT_TEST_TONE_FRAMES * 2 + OUTPUT_TEST_GAP_FRAMES * 2;
+    let mut samples = Vec::with_capacity(total_frames * 2);
+    for frame in 0..total_frames {
+        let (left, right) = if frame < OUTPUT_TEST_TONE_FRAMES {
+            let phase = frame as f32 * 440.0 * std::f32::consts::TAU / OUTPUT_TEST_RATE as f32;
+            ((phase.sin() * 0.22 * i16::MAX as f32) as i16, 0)
+        } else if frame < OUTPUT_TEST_TONE_FRAMES + OUTPUT_TEST_GAP_FRAMES {
+            (0, 0)
+        } else if frame < OUTPUT_TEST_TONE_FRAMES * 2 + OUTPUT_TEST_GAP_FRAMES {
+            let right_frame = frame - OUTPUT_TEST_TONE_FRAMES - OUTPUT_TEST_GAP_FRAMES;
+            let phase =
+                right_frame as f32 * 660.0 * std::f32::consts::TAU / OUTPUT_TEST_RATE as f32;
+            (0, (phase.sin() * 0.22 * i16::MAX as f32) as i16)
+        } else {
+            (0, 0)
+        };
+        samples.extend_from_slice(&[left, right]);
+    }
+    LoopBuffer {
+        samples,
+        channels: 2,
+        rate: OUTPUT_TEST_RATE,
     }
 }
 
@@ -600,7 +710,10 @@ pub struct Player {
     _stream: OutputStream,
     output_channels: u16,
     first_channel: u16,
+    output_meter: Arc<OutputMeter>,
     sink: Option<Sink>,
+    output_test_sink: Option<Sink>,
+    output_test_resume_playback: bool,
     track: Option<Loaded>,
     /// Channel back to the engine loop, so background workers (decode,
     /// WSOLA) can post completions to be applied on the audio thread.
@@ -614,12 +727,16 @@ impl Player {
         selection: &OutputSelection,
     ) -> Result<Self, String> {
         let (_stream, handle, output_channels) = open_output(selection)?;
+        let output_meter = Arc::new(OutputMeter::default());
         Ok(Self {
             handle,
             _stream,
             output_channels,
             first_channel: selection.first_channel,
+            output_meter,
             sink: None,
+            output_test_sink: None,
+            output_test_resume_playback: false,
             track: None,
             tx,
             pitch_seq: 0,
@@ -627,6 +744,9 @@ impl Player {
     }
 
     fn set_output(&mut self, selection: &OutputSelection) -> Result<(), String> {
+        if self.output_test_sink.is_some() {
+            return Err("wait for the audio output test to finish".to_string());
+        }
         let (stream, handle, output_channels) = open_output(selection)?;
         let was_playing = self
             .sink
@@ -668,6 +788,7 @@ impl Player {
                     source,
                     output_channels,
                     selection.first_channel,
+                    self.output_meter.clone(),
                     false,
                 );
                 Some(sink)
@@ -691,11 +812,77 @@ impl Player {
         Ok(())
     }
 
+    fn start_output_test(&mut self) -> Result<(), String> {
+        if self.output_test_sink.is_some() {
+            return Err("an audio output test is already running".to_string());
+        }
+        let sink = Sink::try_new(&self.handle).map_err(|error| error.to_string())?;
+        sink.set_volume(0.65);
+        let buffer = Arc::new(output_test_buffer());
+        let source = LoopRegion::new(
+            buffer.clone(),
+            0,
+            0,
+            buffer.frames(),
+            false,
+            Arc::new(AtomicUsize::new(0)),
+        );
+        queue_routed_source(
+            &sink,
+            source,
+            self.output_channels,
+            self.first_channel,
+            self.output_meter.clone(),
+            false,
+        );
+        self.output_meter.set_gain(0.65);
+
+        let tx = self.tx.clone();
+        let callback_sent = Arc::new(AtomicBool::new(false));
+        let callback_guard = callback_sent.clone();
+        sink.append(EmptyCallback::<i16>::new(Box::new(move || {
+            if !callback_guard.swap(true, Ordering::Relaxed) {
+                let _ = tx.send(EngineCmd::OutputTestFinished);
+            }
+        })));
+
+        let was_playing = self
+            .sink
+            .as_ref()
+            .is_some_and(|current| !current.is_paused() && !current.empty());
+        if was_playing {
+            if let Some(current) = &self.sink {
+                current.pause();
+            }
+        }
+        if let Some(track) = self.track.as_mut() {
+            track.resume_frame = track.cursor.load(Ordering::Relaxed);
+        }
+        // The output-test tones own the stream briefly. Drop the track sink
+        // after saving its exact frame, then recreate it when the test ends.
+        self.sink = None;
+        self.output_test_resume_playback = was_playing;
+        sink.play();
+        self.output_test_sink = Some(sink);
+        Ok(())
+    }
+
+    fn finish_output_test(&mut self) {
+        self.output_test_sink = None;
+        let resume = std::mem::replace(&mut self.output_test_resume_playback, false);
+        self.output_meter
+            .set_gain(self.track.as_ref().map_or(1.0, |track| track.volume));
+        if resume {
+            let _ = self.play();
+        }
+    }
+
     fn fresh_sink(&mut self, volume: f32, speed: f32) -> Result<Sink, String> {
         let sink = Sink::try_new(&self.handle).map_err(|e| format!("audio error: {e}"))?;
         sink.set_volume(volume);
         sink.set_speed(speed);
         sink.pause();
+        self.output_meter.set_gain(volume);
         Ok(sink)
     }
 }
@@ -847,6 +1034,13 @@ fn read_and_decode(path: &str) -> Result<LoopBuffer, String> {
 
 impl Player {
     pub fn play(&mut self) -> Result<PlayerStatus, String> {
+        if self.track.is_none() {
+            return Err("nothing loaded".to_string());
+        }
+        if self.output_test_sink.is_some() {
+            self.output_test_resume_playback = true;
+            return Ok(self.status());
+        }
         let t = self.track.as_mut().ok_or("nothing loaded")?;
         if let Some(s) = &self.sink {
             if s.empty() {
@@ -871,6 +1065,7 @@ impl Player {
             src,
             self.output_channels,
             self.first_channel,
+            self.output_meter.clone(),
         ));
         sink.play();
         self.sink = Some(sink);
@@ -878,6 +1073,12 @@ impl Player {
     }
 
     pub fn pause(&mut self) -> Result<PlayerStatus, String> {
+        if self.output_test_sink.is_some() {
+            let t = self.track.as_mut().ok_or("nothing loaded")?;
+            t.resume_frame = t.cursor.load(Ordering::Relaxed);
+            self.output_test_resume_playback = false;
+            return Ok(self.status());
+        }
         let (sink, t) = self
             .sink
             .as_ref()
@@ -890,6 +1091,7 @@ impl Player {
 
     pub fn stop(&mut self) -> Result<PlayerStatus, String> {
         let t = self.track.as_mut().ok_or("nothing loaded")?;
+        self.output_test_resume_playback = false;
         self.sink = None; // drop first: no callback may advance the cursor after reset
         t.resume_frame = t.start_frame; // spec: stop returns to loop start
         t.cursor.store(t.start_frame, Ordering::Relaxed);
@@ -904,6 +1106,7 @@ impl Player {
         if let Some(t) = &mut self.track {
             t.volume = v;
         }
+        self.output_meter.set_gain(v);
         if let Some(s) = &self.sink {
             s.set_volume(v);
         }
@@ -1060,6 +1263,7 @@ impl Player {
                 src,
                 self.output_channels,
                 self.first_channel,
+                self.output_meter.clone(),
             ));
             sink.play();
             self.sink = Some(sink);
@@ -1105,6 +1309,7 @@ impl Player {
                 src,
                 self.output_channels,
                 self.first_channel,
+                self.output_meter.clone(),
             ));
             sink.play();
             self.sink = Some(sink);
@@ -1163,6 +1368,7 @@ impl Player {
             src,
             self.output_channels,
             self.first_channel,
+            self.output_meter.clone(),
         ));
         sink.play();
         self.sink = Some(sink);
@@ -1198,6 +1404,7 @@ impl Player {
                 src,
                 self.output_channels,
                 self.first_channel,
+                self.output_meter.clone(),
             ));
             sink.play();
             self.sink = Some(sink);
@@ -1206,8 +1413,13 @@ impl Player {
     }
 
     pub fn status(&self) -> PlayerStatus {
+        let (output_left_level_pct, output_right_level_pct) = self.output_meter.take_percentages();
         match &self.track {
-            None => PlayerStatus::empty(),
+            None => PlayerStatus {
+                output_left_level_pct,
+                output_right_level_pct,
+                ..PlayerStatus::empty()
+            },
             Some(t) => {
                 let playing = self
                     .sink
@@ -1236,6 +1448,8 @@ impl Player {
                     total_frames: t.buf.frames(),
                     loop_origin: t.loop_origin.clone(),
                     loop_quality: t.loop_quality,
+                    output_left_level_pct,
+                    output_right_level_pct,
                 }
             }
         }
@@ -1269,6 +1483,9 @@ pub struct PlayerStatus {
     /// Loop diagnostics from the library catalog.
     pub loop_origin: String,
     pub loop_quality: f64,
+    /// Digital peak sent to each routed channel since the last status read.
+    pub output_left_level_pct: f32,
+    pub output_right_level_pct: f32,
 }
 
 impl PlayerStatus {
@@ -1295,6 +1512,8 @@ impl PlayerStatus {
             total_frames: 0,
             loop_origin: "manual".to_string(),
             loop_quality: 1.0,
+            output_left_level_pct: 0.0,
+            output_right_level_pct: 0.0,
         }
     }
 }
@@ -1395,6 +1614,11 @@ pub(crate) enum EngineCmd {
         selection: OutputSelection,
         reply: Reply,
     },
+    TestOutput {
+        selection: OutputSelection,
+        reply: Reply,
+    },
+    OutputTestFinished,
     Status {
         reply: Reply,
     },
@@ -1518,6 +1742,15 @@ impl Engine {
                     let result = self.cmd_set_output(selection);
                     let _ = reply.send(result.map(|()| self.status()));
                 }
+                EngineCmd::TestOutput { selection, reply } => {
+                    let result = self.cmd_test_output(selection);
+                    let _ = reply.send(result);
+                }
+                EngineCmd::OutputTestFinished => {
+                    if let Some(player) = self.player.as_mut() {
+                        player.finish_output_test();
+                    }
+                }
                 EngineCmd::Status { reply } => {
                     let _ = reply.send(Ok(self.status()));
                 }
@@ -1538,11 +1771,20 @@ impl Engine {
                 device.name
             ));
         }
+        if selection == self.output_selection {
+            return Ok(());
+        }
         if let Some(player) = self.player.as_mut() {
             player.set_output(&selection)?;
         }
         self.output_selection = selection;
         Ok(())
+    }
+
+    fn cmd_test_output(&mut self, selection: OutputSelection) -> Result<PlayerStatus, String> {
+        self.cmd_set_output(selection)?;
+        self.ensure()?.start_output_test()?;
+        Ok(self.status())
     }
 
     /// Start a background decode and return a loading status instantly.
@@ -1775,6 +2017,7 @@ impl Engine {
                         src,
                         p.output_channels,
                         p.first_channel,
+                        p.output_meter.clone(),
                     ));
                     sink.play();
                     p.sink = Some(sink);
@@ -1834,6 +2077,10 @@ impl EngineClient {
 
     pub fn set_output(&self, selection: OutputSelection) -> Result<PlayerStatus, String> {
         self.call(|reply| EngineCmd::SetOutput { selection, reply })
+    }
+
+    pub fn test_output(&self, selection: OutputSelection) -> Result<PlayerStatus, String> {
+        self.call(|reply| EngineCmd::TestOutput { selection, reply })
     }
 
     pub fn load(&self, path: String) -> Result<PlayerStatus, String> {

@@ -24,9 +24,12 @@ fn routes_stereo_source_to_selected_multichannel_pair() {
         rate: 44_100,
     });
     let source = LoopRegion::new(buffer, 0, 0, 2, false, cursor());
-    let routed = RoutedLoopRegion::new(source, 4, 1);
+    let meter = Arc::new(OutputMeter::default());
+    let routed = RoutedLoopRegion::new(source, 4, 1, meter.clone());
     assert_eq!(rodio::Source::channels(&routed), 4);
     assert_eq!(routed.collect::<Vec<_>>(), vec![0, 10, 11, 0, 0, 20, 21, 0]);
+    let (left, right) = meter.take_percentages();
+    assert!(left > 0.0 && right > 0.0);
 }
 
 #[test]
@@ -37,15 +40,52 @@ fn routes_mono_source_to_both_channels_of_selected_pair() {
         rate: 44_100,
     });
     let source = LoopRegion::new(buffer, 0, 0, 2, false, cursor());
-    let routed = RoutedLoopRegion::new(source, 3, 1);
+    let routed = RoutedLoopRegion::new(source, 3, 1, Arc::new(OutputMeter::default()));
     assert_eq!(routed.collect::<Vec<_>>(), vec![0, 7, 7, 0, 9, 9]);
+}
+
+#[test]
+fn routed_output_meter_tracks_left_and_right_peak_after_volume() {
+    let buffer = Arc::new(LoopBuffer {
+        samples: vec![16_384, 8_192, 16_384, 8_192],
+        channels: 2,
+        rate: 48_000,
+    });
+    let source = LoopRegion::new(buffer, 0, 0, 2, false, cursor());
+    let meter = Arc::new(OutputMeter::default());
+    meter.set_gain(0.5);
+    let _ = RoutedLoopRegion::new(source, 2, 0, meter.clone()).collect::<Vec<_>>();
+    let (left, right) = meter.take_percentages();
+    assert!((left - 25.0).abs() < 0.1);
+    assert!((right - 12.5).abs() < 0.1);
+}
+
+#[test]
+fn output_test_buffer_sends_left_then_right_tones() {
+    let buffer = output_test_buffer();
+    let frames: Vec<_> = buffer.samples.chunks_exact(2).collect();
+    let left_end = OUTPUT_TEST_TONE_FRAMES;
+    let right_start = OUTPUT_TEST_TONE_FRAMES + OUTPUT_TEST_GAP_FRAMES;
+    let right_end = right_start + OUTPUT_TEST_TONE_FRAMES;
+
+    assert!(frames[..left_end].iter().any(|frame| frame[0] != 0));
+    assert!(frames[..left_end].iter().all(|frame| frame[1] == 0));
+    assert!(frames[left_end..right_start]
+        .iter()
+        .all(|frame| *frame == [0, 0]));
+    assert!(frames[right_start..right_end]
+        .iter()
+        .any(|frame| frame[1] != 0));
+    assert!(frames[right_start..right_end]
+        .iter()
+        .all(|frame| frame[0] == 0));
 }
 
 #[test]
 fn output_reconfiguration_keeps_a_paused_transport_paused() {
     let (sink, _queue) = Sink::new_idle();
     let source = LoopRegion::new(mono(vec![1, 2]), 0, 0, 2, true, cursor());
-    queue_routed_source(&sink, source, 2, 0, false);
+    queue_routed_source(&sink, source, 2, 0, Arc::new(OutputMeter::default()), false);
     assert!(sink.is_paused());
 }
 
@@ -53,7 +93,7 @@ fn output_reconfiguration_keeps_a_paused_transport_paused() {
 fn output_reconfiguration_resumes_a_playing_transport() {
     let (sink, _queue) = Sink::new_idle();
     let source = LoopRegion::new(mono(vec![1, 2]), 0, 0, 2, true, cursor());
-    queue_routed_source(&sink, source, 2, 0, true);
+    queue_routed_source(&sink, source, 2, 0, Arc::new(OutputMeter::default()), true);
     assert!(!sink.is_paused());
 }
 

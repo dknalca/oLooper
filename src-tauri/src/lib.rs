@@ -442,6 +442,7 @@ pub fn run() {
             player_load,
             audio_output_devices,
             audio_set_output,
+            audio_test_output,
             player_play,
             player_pause,
             player_stop,
@@ -515,6 +516,18 @@ fn audio_set_output(
     audio: Audio<'_>,
 ) -> Result<player::PlayerStatus, String> {
     audio.set_output(player::OutputSelection {
+        device_name,
+        first_channel,
+    })
+}
+
+#[tauri::command]
+fn audio_test_output(
+    device_name: Option<String>,
+    first_channel: u16,
+    audio: Audio<'_>,
+) -> Result<player::PlayerStatus, String> {
+    audio.test_output(player::OutputSelection {
         device_name,
         first_channel,
     })

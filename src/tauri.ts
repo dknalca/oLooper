@@ -41,6 +41,9 @@ export interface PlayerStatus {
   loop_origin: string;
   /** Loop quality score 0.0–1.0. */
   loop_quality: number;
+  /** Digital peak sent to the selected left/right output channels (%). */
+  output_left_level_pct: number;
+  output_right_level_pct: number;
 }
 
 export function playerLoad(path: string): Promise<PlayerStatus> {
@@ -105,6 +108,13 @@ export function audioOutputDevices(): Promise<AudioOutputDevice[]> {
 
 export function audioSetOutput(selection: AudioOutputSelection): Promise<PlayerStatus> {
   return invoke<PlayerStatus>("audio_set_output", {
+    deviceName: selection.deviceName,
+    firstChannel: selection.firstChannel,
+  });
+}
+
+export function audioTestOutput(selection: AudioOutputSelection): Promise<PlayerStatus> {
+  return invoke<PlayerStatus>("audio_test_output", {
     deviceName: selection.deviceName,
     firstChannel: selection.firstChannel,
   });
