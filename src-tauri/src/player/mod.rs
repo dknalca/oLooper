@@ -154,6 +154,11 @@ impl Default for OutputMeter {
 }
 
 impl OutputMeter {
+    fn reset(&self) {
+        self.left_peak.store(0, Ordering::Relaxed);
+        self.right_peak.store(0, Ordering::Relaxed);
+    }
+
     fn publish(&self, left: u16, right: u16) {
         fn update_peak(peak: &AtomicUsize, sample: u16) {
             let current = peak.load(Ordering::Relaxed);
@@ -273,9 +278,9 @@ fn routed_sink(
         channels: source_channels,
         rate: source_rate,
     });
-    eprintln!(
-        "[oLooper audio] source: {source_channels} ch @ {source_rate} Hz, speed {speed:.3}x -> stereo mix @ {output_rate} Hz before hardware channel map",
-    );
+    crate::audio_log::write(&format!(
+        "playback_source channels={source_channels} sample_rate={source_rate} speed={speed:.3} output_mix_channels=2 output_mix_rate={output_rate}"
+    ));
     Ok(sink)
 }
 
@@ -346,17 +351,33 @@ fn validate_output_pair(first_channel: u16, channels: u16) -> Result<(), String>
 }
 
 pub fn list_output_devices() -> Result<Vec<AudioOutputDevice>, String> {
+    crate::audio_log::write("device_enumeration_start");
     let host = cpal::default_host();
     let default_name = host
         .default_output_device()
         .and_then(|device| device.name().ok());
-    let devices = host.output_devices().map_err(|error| error.to_string())?;
+    crate::audio_log::write(&format!("system_default_device name={default_name:?}"));
+    let devices = host.output_devices().map_err(|error| {
+        let message = format!("device_enumeration_failed error={error}");
+        crate::audio_log::write(&message);
+        message
+    })?;
     let mut outputs = Vec::new();
     for device in devices {
-        let Ok(name) = device.name() else { continue };
+        let name = match device.name() {
+            Ok(name) => name,
+            Err(error) => {
+                crate::audio_log::write(&format!("device_skipped name_error={error}"));
+                continue;
+            }
+        };
         let configs = device
             .supported_output_configs()
-            .map_err(|error| format!("cannot list output formats for {name}: {error}"))?
+            .map_err(|error| {
+                let message = format!("device_capabilities_failed name={name:?} error={error}");
+                crate::audio_log::write(&message);
+                format!("cannot list output formats for {name}: {error}")
+            })?
             .collect::<Vec<_>>();
         let channels = configs
             .iter()
@@ -384,6 +405,17 @@ pub fn list_output_devices() -> Result<Vec<AudioOutputDevice>, String> {
                 buffer_max = Some(buffer_max.map_or(*max, |old| old.max(*max)));
             }
         }
+        for config in &configs {
+            crate::audio_log::write(&format!(
+                "device_capability name={name:?} default={} channels={} sample_rate_min={} sample_rate_max={} sample_format={:?} buffer_size={:?}",
+                default_name.as_deref() == Some(name.as_str()),
+                config.channels(),
+                config.min_sample_rate().0,
+                config.max_sample_rate().0,
+                config.sample_format(),
+                config.buffer_size(),
+            ));
+        }
         outputs.push(AudioOutputDevice {
             id: name.clone(),
             is_default: default_name.as_deref() == Some(name.as_str()),
@@ -395,6 +427,10 @@ pub fn list_output_devices() -> Result<Vec<AudioOutputDevice>, String> {
         });
     }
     outputs.sort_by(|left, right| left.name.cmp(&right.name));
+    crate::audio_log::write(&format!(
+        "device_enumeration_complete count={}",
+        outputs.len()
+    ));
     Ok(outputs)
 }
 
@@ -503,7 +539,9 @@ where
                     &output_meter,
                 );
             },
-            |error| eprintln!("[oLooper audio] CoreAudio stream error: {error}"),
+            |error| {
+                crate::audio_log::write(&format!("coreaudio_stream_error error={error}"));
+            },
             None,
         )
         .map_err(|error| format!("cannot open requested CoreAudio format: {error}"))
@@ -605,31 +643,63 @@ fn build_output_stream(
 
 struct SelectedOutputConfig {
     device: cpal::Device,
-    supported: Vec<cpal::SupportedStreamConfigRange>,
-    default: cpal::SupportedStreamConfig,
     config: cpal::SupportedStreamConfig,
 }
 
 fn select_output_config(selection: &OutputSelection) -> Result<SelectedOutputConfig, String> {
+    crate::audio_log::write(&format!(
+        "output_selection_requested device={:?} first_channel_index={} sample_rate_request={:?} buffer_frames_request={:?}",
+        selection.device_name,
+        selection.first_channel,
+        selection.sample_rate,
+        selection.buffer_frames,
+    ));
     if selection.first_channel % 2 != 0 {
-        return Err("stereo output must start on channel 1, 3, 5, etc.".to_string());
+        let error = "stereo output must start on channel 1, 3, 5, etc.".to_string();
+        crate::audio_log::write(&format!("output_selection_rejected reason={error}"));
+        return Err(error);
     }
     let host = cpal::default_host();
-    let device = if let Some(name) = &selection.device_name {
+    let device_result: Result<cpal::Device, String> = if let Some(name) = &selection.device_name {
         host.output_devices()
-            .map_err(|error| error.to_string())?
+            .map_err(|error| {
+                let message = format!("cannot enumerate output devices: {error}");
+                crate::audio_log::write(&format!("output_device_enumeration_failed error={error}"));
+                message
+            })?
             .find(|device| device.name().is_ok_and(|device_name| device_name == *name))
-            .ok_or_else(|| format!("audio output device is unavailable: {name}"))?
+            .ok_or_else(|| format!("audio output device is unavailable: {name}"))
     } else {
         host.default_output_device()
-            .ok_or_else(|| "no default audio output device".to_string())?
+            .ok_or_else(|| "no default audio output device".to_string())
     };
+    let device = device_result.map_err(|error| {
+        crate::audio_log::write(&format!("output_device_selection_failed error={error}"));
+        error
+    })?;
+    let device_name = device.name().unwrap_or_else(|_| "unknown".to_string());
 
     let required_channels = selection.first_channel.saturating_add(2);
     let supported = device
         .supported_output_configs()
-        .map_err(|error| format!("cannot query supported output configurations: {error}"))?
+        .map_err(|error| {
+            let message = format!("cannot query supported output configurations: {error}");
+            crate::audio_log::write(&format!(
+                "output_capabilities_failed device={device_name:?} error={error}"
+            ));
+            message
+        })?
         .collect::<Vec<_>>();
+    for candidate in &supported {
+        crate::audio_log::write(&format!(
+            "output_capability device={device_name:?} channels={} sample_rate_min={} sample_rate_max={} sample_format={:?} buffer_size={:?}",
+            candidate.channels(),
+            candidate.min_sample_rate().0,
+            candidate.max_sample_rate().0,
+            candidate.sample_format(),
+            candidate.buffer_size(),
+        ));
+    }
     let max_channels = supported
         .iter()
         .map(|config| config.channels())
@@ -638,9 +708,20 @@ fn select_output_config(selection: &OutputSelection) -> Result<SelectedOutputCon
     // An explicit multichannel interface must use its full stream even for
     // 1–2. Its default *stereo* configuration may represent a different
     // hardware destination (for example the DJ mixer master bus).
-    let default = device
-        .default_output_config()
-        .map_err(|error| format!("cannot query default output configuration: {error}"))?;
+    let default = device.default_output_config().map_err(|error| {
+        let message = format!("cannot query default output configuration: {error}");
+        crate::audio_log::write(&format!(
+            "default_output_config_failed device={device_name:?} error={error}"
+        ));
+        message
+    })?;
+    crate::audio_log::write(&format!(
+        "default_output_config device={device_name:?} channels={} sample_rate={} sample_format={:?} buffer_size={:?}",
+        default.channels(),
+        default.sample_rate().0,
+        default.sample_format(),
+        default.buffer_size(),
+    ));
     let use_default_channels =
         selection.first_channel == 0 && (selection.device_name.is_none() || max_channels <= 2);
     let preferred_channels = use_default_channels.then_some(default.channels());
@@ -652,27 +733,39 @@ fn select_output_config(selection: &OutputSelection) -> Result<SelectedOutputCon
         selection.sample_rate,
         selection.buffer_frames,
         default.sample_format(),
-    )?;
-    validate_output_pair(selection.first_channel, config.channels())?;
+    )
+    .map_err(|error| {
+        crate::audio_log::write(&format!(
+            "output_config_selection_failed device={device_name:?} error={error}"
+        ));
+        error
+    })?;
+    validate_output_pair(selection.first_channel, config.channels()).map_err(|error| {
+        crate::audio_log::write(&format!(
+            "output_channel_pair_rejected device={device_name:?} channels={} first_channel_index={} error={error}",
+            config.channels(),
+            selection.first_channel,
+        ));
+        error
+    })?;
+    crate::audio_log::write(&format!(
+        "output_config_selected device={device_name:?} channels={} sample_rate={} sample_format={:?} buffer_size={:?} route_left_output={} route_right_output={}",
+        config.channels(),
+        config.sample_rate().0,
+        config.sample_format(),
+        config.buffer_size(),
+        selection.first_channel + 1,
+        selection.first_channel + 2,
+    ));
 
-    Ok(SelectedOutputConfig {
-        device,
-        supported,
-        default,
-        config,
-    })
+    Ok(SelectedOutputConfig { device, config })
 }
 
 fn open_output(
     selection: &OutputSelection,
     output_meter: Arc<OutputMeter>,
 ) -> Result<OutputRuntime, String> {
-    let SelectedOutputConfig {
-        device,
-        supported,
-        default,
-        config,
-    } = select_output_config(selection)?;
+    let SelectedOutputConfig { device, config } = select_output_config(selection)?;
     let channels = config.channels();
     let sample_rate = config.sample_rate().0;
     let sample_format = config.sample_format();
@@ -681,6 +774,13 @@ fn open_output(
         stream_config.buffer_size = cpal::BufferSize::Fixed(frames);
     }
     let (mixer, source) = dynamic_mixer::mixer::<f32>(2, sample_rate);
+    let name = device
+        .name()
+        .unwrap_or_else(|_| "unknown output".to_string());
+    crate::audio_log::write(&format!(
+        "output_stream_open_requested device={name:?} channels={channels} sample_rate={sample_rate} sample_format={sample_format:?} buffer_size={:?}",
+        stream_config.buffer_size,
+    ));
     let stream = build_output_stream(
         &device,
         &stream_config,
@@ -689,39 +789,25 @@ fn open_output(
         channels,
         selection.first_channel,
         output_meter,
-    )?;
-    stream
-        .play()
-        .map_err(|error| format!("cannot start CoreAudio output: {error}"))?;
-    let name = device
-        .name()
-        .unwrap_or_else(|_| "unknown output".to_string());
-    eprintln!(
-        "[oLooper audio] Default config: {} ch, {} Hz, {:?}, buffer {:?}",
-        default.channels(),
-        default.sample_rate().0,
-        default.sample_format(),
-        default.buffer_size(),
-    );
-    eprintln!(
-        "[oLooper audio] === OUTPUT CONFIG ===\nDevice: {name}\nRequested rate: {}\nChosen stream: {channels} ch, {sample_rate} Hz, {sample_format:?}, buffer {:?}\nRouting: L -> output {} (index {}), R -> output {} (index {})",
-        selection.sample_rate.map_or_else(|| "device default".to_string(), |rate| format!("{rate} Hz")),
+    )
+    .map_err(|error| {
+        crate::audio_log::write(&format!(
+            "output_stream_open_failed device={name:?} error={error}"
+        ));
+        error
+    })?;
+    stream.play().map_err(|error| {
+        crate::audio_log::write(&format!(
+            "output_stream_start_failed device={name:?} error={error}"
+        ));
+        format!("cannot start CoreAudio output: {error}")
+    })?;
+    crate::audio_log::write(&format!(
+        "output_stream_started device={name:?} channels={channels} sample_rate={sample_rate} sample_format={sample_format:?} buffer_size={:?} route_left_output={} route_right_output={}",
         stream_config.buffer_size,
         selection.first_channel + 1,
-        selection.first_channel,
         selection.first_channel + 2,
-        selection.first_channel + 1,
-    );
-    for candidate in &supported {
-        eprintln!(
-            "[oLooper audio] supported: {} ch, {}–{} Hz, {:?}, buffer {:?}",
-            candidate.channels(),
-            candidate.min_sample_rate().0,
-            candidate.max_sample_rate().0,
-            candidate.sample_format(),
-            candidate.buffer_size(),
-        );
-    }
+    ));
     Ok(OutputRuntime {
         stream,
         mixer,
@@ -1103,6 +1189,10 @@ impl Player {
         self.output_channels = output.channels;
         self.output_sample_rate = output.sample_rate;
         self.first_channel = selection.first_channel;
+        crate::audio_log::write(&format!(
+            "output_route_applied first_channel_index={} output_channels={} output_sample_rate={}",
+            self.first_channel, self.output_channels, self.output_sample_rate
+        ));
         if was_playing {
             if let Some(sink) = &self.sink {
                 sink.play();
@@ -1115,6 +1205,7 @@ impl Player {
         if self.output_test_sink.is_some() {
             return Err("an audio output test is already running".to_string());
         }
+        self.output_meter.reset();
         let buffer = Arc::new(output_test_buffer());
         let source = LoopRegion::new(
             buffer.clone(),
@@ -1159,12 +1250,20 @@ impl Player {
         self.output_test_resume_playback = was_playing;
         sink.play();
         self.output_test_sink = Some(sink);
+        crate::audio_log::write(&format!(
+            "output_test_started left_hz=440 right_hz=660 volume=0.65 first_channel_index={} output_channels={} output_sample_rate={} playback_was_active={was_playing}",
+            self.first_channel, self.output_channels, self.output_sample_rate
+        ));
         Ok(())
     }
 
     fn finish_output_test(&mut self) {
         self.output_test_sink = None;
         let resume = std::mem::replace(&mut self.output_test_resume_playback, false);
+        let (left_peak_pct, right_peak_pct) = self.output_meter.take_percentages();
+        crate::audio_log::write(&format!(
+            "output_test_finished left_peak_pct={left_peak_pct:.2} right_peak_pct={right_peak_pct:.2} resume_playback={resume}"
+        ));
         if resume {
             let _ = self.play();
         }
@@ -1347,6 +1446,15 @@ impl Player {
         }
         let volume = t.volume;
         let speed = if t.pitch_lock { 1.0 } else { t.speed };
+        crate::audio_log::write(&format!(
+            "playback_started source_channels={} source_sample_rate={} start_frame={} end_frame={} loop_enabled={} volume={volume:.3} speed={speed:.3} pitch_lock={}",
+            t.buf.channels,
+            t.buf.rate,
+            t.start_frame,
+            t.end_frame,
+            t.enabled,
+            t.pitch_lock,
+        ));
         let src = LoopRegion::new(
             t.buf.clone(),
             t.resume_frame,
@@ -1375,6 +1483,7 @@ impl Player {
             .ok_or("nothing playing")?;
         t.resume_frame = t.cursor.load(Ordering::Relaxed);
         sink.pause();
+        crate::audio_log::write(&format!("playback_paused frame={}", t.resume_frame));
         Ok(self.status())
     }
 
@@ -1384,6 +1493,7 @@ impl Player {
         self.sink = None; // drop first: no callback may advance the cursor after reset
         t.resume_frame = t.start_frame; // spec: stop returns to loop start
         t.cursor.store(t.start_frame, Ordering::Relaxed);
+        crate::audio_log::write(&format!("playback_stopped frame={}", t.start_frame));
         Ok(self.status())
     }
 
@@ -1412,6 +1522,9 @@ impl Player {
             track.pitch_error = None;
             track.pitch_lock
         };
+        crate::audio_log::write(&format!(
+            "playback_speed_changed speed={speed:.3} pitch_lock={locked}"
+        ));
         if locked {
             // New speed supersedes any in-flight stretch; current audio
             // keeps playing untouched until the new buffer is ready.
@@ -1435,6 +1548,9 @@ impl Player {
             track.pitch_error = None;
             track.buf = track.original_buf.clone();
             let speed = track.speed;
+            crate::audio_log::write(&format!(
+                "pitch_lock_changed enabled=false speed={speed:.3}"
+            ));
             if let Some(sink) = &self.sink {
                 sink.set_speed(speed);
             }
@@ -1456,6 +1572,10 @@ impl Player {
                 true
             }
         };
+        crate::audio_log::write(&format!(
+            "pitch_lock_changed enabled=true speed={}",
+            self.track.as_ref().map_or(1.0, |track| track.speed)
+        ));
         if needs_stretch {
             self.request_stretch();
         }
@@ -1533,6 +1653,10 @@ impl Player {
             .sink
             .as_ref()
             .is_some_and(|s| !s.is_paused() && !s.empty());
+        crate::audio_log::write(&format!(
+            "loop_region_updated start_frame={start} end_frame={end} enabled={} was_playing={was_playing}",
+            t.enabled
+        ));
         if was_playing {
             // Restart the region from the new start for sample-accurate behavior.
             t.resume_frame = t.start_frame;
@@ -1574,6 +1698,10 @@ impl Player {
             .sink
             .as_ref()
             .is_some_and(|s| !s.is_paused() && !s.empty());
+        crate::audio_log::write(&format!(
+            "loop_region_updated start_frame={start_frame} end_frame={end_frame} enabled={} was_playing={was_playing}",
+            t.enabled
+        ));
         if was_playing {
             t.resume_frame = t.start_frame;
             let volume = t.volume;
@@ -1616,12 +1744,21 @@ impl Player {
             .as_ref()
             .is_some_and(|s| !s.is_paused() && !s.empty());
         if !was_playing {
-            self.track.as_mut().ok_or("nothing loaded")?.enabled = enabled;
+            let track = self.track.as_mut().ok_or("nothing loaded")?;
+            track.enabled = enabled;
+            crate::audio_log::write(&format!(
+                "loop_enabled_changed enabled={enabled} start_frame={} end_frame={}",
+                track.start_frame, track.end_frame
+            ));
             return Ok(self.status());
         }
         let (src, volume, speed) = {
             let t = self.track.as_mut().ok_or("nothing loaded")?;
             t.enabled = enabled;
+            crate::audio_log::write(&format!(
+                "loop_enabled_changed enabled={enabled} start_frame={} end_frame={}",
+                t.start_frame, t.end_frame
+            ));
             // LoopRegion captures this flag when created, so rebuild the
             // source immediately instead of waiting for another transport action.
             let cursor = t.cursor.load(Ordering::Relaxed);
@@ -2116,6 +2253,7 @@ impl Engine {
         self.pending_load = None;
         let buf = match result {
             Err(e) => {
+                crate::audio_log::write(&format!("audio_decode_failed error={e}"));
                 self.last_load_error = Some(e);
                 return;
             }
@@ -2158,6 +2296,13 @@ impl Engine {
         })();
         match applied {
             Ok(snapshot) => {
+                crate::audio_log::write(&format!(
+                    "decoded_audio_loaded frames={} channels={} sample_rate={} duration_ms={}",
+                    snapshot.2.frames(),
+                    snapshot.2.channels,
+                    snapshot.2.rate,
+                    snapshot.2.duration_ms(),
+                ));
                 self.cache_decoded(snapshot.0.clone(), snapshot.2.clone());
                 let path = snapshot.0.clone();
                 let published = std::time::Instant::now();

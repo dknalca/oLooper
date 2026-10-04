@@ -23,6 +23,7 @@ fn import_unmark_cancelled(job_id: &str) {
 }
 
 pub mod analysis;
+pub mod audio_log;
 pub mod autoloop;
 pub mod import;
 pub mod library;
@@ -694,6 +695,8 @@ fn library_default_root() -> Result<String, String> {
 fn library_init(root: String, db: Db<'_>) -> Result<String, String> {
     let lib = library::Library::open(std::path::Path::new(&root))?;
     let canonical = lib.root.canonicalize().map_err(|e| e.to_string())?;
+    audio_log::set_library_root(&canonical)
+        .map_err(|error| format!("cannot initialize audio log folder: {error}"))?;
     let root = canonical.to_string_lossy().to_string();
     *db.lock().map_err(|e| e.to_string())? = Some(lib);
     Ok(root)
@@ -714,6 +717,8 @@ fn library_restore(root: Option<String>, db: Db<'_>) -> Result<Option<String>, S
     }
     let lib = library::Library::open(path)?;
     let canonical = lib.root.canonicalize().map_err(|e| e.to_string())?;
+    audio_log::set_library_root(&canonical)
+        .map_err(|error| format!("cannot initialize audio log folder: {error}"))?;
     *db.lock().map_err(|e| e.to_string())? = Some(lib);
     Ok(Some(canonical.to_string_lossy().to_string()))
 }

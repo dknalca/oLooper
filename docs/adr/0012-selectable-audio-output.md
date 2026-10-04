@@ -44,6 +44,11 @@ unselected outputs when Rodio converts/resamples for a multichannel mixer.
   close only when playback was active at dialog entry.
 - L/R meters are digital peak measurements in the routed source before the
   hardware interface; no analog loopback is implied.
+- After the library root is initialized, timestamped audio diagnostics are
+  persisted under `<library>/log/`, including host architecture/Rosetta state,
+  CoreAudio capabilities and stream choices, and output-test levels. Logs omit
+  track names and source paths and are capped by rotating at 2 MiB. The
+  real-time sample callback never writes to disk.
 - The CPAL callback only pulls prepared stereo Rodio-mixer samples, applies the
   physical channel mapping and digital peak metering, and converts to the
   selected device sample format. Decoding remains outside the callback.

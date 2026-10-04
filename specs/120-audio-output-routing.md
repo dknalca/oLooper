@@ -77,6 +77,13 @@ other than 1–2.
 - The CPAL callback only pulls ready stereo samples from Rodio's mixer, maps
   them to the selected pair, updates digital peak meters, and converts their
   sample format; decoding and file I/O stay outside it.
+- On library initialization, diagnostics are appended to
+  `<library>/log/audio-output.log`; the previous file is retained as
+  `audio-output.previous.log` when the active log reaches 2 MiB. Entries record
+  session OS/CPU/Rosetta facts, enumerated output capabilities, selection and
+  stream results/errors, output-test peak levels, and decoded audio/loop shape.
+  They omit track names, source paths, and audio data; no per-buffer callback
+  logging or disk I/O is performed.
 - The frontend invokes output commands through `src/tauri.ts`; the backend
   applies routing on the existing audio engine thread.
 
