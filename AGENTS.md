@@ -7,7 +7,7 @@ Tauri 2 desktop app: React/TypeScript frontend (`src/`) and Rust backend (`src-t
 - Use `pnpm` (lockfile is `pnpm-lock.yaml`). Dev: `pnpm install && pnpm tauri dev`; Vite requires fixed port `1420` (`vite.config.ts` / Tauri `devUrl`).
 - Typecheck: `pnpm run typecheck`. Frontend tests: `pnpm test`; focused test: `pnpm vitest run src/importFlow.test.ts`.
 - Rust tests: `cd src-tauri && cargo test`; focused test: `cargo test <name>` (add `-- --exact` for exact match).
-- App build: `./scripts/build.sh [--dev]`. It installs frozen dependencies and generates required icons before invoking Tauri, then copies the app bundle to `./oLooper.app`; don't bypass it for local app builds. DMG: `./scripts/package-dmg.sh` after building (unsigned, macOS only).
+- App build: `./scripts/build.sh [--dev | --native]`. Release builds are universal macOS bundles by default (Intel + Apple Silicon); `--native` makes a single-architecture release, and `--dev` makes a native debug build. It installs frozen dependencies and generates required icons before invoking Tauri, then copies the app bundle to `./oLooper.app`; don't bypass it for local app builds. DMG: `./scripts/package-dmg.sh` after building (unsigned, macOS only).
 - The ignored SWF regression test requires a real fixture: `OLOOPER_TURNTABLE_FIXTURE=/path/to/file.swf cargo test -- --ignored turntable_fixture` from `src-tauri/`. Real samples belong in gitignored `loopersFlash/`, never in commits.
 
 ## Architecture and constraints
