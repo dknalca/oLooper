@@ -6,22 +6,34 @@ Accepted
 
 ## Context
 
-oLooper's Rodio output stream used the system's default device and default
-stream configuration. That is insufficient for multichannel DJ interfaces,
-where the desired cue/program signal may be connected to a stereo pair such as
-outputs 2–3. The audio engine runs on a dedicated thread because Rodio stream
-and sink objects are not `Send`.
+oLooper needs explicit multichannel routing for DJ interfaces. Rodio 0.20's
+`OutputStream::try_from_device_config` may fall back to a different supported
+configuration after an open failure, without returning the actual configuration
+it opened. A fallback from a multichannel stream to stereo can route audio to a
+different physical destination. Rodio's Sink queue initially describes itself
+as mono; changing channel layouts while it is queued can also leak audio into
+unselected outputs when Rodio converts/resamples for a multichannel mixer.
 
 ## Decision
 
-- Enumerate output devices and supported channel counts through CPAL.
+- Enumerate output devices and supported channels, sample rates, sample formats,
+  and buffer ranges through CPAL.
 - Keep the system default as the initial selection; allow an explicit device
-  override and a zero-based first channel for the stereo pair.
-- Use Rodio for stream and sink lifecycle, and route each mono/stereo source
-  into a multichannel stream with silence on unselected channels.
+  override, an even zero-based first channel for the stereo pair, an optional
+  supported sample rate, and an optional buffer frame count.
+- Build the CPAL stream directly with the chosen `StreamConfig` and sample
+  format. Do not allow Rodio to silently fall back to another device config.
+- Use Rodio's mixer/Sink for decoded sources. Wrap each Sink queue with its
+  stable source channel count and source sample rate. Rodio converts and
+  resamples sources into a two-channel mixer at the selected device rate; the
+  CPAL callback then maps that stereo bus to the selected hardware pair and
+  zeros all other channels.
+- Default to the device's default sample rate and CoreAudio buffer. Explicit
+  sample rates and buffers are chosen only from the device's advertised ranges.
 - Serialize setting changes through the existing audio engine command queue.
 - Persist the active device and each device's stereo-pair choice in frontend
-  local storage, not the audio catalog.
+  local storage, not the audio catalog; persist sample-rate and buffer
+  selections with the active device preference.
 
 ## Consequences
 
@@ -32,6 +44,9 @@ and sink objects are not `Send`.
   close only when playback was active at dialog entry.
 - L/R meters are digital peak measurements in the routed source before the
   hardware interface; no analog loopback is implied.
+- The CPAL callback only pulls prepared stereo Rodio-mixer samples, applies the
+  physical channel mapping and digital peak metering, and converts to the
+  selected device sample format. Decoding remains outside the callback.
 - Device names are used as selection identifiers because CPAL 0.15 does not
   expose stable cross-session device IDs. If an interface is renamed or
   disconnected, the user can select another device or return to system default.

@@ -61,6 +61,10 @@ export default function Sidebar({ libraryReady, refreshKey, activeTrackId, onReg
   const [activeId, setActiveId] = useState<number | null>(null);
   const [contextMenu, setContextMenu] = useState<number | null>(null);
   const [groupMenu, setGroupMenu] = useState<string | null>(null);
+  const [editingTrack, setEditingTrack] = useState<Track | null>(null);
+  const [metadataDraft, setMetadataDraft] = useState({ title: "", bpm: "", tags: "" });
+  const [metadataBusy, setMetadataBusy] = useState(false);
+  const [metadataError, setMetadataError] = useState<string | null>(null);
   const [menuPosition, setMenuPosition] = useState({ x: 16, y: 16 });
   const [selectedIds, setSelectedIds] = useState<number[]>([]);
   const [loadingId, setLoadingId] = useState<number | null>(null);
@@ -250,27 +254,45 @@ export default function Sidebar({ libraryReady, refreshKey, activeTrackId, onReg
   };
 
   const editTrack = (track: Track) => {
-    const title = window.prompt("Loop title", track.title)?.trim();
-    if (!title) return;
-    const bpmInput = window.prompt("BPM (leave empty to keep current)", track.bpm?.toString() ?? "");
-    if (bpmInput === null) return;
-    const bpm = bpmInput.trim() ? Number(bpmInput) : track.bpm;
-    if (bpm !== null && (!Number.isFinite(bpm) || bpm < 20 || bpm > 300)) { setError("BPM must be between 20 and 300"); return; }
-    const tags = window.prompt("Tags (comma separated)", track.tags)?.trim();
-    if (tags === undefined) return;
-    libraryUpdateMetadata(track.id, title, bpm, tags).then(async (updated) => {
-      if (updated.bpm !== null && updated.bpm !== track.bpm) {
+    setMetadataDraft({ title: track.title, bpm: track.bpm?.toString() ?? "", tags: track.tags });
+    setMetadataError(null);
+    setEditingTrack(track);
+    setContextMenu(null);
+  };
+
+  const saveTrackMetadata = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!editingTrack) return;
+    const title = metadataDraft.title.trim();
+    if (!title) {
+      setMetadataError("Loop title cannot be empty.");
+      return;
+    }
+    const bpmText = metadataDraft.bpm.trim();
+    const bpm = bpmText ? Number(bpmText) : editingTrack.bpm;
+    if (bpm !== null && (!Number.isFinite(bpm) || bpm < 20 || bpm > 300)) {
+      setMetadataError("BPM must be between 20 and 300.");
+      return;
+    }
+
+    setMetadataBusy(true);
+    setMetadataError(null);
+    try {
+      const updated = await libraryUpdateMetadata(editingTrack.id, title, bpm, metadataDraft.tags.trim());
+      setTracks((current) => current.map((track) => track.id === updated.id ? updated : track));
+      setEditingTrack(null);
+      if (updated.bpm !== null && updated.bpm !== editingTrack.bpm) {
         try {
-          await librarySyncSeratoMetadata(track.id);
+          await librarySyncSeratoMetadata(editingTrack.id);
         } catch (cause) {
-          refresh();
-          setError(`BPM saved in oLooper, but Serato sync failed: ${String(cause)}`);
-          return;
+          setError(`Metadata saved in oLooper, but Serato BPM sync failed: ${String(cause)}`);
         }
       }
-      refresh();
-    }).catch((cause) => setError(String(cause)));
-    setContextMenu(null);
+    } catch (cause) {
+      setMetadataError(String(cause));
+    } finally {
+      setMetadataBusy(false);
+    }
   };
 
   const removeGroup = (sourceHash: string, name: string) => {
@@ -509,7 +531,7 @@ export default function Sidebar({ libraryReady, refreshKey, activeTrackId, onReg
           <button onClick={() => { const track = tracks.find((item) => item.id === contextMenu); if (track) void playTrack(track); setContextMenu(null); }} className="w-full px-3 py-1.5 text-left text-xs text-text hover:bg-surface-hover">Play now</button>
           <button onClick={() => { const track = tracks.find((item) => item.id === contextMenu); if (track) revealInFileManager(track.file_path).catch((e: unknown) => setError(String(e))); setContextMenu(null); }} className="w-full px-3 py-1.5 text-left text-xs text-text hover:bg-surface-hover">Reveal audio file</button>
           <button onClick={() => { const track = tracks.find((item) => item.id === contextMenu); if (track) toggleFavorite(track); setContextMenu(null); }} className="w-full px-3 py-1.5 text-left text-xs text-text hover:bg-surface-hover">{tracks.find((item) => item.id === contextMenu)?.favorite ? "Remove favorite" : "Add favorite"}</button>
-          <button onClick={() => { const track = tracks.find((item) => item.id === contextMenu); if (track) editTrack(track); }} className="w-full px-3 py-1.5 text-left text-xs text-text hover:bg-surface-hover">Edit metadata</button>
+          <button onClick={() => { const track = tracks.find((item) => item.id === contextMenu); if (track) editTrack(track); else setContextMenu(null); }} className="w-full px-3 py-1.5 text-left text-xs text-text hover:bg-surface-hover">Edit metadata</button>
           <button
             onClick={() => {
               const track = tracks.find((item) => item.id === contextMenu);
@@ -536,6 +558,70 @@ export default function Sidebar({ libraryReady, refreshKey, activeTrackId, onReg
           </div>
         );
       })()}
+      {editingTrack && (
+        <div
+          className="fixed inset-0 z-[110] flex items-center justify-center bg-app/75 p-4 backdrop-blur-sm"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget && !metadataBusy) setEditingTrack(null);
+          }}
+        >
+          <form
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="edit-track-metadata-title"
+            onSubmit={(event) => void saveTrackMetadata(event)}
+            className="w-full max-w-md rounded-lg border border-border bg-surface p-5 shadow-2xl"
+          >
+            <h2 id="edit-track-metadata-title" className="mb-4 text-base font-semibold text-text">Edit metadata</h2>
+            <label className="mb-3 block text-xs text-text-secondary">
+              Loop title
+              <input
+                autoFocus
+                value={metadataDraft.title}
+                onChange={(event) => setMetadataDraft((draft) => ({ ...draft, title: event.target.value }))}
+                disabled={metadataBusy}
+                className="mt-1 block w-full rounded border border-border bg-elevated px-2.5 py-2 text-sm text-text disabled:opacity-50"
+              />
+            </label>
+            <label className="mb-3 block text-xs text-text-secondary">
+              BPM <span className="text-text-secondary/70">(leave empty to keep current)</span>
+              <input
+                type="number"
+                min={20}
+                max={300}
+                step="any"
+                value={metadataDraft.bpm}
+                onChange={(event) => setMetadataDraft((draft) => ({ ...draft, bpm: event.target.value }))}
+                disabled={metadataBusy}
+                className="mt-1 block w-full rounded border border-border bg-elevated px-2.5 py-2 text-sm text-text disabled:opacity-50"
+              />
+            </label>
+            <label className="mb-4 block text-xs text-text-secondary">
+              Tags <span className="text-text-secondary/70">(comma separated)</span>
+              <input
+                value={metadataDraft.tags}
+                onChange={(event) => setMetadataDraft((draft) => ({ ...draft, tags: event.target.value }))}
+                disabled={metadataBusy}
+                className="mt-1 block w-full rounded border border-border bg-elevated px-2.5 py-2 text-sm text-text disabled:opacity-50"
+              />
+            </label>
+            {metadataError && <p className="mb-3 text-xs text-danger" role="alert">{metadataError}</p>}
+            <div className="flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setEditingTrack(null)}
+                disabled={metadataBusy}
+                className="rounded bg-border px-3 py-2 text-xs text-text-secondary hover:text-text disabled:opacity-40"
+              >Cancel</button>
+              <button
+                type="submit"
+                disabled={metadataBusy}
+                className="rounded bg-accent px-3 py-2 text-xs font-medium text-white disabled:opacity-40"
+              >{metadataBusy ? "Saving…" : "Save metadata"}</button>
+            </div>
+          </form>
+        </div>
+      )}
       {error && <div className="border-t border-danger/30 px-3 py-1.5 text-[10px] text-danger" role="alert">{error}</div>}
     </aside>
   );

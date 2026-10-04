@@ -94,12 +94,17 @@ export interface AudioOutputDevice {
   id: string;
   name: string;
   channels: number;
+  sample_rates: number[];
+  buffer_size_min: number | null;
+  buffer_size_max: number | null;
   is_default: boolean;
 }
 
 export interface AudioOutputSelection {
   deviceName: string | null;
   firstChannel: number;
+  sampleRate: number | null;
+  bufferFrames: number | null;
 }
 
 export function audioOutputDevices(): Promise<AudioOutputDevice[]> {
@@ -110,6 +115,8 @@ export function audioSetOutput(selection: AudioOutputSelection): Promise<PlayerS
   return invoke<PlayerStatus>("audio_set_output", {
     deviceName: selection.deviceName,
     firstChannel: selection.firstChannel,
+    sampleRate: selection.sampleRate,
+    bufferFrames: selection.bufferFrames,
   });
 }
 
@@ -117,6 +124,8 @@ export function audioTestOutput(selection: AudioOutputSelection): Promise<Player
   return invoke<PlayerStatus>("audio_test_output", {
     deviceName: selection.deviceName,
     firstChannel: selection.firstChannel,
+    sampleRate: selection.sampleRate,
+    bufferFrames: selection.bufferFrames,
   });
 }
 

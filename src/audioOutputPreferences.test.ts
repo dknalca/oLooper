@@ -8,8 +8,8 @@ import {
 
 describe("audio output pair preferences", () => {
   it("remembers a separate stereo pair for each device", () => {
-    const djm = { deviceName: "DJM-S11", firstChannel: 2 };
-    const speakers = { deviceName: "Built-in Output", firstChannel: 0 };
+    const djm = { deviceName: "DJM-S11", firstChannel: 2, sampleRate: 48000, bufferFrames: 256 };
+    const speakers = { deviceName: "Built-in Output", firstChannel: 0, sampleRate: null, bufferFrames: null };
     const saved = rememberOutputPair(rememberOutputPair({}, djm), speakers);
 
     expect(rememberedOutputPair(saved, "DJM-S11")).toBe(2);

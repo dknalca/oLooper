@@ -18,30 +18,43 @@ fn cursor() -> Arc<AtomicUsize> {
 
 #[test]
 fn routes_stereo_source_to_selected_multichannel_pair() {
-    let buffer = Arc::new(LoopBuffer {
-        samples: vec![10, 11, 20, 21],
-        channels: 2,
-        rate: 44_100,
-    });
-    let source = LoopRegion::new(buffer, 0, 0, 2, false, cursor());
-    let meter = Arc::new(OutputMeter::default());
-    let routed = RoutedLoopRegion::new(source, 4, 2, meter.clone());
-    assert_eq!(rodio::Source::channels(&routed), 4);
-    assert_eq!(routed.collect::<Vec<_>>(), vec![0, 0, 10, 11, 0, 0, 20, 21]);
-    let (left, right) = meter.take_percentages();
-    assert!(left > 0.0 && right > 0.0);
+    let mut frame = [1.0f32; 8];
+    map_stereo_frame(
+        &mut frame,
+        2,
+        10.0 / i16::MAX as f32,
+        11.0 / i16::MAX as f32,
+    );
+    assert_eq!(
+        frame,
+        [
+            0.0,
+            0.0,
+            10.0 / i16::MAX as f32,
+            11.0 / i16::MAX as f32,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+        ]
+    );
 }
 
 #[test]
 fn routes_mono_source_to_both_channels_of_selected_pair() {
-    let buffer = Arc::new(LoopBuffer {
-        samples: vec![7, 9],
-        channels: 1,
-        rate: 44_100,
-    });
-    let source = LoopRegion::new(buffer, 0, 0, 2, false, cursor());
-    let routed = RoutedLoopRegion::new(source, 4, 2, Arc::new(OutputMeter::default()));
-    assert_eq!(routed.collect::<Vec<_>>(), vec![0, 0, 7, 7, 0, 0, 9, 9]);
+    let mut frame = [1.0f32; 6];
+    map_stereo_frame(&mut frame, 2, 7.0 / i16::MAX as f32, 9.0 / i16::MAX as f32);
+    assert_eq!(
+        frame,
+        [
+            0.0,
+            0.0,
+            7.0 / i16::MAX as f32,
+            9.0 / i16::MAX as f32,
+            0.0,
+            0.0
+        ]
+    );
 }
 
 #[test]
@@ -54,71 +67,156 @@ fn stereo_pairs_do_not_straddle_two_hardware_outputs() {
 }
 
 #[test]
-fn rodio_stream_keeps_all_unselected_djm_channels_silent_after_resampling() {
-    // Exercise the same Sink -> queue -> Rodio mixer path that feeds CPAL,
-    // including its 44.1 kHz -> 48 kHz conversion. The test tone alone cannot
-    // detect leaks introduced later than RoutedLoopRegion.
-    for first_channel in [0, 2, 4, 6] {
-        let samples = (0..4_410)
-            .flat_map(|frame| [1_000 + (frame % 100) as i16, -2_000])
-            .collect();
-        let buffer = Arc::new(LoopBuffer {
-            samples,
-            channels: 2,
-            rate: 44_100,
-        });
-        let source = LoopRegion::new(buffer, 0, 0, 4_410, true, cursor());
-        let (sink, queue) = Sink::new_idle();
-        sink.set_volume(0.8);
-        queue_routed_source(
-            &sink,
-            source,
-            8,
-            first_channel,
-            Arc::new(OutputMeter::default()),
-            true,
-        );
-        let (controller, mut stream) = rodio::dynamic_mixer::mixer::<f32>(8, 48_000);
-        controller.add(RoutedOutputQueue {
-            inner: queue,
-            channels: 8,
-            rate: 44_100,
-        });
+fn output_config_selection_respects_channels_rate_format_and_buffer() {
+    let supported = vec![
+        cpal::SupportedStreamConfigRange::new(
+            2,
+            cpal::SampleRate(44_100),
+            cpal::SampleRate(96_000),
+            cpal::SupportedBufferSize::Range { min: 64, max: 1024 },
+            cpal::SampleFormat::F32,
+        ),
+        cpal::SupportedStreamConfigRange::new(
+            14,
+            cpal::SampleRate(48_000),
+            cpal::SampleRate(48_000),
+            cpal::SupportedBufferSize::Range {
+                min: 128,
+                max: 2048,
+            },
+            cpal::SampleFormat::I16,
+        ),
+    ];
 
-        let rendered: Vec<_> = stream.by_ref().take(8 * 1_000).collect();
-        assert_eq!(rendered.len(), 8 * 1_000);
-        for frame in rendered.chunks_exact(8) {
-            for (channel, sample) in frame.iter().enumerate() {
-                if channel != first_channel as usize && channel != first_channel as usize + 1 {
-                    assert!(
-                        sample.abs() < 1e-6,
-                        "unexpected signal on output {} for pair {}–{}: {sample}",
-                        channel + 1,
-                        first_channel + 1,
-                        first_channel + 2
+    let selected = choose_output_config(
+        &supported,
+        4,
+        None,
+        44_100,
+        Some(48_000),
+        Some(256),
+        cpal::SampleFormat::F32,
+    )
+    .unwrap();
+    assert_eq!(selected.channels(), 14);
+    assert_eq!(selected.sample_rate().0, 48_000);
+    assert_eq!(selected.sample_format(), cpal::SampleFormat::I16);
+
+    assert!(choose_output_config(
+        &supported,
+        4,
+        None,
+        44_100,
+        Some(44_100),
+        Some(256),
+        cpal::SampleFormat::F32,
+    )
+    .is_err());
+    assert!(choose_output_config(
+        &supported,
+        4,
+        None,
+        48_000,
+        Some(48_000),
+        Some(4096),
+        cpal::SampleFormat::F32,
+    )
+    .is_err());
+}
+
+#[test]
+fn rodio_resamples_stereo_before_cpals_multichannel_mapping() {
+    // Exercise Sink -> source-rate conversion -> stereo mixer -> the exact
+    // post-mixer frame mapper used by CPAL for many device layouts.
+    for source_rate in [48_000, 44_100] {
+        for output_channels in [2, 4, 6, 8, 14, 16, 32] {
+            for first_channel in (0..output_channels).step_by(2) {
+                for input_channels in [1, 2] {
+                    let source_frames = source_rate / 10;
+                    let samples = (0..source_frames)
+                        .flat_map(|frame| {
+                            let left = 1_000 + (frame % 100) as i16;
+                            if input_channels == 1 {
+                                vec![left]
+                            } else {
+                                vec![left, -2_000]
+                            }
+                        })
+                        .collect();
+                    let buffer = Arc::new(LoopBuffer {
+                        samples,
+                        channels: input_channels,
+                        rate: source_rate,
+                    });
+                    let source =
+                        LoopRegion::new(buffer, 0, 0, source_frames as usize, true, cursor());
+                    let (sink, queue) = Sink::new_idle();
+                    sink.set_volume(0.8);
+                    sink.pause();
+                    sink.append(source);
+                    let (controller, mut stream) = rodio::dynamic_mixer::mixer::<f32>(2, 48_000);
+                    controller.add(RoutedOutputQueue {
+                        inner: queue,
+                        channels: input_channels,
+                        rate: source_rate,
+                    });
+                    sink.play();
+
+                    let mut rendered = vec![0.0f32; output_channels as usize * 256];
+                    render_routed_output(
+                        &mut rendered,
+                        output_channels,
+                        first_channel,
+                        &mut stream,
+                        &OutputMeter::default(),
                     );
+                    for (frame_index, frame) in
+                        rendered.chunks_exact(output_channels as usize).enumerate()
+                    {
+                        for (channel, sample) in frame.iter().enumerate() {
+                            if channel != first_channel as usize
+                                && channel != first_channel as usize + 1
+                            {
+                                assert!(
+                            sample.abs() < 1e-6,
+                            "unexpected signal on output {} frame {} for input {} ch, output {} ch pair {}–{} at {} Hz: {sample}",
+                            channel + 1,
+                            frame_index,
+                            input_channels,
+                            output_channels,
+                            first_channel + 1,
+                            first_channel + 2,
+                            source_rate
+                        );
+                            }
+                        }
+                    }
+                    assert!(rendered
+                        .iter()
+                        .skip(first_channel as usize)
+                        .step_by(output_channels as usize)
+                        .any(|sample| *sample != 0.0));
+                    assert!(rendered
+                        .iter()
+                        .skip(first_channel as usize + 1)
+                        .step_by(output_channels as usize)
+                        .any(|sample| *sample != 0.0));
+                    assert!(rendered
+                        .iter()
+                        .skip(first_channel as usize + 1)
+                        .step_by(output_channels as usize)
+                        .any(|sample| *sample != 0.0));
                 }
             }
         }
-        assert!(rendered
-            .iter()
-            .skip(first_channel as usize)
-            .step_by(8)
-            .any(|sample| *sample != 0.0));
     }
 }
 
 #[test]
 fn routed_output_meter_tracks_left_and_right_peak_after_volume() {
-    let buffer = Arc::new(LoopBuffer {
-        samples: vec![16_384, 8_192, 16_384, 8_192],
-        channels: 2,
-        rate: 48_000,
-    });
-    let source = LoopRegion::new(buffer, 0, 0, 2, false, cursor());
-    let meter = Arc::new(OutputMeter::default());
-    meter.set_gain(0.5);
-    let _ = RoutedLoopRegion::new(source, 2, 0, meter.clone()).collect::<Vec<_>>();
+    let meter = OutputMeter::default();
+    // These are peak samples after sink volume has already been applied.
+    meter.publish(8_192, 4_096);
     let (left, right) = meter.take_percentages();
     assert!((left - 25.0).abs() < 0.1);
     assert!((right - 12.5).abs() < 0.1);
@@ -149,7 +247,8 @@ fn output_test_buffer_sends_left_then_right_tones() {
 fn output_reconfiguration_keeps_a_paused_transport_paused() {
     let (sink, _queue) = Sink::new_idle();
     let source = LoopRegion::new(mono(vec![1, 2]), 0, 0, 2, true, cursor());
-    queue_routed_source(&sink, source, 2, 0, Arc::new(OutputMeter::default()), false);
+    sink.pause();
+    sink.append(source);
     assert!(sink.is_paused());
 }
 
@@ -157,7 +256,9 @@ fn output_reconfiguration_keeps_a_paused_transport_paused() {
 fn output_reconfiguration_resumes_a_playing_transport() {
     let (sink, _queue) = Sink::new_idle();
     let source = LoopRegion::new(mono(vec![1, 2]), 0, 0, 2, true, cursor());
-    queue_routed_source(&sink, source, 2, 0, Arc::new(OutputMeter::default()), true);
+    sink.pause();
+    sink.append(source);
+    sink.play();
     assert!(!sink.is_paused());
 }
 

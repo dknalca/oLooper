@@ -9,7 +9,8 @@ other than 1–2.
 
 ## User-visible behavior
 
-1. **oLooper → Audio Output…** opens device and stereo-pair selectors.
+1. **oLooper → Audio Output…** opens device, stereo-pair, sample-rate and
+   buffer-size selectors.
 2. System default is the initial setting and follows the default output chosen
    in macOS. Selecting a device overrides that default for oLooper only.
 3. Available stereo pairs are derived from the device's supported output
@@ -18,23 +19,27 @@ other than 1–2.
    outputs; old saved odd selections fall back to the preceding complete pair.
    The dialog shows device availability and the number of output channels;
    disconnected saved devices can be refreshed or replaced.
-4. Mono audio is duplicated to both channels of the selected pair. Stereo audio
+4. Sample rate can follow the device default or use one of its advertised rates.
+   Buffer size can remain at CoreAudio's default or use a frame count inside the
+   selected device's advertised range. Unsupported combinations return an error
+   without replacing the current stream.
+5. Mono audio is duplicated to both channels of the selected pair. Stereo audio
     routes left/right to that pair; every other output channel is silent.
-5. Opening Audio Output stops an active track at the loop start. Applying a new
+6. Opening Audio Output stops an active track at the loop start. Applying a new
    route reconnects the stream while stopped. Closing the dialog starts the
    loaded track from the loop start only if it was playing on entry; a track
    that was paused on entry stays paused. Track, loop, speed, pitch lock, and
    volume are preserved.
-6. **Test L/R** sends a short, moderate-volume 440 Hz tone to the left channel,
+7. **Test L/R** sends a short, moderate-volume 440 Hz tone to the left channel,
     then a 660 Hz tone to the right channel. It applies the selected route,
     temporarily takes the routed stream for the test. Track playback is stopped
     for the entire dialog; closing resumes from loop start only if playback was
     active when the dialog opened.
-7. The selected device and its stereo pair are remembered independently for each
+8. The selected device and its stereo pair are remembered independently for each
     device in local app settings.
    A missing saved device is reported when applying settings; playback can use
    the system default instead.
-8. The dialog displays whether the selected device is available, its supported
+9. The dialog displays whether the selected device is available, its supported
    output-channel count, and digital L/R peak levels. These meter values are
    measured before the interface and do not claim to sense its physical outputs.
 
@@ -52,17 +57,26 @@ other than 1–2.
 
 ## Implementation
 
-- CPAL enumerates devices and their supported output channel counts.
-- Rodio owns the output stream and sink. A channel-routing source places the
-  practice player's mono/stereo samples at the chosen output indices.
-- Rodio's sink queue starts with an empty mono source; its output mixer must
-  receive a queue that advertises the *fixed selected stream channel count and
-  track sample rate* from creation. Otherwise its initial mono conversion can
-  copy real audio into channels outside the selected pair, despite the routing
-  source itself producing zeros there.
+- CPAL enumerates devices and their supported channel counts, sample rates,
+  sample formats, and buffer sizes, then opens the selected stream directly.
+- Rodio's Sink queues feed a two-channel mixer at the selected device rate.
+  Each queue advertises its stable source channel count and source sample rate
+  from creation; its initial silence source is mono, so changing metadata after
+  samples are queued could trigger unwanted channel conversion.
+- Rodio converts/resamples source PCM into the stereo mixer before physical
+  routing. The CPAL callback places those two samples at the selected hardware
+  pair and zeros every other output channel. This keeps Rodio's channel
+  conversion out of the multichannel hardware layout.
 - An explicitly selected multichannel interface opens its full-channel stream
   even for Output 1–2. Opening the device's default stereo stream instead may
   select a different hardware destination, such as a mixer master bus.
+- CPAL's chosen channel count, sample rate, sample format and buffer size are used
+  directly to open the stream. Rodio is not allowed to silently fall back to a
+  different output configuration. Track PCM stays at its decoded rate until
+  Rodio's sample-rate converter feeds the chosen device rate.
+- The CPAL callback only pulls ready stereo samples from Rodio's mixer, maps
+  them to the selected pair, updates digital peak meters, and converts their
+  sample format; decoding and file I/O stay outside it.
 - The frontend invokes output commands through `src/tauri.ts`; the backend
   applies routing on the existing audio engine thread.
 
@@ -73,6 +87,10 @@ other than 1–2.
   resampling produces zero samples on all unselected DJM-S11 output channels.
 - [x] The selector exposes only complete stereo pairs; the backend rejects
   overlapping pairs that straddle two hardware outputs.
+- [x] Device sample rate and CoreAudio buffer can be selected or left at their
+  advertised defaults; incompatible requests are rejected.
+- [x] The opened CPAL stream uses its selected channel count/sample format and
+  has no hidden Rodio device-configuration fallback.
 - [x] The generated test signal sends left and right tones on separate sides.
 - [x] Unit tests verify output tests preserve transport pause/resume intent.
 - [x] The frontend remembers channel pairs independently per output device.

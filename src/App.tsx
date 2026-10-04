@@ -42,16 +42,27 @@ type MidiBindings = Partial<Record<MidiAction, MidiBinding>>;
 function readAudioSelection(): AudioOutputSelection {
   try {
     const value: unknown = JSON.parse(localStorage.getItem("olooper.audio.output") ?? "null");
-    if (!value || typeof value !== "object") return { deviceName: null, firstChannel: 0 };
+    if (!value || typeof value !== "object") return { deviceName: null, firstChannel: 0, sampleRate: null, bufferFrames: null };
     const selection = value as Partial<AudioOutputSelection>;
+    const sampleRate = Number.isInteger(selection.sampleRate) && (selection.sampleRate ?? 0) > 0
+      ? selection.sampleRate!
+      : null;
+    const bufferFrames = Number.isInteger(selection.bufferFrames) && (selection.bufferFrames ?? 0) > 0
+      ? selection.bufferFrames!
+      : null;
     if (
       (selection.deviceName === null || typeof selection.deviceName === "string")
       && Number.isInteger(selection.firstChannel)
       && (selection.firstChannel ?? -1) >= 0
       && (selection.firstChannel ?? 0) <= 62
-    ) return { deviceName: selection.deviceName ?? null, firstChannel: normalizeStereoPair(selection.firstChannel!) };
+    ) return {
+      deviceName: selection.deviceName ?? null,
+      firstChannel: normalizeStereoPair(selection.firstChannel!),
+      sampleRate,
+      bufferFrames,
+    };
   } catch { /* Use the system default when the local preference is invalid. */ }
-  return { deviceName: null, firstChannel: 0 };
+  return { deviceName: null, firstChannel: 0, sampleRate: null, bufferFrames: null };
 }
 
 function readMidiBindings(): MidiBindings {

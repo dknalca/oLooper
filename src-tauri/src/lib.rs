@@ -518,11 +518,15 @@ fn audio_output_devices() -> Result<Vec<player::AudioOutputDevice>, String> {
 fn audio_set_output(
     device_name: Option<String>,
     first_channel: u16,
+    sample_rate: Option<u32>,
+    buffer_frames: Option<u32>,
     audio: Audio<'_>,
 ) -> Result<player::PlayerStatus, String> {
     audio.set_output(player::OutputSelection {
         device_name,
         first_channel,
+        sample_rate,
+        buffer_frames,
     })
 }
 
@@ -530,11 +534,15 @@ fn audio_set_output(
 fn audio_test_output(
     device_name: Option<String>,
     first_channel: u16,
+    sample_rate: Option<u32>,
+    buffer_frames: Option<u32>,
     audio: Audio<'_>,
 ) -> Result<player::PlayerStatus, String> {
     audio.test_output(player::OutputSelection {
         device_name,
         first_channel,
+        sample_rate,
+        buffer_frames,
     })
 }
 

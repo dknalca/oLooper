@@ -4,14 +4,16 @@
 //! [`PlayerStatus`]. Hardware (`OutputStream`) is created lazily so unit
 //! tests run headless; all loop math is hardware-free.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::io::Cursor;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use cpal::traits::{DeviceTrait, HostTrait};
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use cpal::{FromSample, SampleFormat, SupportedBufferSize};
+use rodio::dynamic_mixer::{self, DynamicMixerController};
 use rodio::source::EmptyCallback;
-use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink, Source as _};
+use rodio::{Decoder, Sink, Source as _};
 use serde::{Deserialize, Serialize};
 
 /// Tracks longer than this are rejected (memory + practice-loop scope).
@@ -137,26 +139,9 @@ impl rodio::Source for LoopRegion {
     }
 }
 
-/// Routes a mono/stereo practice source to a selected stereo pair in a
-/// multichannel output stream, leaving every other channel silent.
-struct RoutedLoopRegion {
-    inner: LoopRegion,
-    input_channels: usize,
-    output_channels: u16,
-    first_channel: usize,
-    output_channel: usize,
-    meter: Arc<OutputMeter>,
-    meter_frames: usize,
-    left_peak: u16,
-    right_peak: u16,
-    left: Option<i16>,
-    right: Option<i16>,
-}
-
 struct OutputMeter {
     left_peak: AtomicUsize,
     right_peak: AtomicUsize,
-    gain_bits: AtomicU32,
 }
 
 impl Default for OutputMeter {
@@ -164,17 +149,11 @@ impl Default for OutputMeter {
         Self {
             left_peak: AtomicUsize::new(0),
             right_peak: AtomicUsize::new(0),
-            gain_bits: AtomicU32::new(1.0f32.to_bits()),
         }
     }
 }
 
 impl OutputMeter {
-    fn set_gain(&self, gain: f32) {
-        self.gain_bits
-            .store(gain.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
-    }
-
     fn publish(&self, left: u16, right: u16) {
         fn update_peak(peak: &AtomicUsize, sample: u16) {
             let current = peak.load(Ordering::Relaxed);
@@ -195,91 +174,40 @@ impl OutputMeter {
     }
 }
 
-impl RoutedLoopRegion {
-    fn new(
-        inner: LoopRegion,
-        output_channels: u16,
-        first_channel: u16,
-        meter: Arc<OutputMeter>,
-    ) -> Self {
-        Self {
-            input_channels: inner.channels().max(1) as usize,
-            inner,
-            output_channels,
-            first_channel: first_channel as usize,
-            output_channel: 0,
-            meter,
-            meter_frames: 0,
-            left_peak: 0,
-            right_peak: 0,
-            left: None,
-            right: None,
-        }
-    }
-
-    fn publish_meter_block(&mut self) {
-        self.meter.publish(self.left_peak, self.right_peak);
-        self.meter_frames = 0;
-        self.left_peak = 0;
-        self.right_peak = 0;
+fn map_stereo_frame<T: cpal::Sample + FromSample<f32>>(
+    frame: &mut [T],
+    first_channel: u16,
+    left: f32,
+    right: f32,
+) {
+    frame.fill(T::from_sample(0.0));
+    let left_channel = first_channel as usize;
+    if left_channel + 1 < frame.len() {
+        frame[left_channel] = T::from_sample(left);
+        frame[left_channel + 1] = T::from_sample(right);
     }
 }
 
-impl Iterator for RoutedLoopRegion {
-    type Item = i16;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.output_channel == 0 {
-            let Some(left) = self.inner.next() else {
-                self.publish_meter_block();
-                return None;
-            };
-            self.left = Some(left);
-            self.right = Some(if self.input_channels > 1 {
-                self.inner.next()?
-            } else {
-                self.left.unwrap_or_default()
-            });
-            for _ in 2..self.input_channels {
-                self.inner.next()?;
-            }
-            let gain = f32::from_bits(self.meter.gain_bits.load(Ordering::Relaxed));
-            self.left_peak = self
-                .left_peak
-                .max((left.unsigned_abs() as f32 * gain) as u16);
-            self.right_peak = self
-                .right_peak
-                .max((self.right.unwrap_or_default().unsigned_abs() as f32 * gain) as u16);
-            self.meter_frames += 1;
-            if self.meter_frames >= 256 {
-                self.publish_meter_block();
-            }
-        }
-        let channel = self.output_channel;
-        self.output_channel = (self.output_channel + 1) % self.output_channels as usize;
-        if channel == self.first_channel {
-            self.left
-        } else if channel == self.first_channel + 1 {
-            self.right
-        } else {
-            Some(0)
-        }
+fn render_routed_output<T: cpal::Sample + FromSample<f32>>(
+    output: &mut [T],
+    channels: u16,
+    first_channel: u16,
+    source: &mut rodio::dynamic_mixer::DynamicMixer<f32>,
+    output_meter: &OutputMeter,
+) {
+    let mut left_peak = 0u16;
+    let mut right_peak = 0u16;
+    let channels = channels as usize;
+    let mut frames = output.chunks_exact_mut(channels);
+    for frame in &mut frames {
+        let left = source.next().unwrap_or(0.0);
+        let right = source.next().unwrap_or(0.0);
+        map_stereo_frame(frame, first_channel, left, right);
+        left_peak = left_peak.max((left.abs().min(1.0) * i16::MAX as f32) as u16);
+        right_peak = right_peak.max((right.abs().min(1.0) * i16::MAX as f32) as u16);
     }
-}
-
-impl rodio::Source for RoutedLoopRegion {
-    fn current_frame_len(&self) -> Option<usize> {
-        None
-    }
-    fn channels(&self) -> u16 {
-        self.output_channels
-    }
-    fn sample_rate(&self) -> u32 {
-        self.inner.sample_rate()
-    }
-    fn total_duration(&self) -> Option<std::time::Duration> {
-        self.inner.total_duration()
-    }
+    frames.into_remainder().fill(T::from_sample(0.0));
+    output_meter.publish(left_peak, right_peak);
 }
 
 /// Rodio's Sink queue starts with an empty *mono* source. If that changing
@@ -319,38 +247,36 @@ impl rodio::Source for RoutedOutputQueue {
     }
 }
 
-fn routed_sink(handle: &OutputStreamHandle, channels: u16, rate: u32) -> Result<Sink, String> {
-    let (sink, queue) = Sink::new_idle();
-    handle
-        .play_raw(RoutedOutputQueue {
-            inner: queue,
-            channels,
-            rate,
-        })
-        .map_err(|error| format!("audio error: {error}"))?;
-    Ok(sink)
-}
-
-fn queue_routed_source(
-    sink: &Sink,
+fn routed_sink(
+    mixer: &Arc<DynamicMixerController<f32>>,
+    output_rate: u32,
     source: LoopRegion,
-    output_channels: u16,
-    first_channel: u16,
-    meter: Arc<OutputMeter>,
-    resume_playback: bool,
-) {
-    // Sink::try_new starts playing immediately, so always pause before
-    // appending. Restore playback only when the transport was running.
-    sink.pause();
-    sink.append(RoutedLoopRegion::new(
-        source,
-        output_channels,
-        first_channel,
-        meter,
-    ));
-    if resume_playback {
-        sink.play();
+    volume: f32,
+    speed: f32,
+) -> Result<Sink, String> {
+    let source_channels = source.channels();
+    let source_rate = source.sample_rate();
+    if source_rate == 0 || output_rate == 0 {
+        return Err("source and output sample rates must be nonzero".to_string());
     }
+    let (sink, queue) = Sink::new_idle();
+    sink.set_volume(volume);
+    // Rodio applies speed to the source before the stereo mixer converts to
+    // the device rate; hardware channel mapping happens afterward in CPAL.
+    sink.set_speed(speed);
+    sink.pause();
+    // Append before connecting to the stereo mixer so the queue has stable
+    // source channel metadata rather than its initial mono silence source.
+    sink.append(source);
+    mixer.add(RoutedOutputQueue {
+        inner: queue,
+        channels: source_channels,
+        rate: source_rate,
+    });
+    eprintln!(
+        "[oLooper audio] source: {source_channels} ch @ {source_rate} Hz, speed {speed:.3}x -> stereo mix @ {output_rate} Hz before hardware channel map",
+    );
+    Ok(sink)
 }
 
 const OUTPUT_TEST_RATE: u32 = 48_000;
@@ -388,6 +314,9 @@ pub struct AudioOutputDevice {
     pub id: String,
     pub name: String,
     pub channels: u16,
+    pub sample_rates: Vec<u32>,
+    pub buffer_size_min: Option<u32>,
+    pub buffer_size_max: Option<u32>,
     pub is_default: bool,
 }
 
@@ -397,6 +326,10 @@ pub struct OutputSelection {
     pub device_name: Option<String>,
     /// Zero-based first channel of the stereo pair.
     pub first_channel: u16,
+    /// None uses the output device's preferred sample rate.
+    pub sample_rate: Option<u32>,
+    /// None asks CoreAudio to choose its default buffer size.
+    pub buffer_frames: Option<u32>,
 }
 
 fn validate_output_pair(first_channel: u16, channels: u16) -> Result<(), String> {
@@ -421,26 +354,263 @@ pub fn list_output_devices() -> Result<Vec<AudioOutputDevice>, String> {
     let mut outputs = Vec::new();
     for device in devices {
         let Ok(name) = device.name() else { continue };
-        let channels = device
+        let configs = device
             .supported_output_configs()
-            .map_err(|error| error.to_string())?
+            .map_err(|error| format!("cannot list output formats for {name}: {error}"))?
+            .collect::<Vec<_>>();
+        let channels = configs
+            .iter()
             .map(|config| config.channels())
             .max()
             .unwrap_or(0);
+        let mut sample_rates = BTreeSet::new();
+        let mut buffer_min = None::<u32>;
+        let mut buffer_max = None::<u32>;
+        for config in configs
+            .iter()
+            .filter(|config| config.channels() == channels)
+        {
+            let min_rate = config.min_sample_rate().0;
+            let max_rate = config.max_sample_rate().0;
+            for rate in [
+                min_rate, max_rate, 44_100, 48_000, 88_200, 96_000, 176_400, 192_000,
+            ] {
+                if (min_rate..=max_rate).contains(&rate) {
+                    sample_rates.insert(rate);
+                }
+            }
+            if let SupportedBufferSize::Range { min, max } = config.buffer_size() {
+                buffer_min = Some(buffer_min.map_or(*min, |old| old.min(*min)));
+                buffer_max = Some(buffer_max.map_or(*max, |old| old.max(*max)));
+            }
+        }
         outputs.push(AudioOutputDevice {
             id: name.clone(),
             is_default: default_name.as_deref() == Some(name.as_str()),
             name,
             channels,
+            sample_rates: sample_rates.into_iter().collect(),
+            buffer_size_min: buffer_min,
+            buffer_size_max: buffer_max,
         });
     }
     outputs.sort_by(|left, right| left.name.cmp(&right.name));
     Ok(outputs)
 }
 
-fn open_output(
-    selection: &OutputSelection,
-) -> Result<(OutputStream, OutputStreamHandle, u16), String> {
+struct OutputRuntime {
+    stream: cpal::Stream,
+    mixer: Arc<DynamicMixerController<f32>>,
+    channels: u16,
+    sample_rate: u32,
+}
+
+fn sample_format_rank(format: SampleFormat) -> u8 {
+    match format {
+        SampleFormat::F32 => 0,
+        SampleFormat::F64 => 1,
+        SampleFormat::I16 => 2,
+        SampleFormat::I32 => 3,
+        SampleFormat::U16 => 4,
+        SampleFormat::U32 => 5,
+        _ => 6,
+    }
+}
+
+fn choose_output_config(
+    configs: &[cpal::SupportedStreamConfigRange],
+    required_channels: u16,
+    preferred_channels: Option<u16>,
+    preferred_sample_rate: u32,
+    requested_sample_rate: Option<u32>,
+    requested_buffer_frames: Option<u32>,
+    preferred_sample_format: SampleFormat,
+) -> Result<cpal::SupportedStreamConfig, String> {
+    let mut candidates = Vec::new();
+    for range in configs {
+        if range.channels() < required_channels
+            || preferred_channels.is_some_and(|channels| range.channels() != channels)
+        {
+            continue;
+        }
+        let sample_rate = if let Some(rate) = requested_sample_rate {
+            rate
+        } else {
+            preferred_sample_rate.clamp(range.min_sample_rate().0, range.max_sample_rate().0)
+        };
+        let Some(config) = range
+            .clone()
+            .try_with_sample_rate(cpal::SampleRate(sample_rate))
+        else {
+            continue;
+        };
+        if let Some(frames) = requested_buffer_frames {
+            match config.buffer_size() {
+                SupportedBufferSize::Range { min, max } if (*min..=*max).contains(&frames) => {}
+                SupportedBufferSize::Unknown => continue,
+                SupportedBufferSize::Range { .. } => continue,
+            }
+        }
+        let rate_distance = sample_rate.abs_diff(preferred_sample_rate);
+        let format_penalty = u8::from(config.sample_format() != preferred_sample_format);
+        candidates.push((config, rate_distance, format_penalty));
+    }
+    candidates.sort_by_key(|(config, rate_distance, format_penalty)| {
+        (
+            std::cmp::Reverse(config.channels()),
+            *rate_distance,
+            *format_penalty,
+            sample_format_rank(config.sample_format()),
+        )
+    });
+    candidates
+        .into_iter()
+        .next()
+        .map(|(config, _, _)| config)
+        .ok_or_else(|| {
+            if let Some(rate) = requested_sample_rate {
+                format!(
+                    "device has no output configuration for {required_channels} channels at {rate} Hz with the requested buffer"
+                )
+            } else {
+                format!(
+                    "device has no compatible output configuration for {required_channels} channels"
+                )
+            }
+        })
+}
+
+fn build_typed_output_stream<T>(
+    device: &cpal::Device,
+    config: &cpal::StreamConfig,
+    mut source: rodio::dynamic_mixer::DynamicMixer<f32>,
+    output_channels: u16,
+    first_channel: u16,
+    output_meter: Arc<OutputMeter>,
+) -> Result<cpal::Stream, String>
+where
+    T: cpal::SizedSample + FromSample<f32>,
+{
+    device
+        .build_output_stream::<T, _, _>(
+            config,
+            move |output, _| {
+                render_routed_output(
+                    output,
+                    output_channels,
+                    first_channel,
+                    &mut source,
+                    &output_meter,
+                );
+            },
+            |error| eprintln!("[oLooper audio] CoreAudio stream error: {error}"),
+            None,
+        )
+        .map_err(|error| format!("cannot open requested CoreAudio format: {error}"))
+}
+
+fn build_output_stream(
+    device: &cpal::Device,
+    config: &cpal::StreamConfig,
+    format: SampleFormat,
+    source: rodio::dynamic_mixer::DynamicMixer<f32>,
+    output_channels: u16,
+    first_channel: u16,
+    output_meter: Arc<OutputMeter>,
+) -> Result<cpal::Stream, String> {
+    match format {
+        SampleFormat::F32 => build_typed_output_stream::<f32>(
+            device,
+            config,
+            source,
+            output_channels,
+            first_channel,
+            output_meter,
+        ),
+        SampleFormat::F64 => build_typed_output_stream::<f64>(
+            device,
+            config,
+            source,
+            output_channels,
+            first_channel,
+            output_meter,
+        ),
+        SampleFormat::I8 => build_typed_output_stream::<i8>(
+            device,
+            config,
+            source,
+            output_channels,
+            first_channel,
+            output_meter,
+        ),
+        SampleFormat::I16 => build_typed_output_stream::<i16>(
+            device,
+            config,
+            source,
+            output_channels,
+            first_channel,
+            output_meter,
+        ),
+        SampleFormat::I32 => build_typed_output_stream::<i32>(
+            device,
+            config,
+            source,
+            output_channels,
+            first_channel,
+            output_meter,
+        ),
+        SampleFormat::I64 => build_typed_output_stream::<i64>(
+            device,
+            config,
+            source,
+            output_channels,
+            first_channel,
+            output_meter,
+        ),
+        SampleFormat::U8 => build_typed_output_stream::<u8>(
+            device,
+            config,
+            source,
+            output_channels,
+            first_channel,
+            output_meter,
+        ),
+        SampleFormat::U16 => build_typed_output_stream::<u16>(
+            device,
+            config,
+            source,
+            output_channels,
+            first_channel,
+            output_meter,
+        ),
+        SampleFormat::U32 => build_typed_output_stream::<u32>(
+            device,
+            config,
+            source,
+            output_channels,
+            first_channel,
+            output_meter,
+        ),
+        SampleFormat::U64 => build_typed_output_stream::<u64>(
+            device,
+            config,
+            source,
+            output_channels,
+            first_channel,
+            output_meter,
+        ),
+        format => Err(format!("unsupported CoreAudio sample format: {format:?}")),
+    }
+}
+
+struct SelectedOutputConfig {
+    device: cpal::Device,
+    supported: Vec<cpal::SupportedStreamConfigRange>,
+    default: cpal::SupportedStreamConfig,
+    config: cpal::SupportedStreamConfig,
+}
+
+fn select_output_config(selection: &OutputSelection) -> Result<SelectedOutputConfig, String> {
     if selection.first_channel % 2 != 0 {
         return Err("stereo output must start on channel 1, 3, 5, etc.".to_string());
     }
@@ -456,60 +626,108 @@ fn open_output(
     };
 
     let required_channels = selection.first_channel.saturating_add(2);
-    let max_channels = device
+    let supported = device
         .supported_output_configs()
-        .map_err(|error| error.to_string())?
+        .map_err(|error| format!("cannot query supported output configurations: {error}"))?
+        .collect::<Vec<_>>();
+    let max_channels = supported
+        .iter()
         .map(|config| config.channels())
         .max()
         .unwrap_or(0);
     // An explicit multichannel interface must use its full stream even for
     // 1–2. Its default *stereo* configuration may represent a different
     // hardware destination (for example the DJ mixer master bus).
-    let use_default_config =
+    let default = device
+        .default_output_config()
+        .map_err(|error| format!("cannot query default output configuration: {error}"))?;
+    let use_default_channels =
         selection.first_channel == 0 && (selection.device_name.is_none() || max_channels <= 2);
-    let (stream, handle, channels) = if use_default_config {
-        let channels = device
-            .default_output_config()
-            .map_err(|error| error.to_string())?
-            .channels();
-        let (stream, handle) = OutputStream::try_from_device(&device)
-            .map_err(|error| format!("cannot open audio output: {error}"))?;
-        (stream, handle, channels)
-    } else {
-        let mut configs: Vec<_> = device
-            .supported_output_configs()
-            .map_err(|error| error.to_string())?
-            .filter(|config| config.channels() >= required_channels)
-            .collect();
-        configs.sort_by_key(|config| std::cmp::Reverse(config.channels()));
-        let config = configs.into_iter().next().ok_or_else(|| {
-            format!(
-                "device does not expose output channels {}–{}",
-                selection.first_channel + 1,
-                required_channels
-            )
-        })?;
-        let preferred_rate = device
-            .default_output_config()
-            .map(|config| config.sample_rate().0)
-            .unwrap_or(48_000);
-        let rate = if config.min_sample_rate().0 <= preferred_rate
-            && config.max_sample_rate().0 >= preferred_rate
-        {
-            preferred_rate
-        } else if config.min_sample_rate().0 <= 48_000 && config.max_sample_rate().0 >= 48_000 {
-            48_000
-        } else {
-            config.min_sample_rate().0
-        };
-        let config = config.with_sample_rate(cpal::SampleRate(rate));
-        let channels = config.channels();
-        let (stream, handle) = OutputStream::try_from_device_config(&device, config)
-            .map_err(|error| format!("cannot open selected audio channels: {error}"))?;
-        (stream, handle, channels)
-    };
-    validate_output_pair(selection.first_channel, channels)?;
-    Ok((stream, handle, channels))
+    let preferred_channels = use_default_channels.then_some(default.channels());
+    let config = choose_output_config(
+        &supported,
+        required_channels,
+        preferred_channels,
+        default.sample_rate().0,
+        selection.sample_rate,
+        selection.buffer_frames,
+        default.sample_format(),
+    )?;
+    validate_output_pair(selection.first_channel, config.channels())?;
+
+    Ok(SelectedOutputConfig {
+        device,
+        supported,
+        default,
+        config,
+    })
+}
+
+fn open_output(
+    selection: &OutputSelection,
+    output_meter: Arc<OutputMeter>,
+) -> Result<OutputRuntime, String> {
+    let SelectedOutputConfig {
+        device,
+        supported,
+        default,
+        config,
+    } = select_output_config(selection)?;
+    let channels = config.channels();
+    let sample_rate = config.sample_rate().0;
+    let sample_format = config.sample_format();
+    let mut stream_config = config.config();
+    if let Some(frames) = selection.buffer_frames {
+        stream_config.buffer_size = cpal::BufferSize::Fixed(frames);
+    }
+    let (mixer, source) = dynamic_mixer::mixer::<f32>(2, sample_rate);
+    let stream = build_output_stream(
+        &device,
+        &stream_config,
+        sample_format,
+        source,
+        channels,
+        selection.first_channel,
+        output_meter,
+    )?;
+    stream
+        .play()
+        .map_err(|error| format!("cannot start CoreAudio output: {error}"))?;
+    let name = device
+        .name()
+        .unwrap_or_else(|_| "unknown output".to_string());
+    eprintln!(
+        "[oLooper audio] Default config: {} ch, {} Hz, {:?}, buffer {:?}",
+        default.channels(),
+        default.sample_rate().0,
+        default.sample_format(),
+        default.buffer_size(),
+    );
+    eprintln!(
+        "[oLooper audio] === OUTPUT CONFIG ===\nDevice: {name}\nRequested rate: {}\nChosen stream: {channels} ch, {sample_rate} Hz, {sample_format:?}, buffer {:?}\nRouting: L -> output {} (index {}), R -> output {} (index {})",
+        selection.sample_rate.map_or_else(|| "device default".to_string(), |rate| format!("{rate} Hz")),
+        stream_config.buffer_size,
+        selection.first_channel + 1,
+        selection.first_channel,
+        selection.first_channel + 2,
+        selection.first_channel + 1,
+    );
+    for candidate in &supported {
+        eprintln!(
+            "[oLooper audio] supported: {} ch, {}–{} Hz, {:?}, buffer {:?}",
+            candidate.channels(),
+            candidate.min_sample_rate().0,
+            candidate.max_sample_rate().0,
+            candidate.sample_format(),
+            candidate.buffer_size(),
+        );
+    }
+    Ok(OutputRuntime {
+        stream,
+        mixer,
+        channels,
+        sample_rate,
+    })
 }
 
 /// Decode any rodio-supported bytes into a buffer. Hardware-free.
@@ -788,9 +1006,10 @@ struct PendingLoad {
 }
 
 pub struct Player {
-    handle: OutputStreamHandle,
-    _stream: OutputStream,
+    _output_stream: cpal::Stream,
+    output_mixer: Arc<DynamicMixerController<f32>>,
     output_channels: u16,
+    output_sample_rate: u32,
     first_channel: u16,
     output_meter: Arc<OutputMeter>,
     sink: Option<Sink>,
@@ -808,12 +1027,13 @@ impl Player {
         tx: std::sync::mpsc::Sender<EngineCmd>,
         selection: &OutputSelection,
     ) -> Result<Self, String> {
-        let (_stream, handle, output_channels) = open_output(selection)?;
         let output_meter = Arc::new(OutputMeter::default());
+        let output = open_output(selection, output_meter.clone())?;
         Ok(Self {
-            handle,
-            _stream,
-            output_channels,
+            _output_stream: output.stream,
+            output_mixer: output.mixer,
+            output_channels: output.channels,
+            output_sample_rate: output.sample_rate,
             first_channel: selection.first_channel,
             output_meter,
             sink: None,
@@ -829,7 +1049,7 @@ impl Player {
         if self.output_test_sink.is_some() {
             return Err("wait for the audio output test to finish".to_string());
         }
-        let (stream, handle, output_channels) = open_output(selection)?;
+        let output = open_output(selection, self.output_meter.clone())?;
         let was_playing = self
             .sink
             .as_ref()
@@ -852,7 +1072,13 @@ impl Player {
                     track.enabled,
                     track.cursor.clone(),
                 );
-                let sink = match routed_sink(&handle, output_channels, track.buf.rate) {
+                let sink = match routed_sink(
+                    &output.mixer,
+                    output.sample_rate,
+                    source,
+                    track.volume,
+                    if track.pitch_lock { 1.0 } else { track.speed },
+                ) {
                     Ok(sink) => sink,
                     Err(error) => {
                         if was_playing {
@@ -863,16 +1089,6 @@ impl Player {
                         return Err(error.to_string());
                     }
                 };
-                sink.set_volume(track.volume);
-                sink.set_speed(if track.pitch_lock { 1.0 } else { track.speed });
-                queue_routed_source(
-                    &sink,
-                    source,
-                    output_channels,
-                    selection.first_channel,
-                    self.output_meter.clone(),
-                    false,
-                );
                 Some(sink)
             } else {
                 None
@@ -882,9 +1098,10 @@ impl Player {
         };
 
         self.sink = new_sink;
-        self.handle = handle;
-        self._stream = stream;
-        self.output_channels = output_channels;
+        self._output_stream = output.stream;
+        self.output_mixer = output.mixer;
+        self.output_channels = output.channels;
+        self.output_sample_rate = output.sample_rate;
         self.first_channel = selection.first_channel;
         if was_playing {
             if let Some(sink) = &self.sink {
@@ -898,8 +1115,6 @@ impl Player {
         if self.output_test_sink.is_some() {
             return Err("an audio output test is already running".to_string());
         }
-        let sink = routed_sink(&self.handle, self.output_channels, OUTPUT_TEST_RATE)?;
-        sink.set_volume(0.65);
         let buffer = Arc::new(output_test_buffer());
         let source = LoopRegion::new(
             buffer.clone(),
@@ -909,15 +1124,13 @@ impl Player {
             false,
             Arc::new(AtomicUsize::new(0)),
         );
-        queue_routed_source(
-            &sink,
+        let sink = routed_sink(
+            &self.output_mixer,
+            self.output_sample_rate,
             source,
-            self.output_channels,
-            self.first_channel,
-            self.output_meter.clone(),
-            false,
-        );
-        self.output_meter.set_gain(0.65);
+            0.65,
+            1.0,
+        )?;
 
         let tx = self.tx.clone();
         let callback_sent = Arc::new(AtomicBool::new(false));
@@ -952,20 +1165,19 @@ impl Player {
     fn finish_output_test(&mut self) {
         self.output_test_sink = None;
         let resume = std::mem::replace(&mut self.output_test_resume_playback, false);
-        self.output_meter
-            .set_gain(self.track.as_ref().map_or(1.0, |track| track.volume));
         if resume {
             let _ = self.play();
         }
     }
 
-    fn fresh_sink(&mut self, volume: f32, speed: f32) -> Result<Sink, String> {
-        let rate = self.track.as_ref().ok_or("nothing loaded")?.buf.rate;
-        let sink = routed_sink(&self.handle, self.output_channels, rate)?;
-        sink.set_volume(volume);
-        sink.set_speed(speed);
-        sink.pause();
-        self.output_meter.set_gain(volume);
+    fn fresh_sink(&self, source: LoopRegion, volume: f32, speed: f32) -> Result<Sink, String> {
+        let sink = routed_sink(
+            &self.output_mixer,
+            self.output_sample_rate,
+            source,
+            volume,
+            speed,
+        )?;
         Ok(sink)
     }
 }
@@ -1143,13 +1355,7 @@ impl Player {
             t.enabled,
             t.cursor.clone(),
         );
-        let sink = self.fresh_sink(volume, speed)?;
-        sink.append(RoutedLoopRegion::new(
-            src,
-            self.output_channels,
-            self.first_channel,
-            self.output_meter.clone(),
-        ));
+        let sink = self.fresh_sink(src, volume, speed)?;
         sink.play();
         self.sink = Some(sink);
         Ok(self.status())
@@ -1189,7 +1395,6 @@ impl Player {
         if let Some(t) = &mut self.track {
             t.volume = v;
         }
-        self.output_meter.set_gain(v);
         if let Some(s) = &self.sink {
             s.set_volume(v);
         }
@@ -1341,13 +1546,7 @@ impl Player {
                 t.enabled,
                 t.cursor.clone(),
             );
-            let sink = self.fresh_sink(volume, speed)?;
-            sink.append(RoutedLoopRegion::new(
-                src,
-                self.output_channels,
-                self.first_channel,
-                self.output_meter.clone(),
-            ));
+            let sink = self.fresh_sink(src, volume, speed)?;
             sink.play();
             self.sink = Some(sink);
         } else {
@@ -1387,13 +1586,7 @@ impl Player {
                 t.enabled,
                 t.cursor.clone(),
             );
-            let sink = self.fresh_sink(volume, speed)?;
-            sink.append(RoutedLoopRegion::new(
-                src,
-                self.output_channels,
-                self.first_channel,
-                self.output_meter.clone(),
-            ));
+            let sink = self.fresh_sink(src, volume, speed)?;
             sink.play();
             self.sink = Some(sink);
         } else {
@@ -1446,13 +1639,7 @@ impl Player {
                 if t.pitch_lock { 1.0 } else { t.speed },
             )
         };
-        let sink = self.fresh_sink(volume, speed)?;
-        sink.append(RoutedLoopRegion::new(
-            src,
-            self.output_channels,
-            self.first_channel,
-            self.output_meter.clone(),
-        ));
+        let sink = self.fresh_sink(src, volume, speed)?;
         sink.play();
         self.sink = Some(sink);
         Ok(self.status())
@@ -1482,13 +1669,7 @@ impl Player {
                 enabled,
                 t.cursor.clone(),
             );
-            let sink = self.fresh_sink(volume, speed)?;
-            sink.append(RoutedLoopRegion::new(
-                src,
-                self.output_channels,
-                self.first_channel,
-                self.output_meter.clone(),
-            ));
+            let sink = self.fresh_sink(src, volume, speed)?;
             sink.play();
             self.sink = Some(sink);
         }
@@ -1842,17 +2023,9 @@ impl Engine {
     }
 
     fn cmd_set_output(&mut self, selection: OutputSelection) -> Result<(), String> {
-        if selection.first_channel % 2 != 0 {
-            return Err("stereo output must start on channel 1, 3, 5, etc.".to_string());
-        }
-        let devices = list_output_devices()?;
-        let device = match &selection.device_name {
-            Some(name) => devices.iter().find(|device| &device.id == name),
-            None => devices.iter().find(|device| device.is_default),
-        }
-        .ok_or_else(|| "selected audio output is unavailable".to_string())?;
-        validate_output_pair(selection.first_channel, device.channels)
-            .map_err(|error| format!("{error} on {}", device.name))?;
+        // Validate the exact channel/rate/format/buffer tuple even while the
+        // lazy player has not opened a CoreAudio stream yet.
+        select_output_config(&selection)?;
         if selection == self.output_selection {
             return Ok(());
         }
@@ -2082,25 +2255,20 @@ impl Engine {
                     // Restart on the stretched buffer at locked (1.0x) rate.
                     let src =
                         LoopRegion::new(new_buf.clone(), from, new_start, new_end, enabled, cursor);
-                    let sink = match routed_sink(&p.handle, p.output_channels, new_buf.rate) {
-                        Ok(sink) => {
-                            sink.set_volume(volume);
-                            sink.set_speed(1.0);
-                            sink.pause();
-                            sink
-                        }
+                    let sink = match routed_sink(
+                        &p.output_mixer,
+                        p.output_sample_rate,
+                        src,
+                        volume,
+                        1.0,
+                    ) {
+                        Ok(sink) => sink,
                         Err(error) => {
                             t.pitch_pending = false;
                             t.pitch_error = Some(error.to_string());
                             return;
                         }
                     };
-                    sink.append(RoutedLoopRegion::new(
-                        src,
-                        p.output_channels,
-                        p.first_channel,
-                        p.output_meter.clone(),
-                    ));
                     sink.play();
                     p.sink = Some(sink);
                 }

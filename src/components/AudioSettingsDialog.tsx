@@ -39,6 +39,8 @@ export default function AudioSettingsDialog({
   const [devices, setDevices] = useState<AudioOutputDevice[]>([]);
   const [deviceName, setDeviceName] = useState(selection.deviceName ?? "");
   const [firstChannel, setFirstChannel] = useState(selection.firstChannel);
+  const [sampleRate, setSampleRate] = useState(selection.sampleRate?.toString() ?? "");
+  const [bufferFrames, setBufferFrames] = useState(selection.bufferFrames?.toString() ?? "");
   const [pairSelections, setPairSelections] = useState<Record<string, number>>(() =>
     parseOutputPairSelections(localStorage.getItem("olooper.audio.output-pairs")),
   );
@@ -72,6 +74,8 @@ export default function AudioSettingsDialog({
     if (!open) return;
     setDeviceName(selection.deviceName ?? "");
     setFirstChannel(normalizeStereoPair(selection.firstChannel));
+    setSampleRate(selection.sampleRate?.toString() ?? "");
+    setBufferFrames(selection.bufferFrames?.toString() ?? "");
     const remembered = rememberOutputPair(
       parseOutputPairSelections(localStorage.getItem("olooper.audio.output-pairs")),
       selection,
@@ -140,8 +144,15 @@ export default function AudioSettingsDialog({
   );
   const systemDefault = devices.find((device) => device.is_default);
   const selectedAvailable = deviceName ? Boolean(selectedDevice) : Boolean(systemDefault);
-  const channelCount = deviceName ? selectedDevice?.channels ?? 0 : systemDefault?.channels ?? 0;
+  const activeDevice = deviceName ? selectedDevice : systemDefault;
+  const channelCount = activeDevice?.channels ?? 0;
   const pairCount = Math.floor(channelCount / 2);
+  const sampleRates = activeDevice?.sample_rates ?? [];
+  const bufferPresets = [64, 128, 256, 512, 1024, 2048, 4096]
+    .filter((frames) => activeDevice?.buffer_size_min != null
+      && activeDevice.buffer_size_max != null
+      && frames >= activeDevice.buffer_size_min
+      && frames <= activeDevice.buffer_size_max);
 
   if (!open) return null;
 
@@ -153,10 +164,17 @@ export default function AudioSettingsDialog({
     onSelectionChange(next);
   };
 
+  const currentSelection = (): AudioOutputSelection => ({
+    deviceName: deviceName || null,
+    firstChannel: normalizeStereoPair(firstChannel),
+    sampleRate: sampleRate ? Number(sampleRate) : null,
+    bufferFrames: bufferFrames ? Number(bufferFrames) : null,
+  });
+
   const apply = async () => {
     setBusy(true);
     setError(null);
-    const next = { deviceName: deviceName || null, firstChannel };
+    const next = currentSelection();
     try {
       await audioSetOutput(next);
       saveSelection(next);
@@ -173,7 +191,7 @@ export default function AudioSettingsDialog({
     setError(null);
     clearTestTimers();
     setTestChannel(null);
-    const next = { deviceName: deviceName || null, firstChannel };
+    const next = currentSelection();
     try {
       await audioTestOutput(next);
       onOutputTestStarted();
@@ -219,6 +237,19 @@ export default function AudioSettingsDialog({
               const nextDevice = event.target.value;
               setDeviceName(nextDevice);
               setFirstChannel(rememberedOutputPair(pairSelections, nextDevice || null));
+              const nextAvailable = nextDevice
+                ? devices.find((device) => device.id === nextDevice)
+                : systemDefault;
+              if (sampleRate && !nextAvailable?.sample_rates.includes(Number(sampleRate))) {
+                setSampleRate("");
+              }
+              const requestedBuffer = Number(bufferFrames);
+              if (bufferFrames && (nextAvailable?.buffer_size_min == null
+                || nextAvailable.buffer_size_max == null
+                || requestedBuffer < nextAvailable.buffer_size_min
+                || requestedBuffer > nextAvailable.buffer_size_max)) {
+                setBufferFrames("");
+              }
               setTestChannel(null);
             }}
             disabled={loading || busy}
@@ -228,6 +259,43 @@ export default function AudioSettingsDialog({
             {devices.map((device) => <option key={device.id} value={device.id}>{device.name}{device.is_default ? " (system default)" : ""}</option>)}
           </select>
         </label>
+
+        <div className="mt-4 grid grid-cols-2 gap-3">
+          <label className="block text-xs text-text-secondary">
+            Device sample rate
+            <select
+              value={sampleRate}
+              onChange={(event) => setSampleRate(event.target.value)}
+              disabled={loading || busy || !selectedAvailable}
+              className="mt-1 block w-full rounded border border-border bg-elevated px-2 py-2 text-xs text-text disabled:opacity-50"
+            >
+              <option value="">Device default</option>
+              {sampleRate && !sampleRates.includes(Number(sampleRate)) && (
+                <option value={sampleRate}>Saved {Number(sampleRate) / 1000} kHz (unsupported)</option>
+              )}
+              {sampleRates.map((rate) => (
+                <option key={rate} value={rate}>{(rate / 1000).toFixed(rate % 1000 === 0 ? 0 : 1)} kHz</option>
+              ))}
+            </select>
+          </label>
+          <label className="block text-xs text-text-secondary">
+            Buffer size
+            <select
+              value={bufferFrames}
+              onChange={(event) => setBufferFrames(event.target.value)}
+              disabled={loading || busy || !selectedAvailable}
+              className="mt-1 block w-full rounded border border-border bg-elevated px-2 py-2 text-xs text-text disabled:opacity-50"
+            >
+              <option value="">CoreAudio default</option>
+              {bufferFrames && !bufferPresets.includes(Number(bufferFrames)) && (
+                <option value={bufferFrames}>Saved {bufferFrames} frames</option>
+              )}
+              {bufferPresets.map((frames) => (
+                <option key={frames} value={frames}>{frames} frames</option>
+              ))}
+            </select>
+          </label>
+        </div>
 
         <label className="mt-4 block text-xs text-text-secondary">
           Stereo output pair
@@ -254,7 +322,7 @@ export default function AudioSettingsDialog({
         </p>
 
         <p className="mt-3 text-[10px] text-text-secondary">
-          Test plays a 440 Hz tone on L, then 660 Hz on R. System default follows macOS; for a DJ mixer, choose its device and the pair connected to your channel.
+          Test plays a 440 Hz tone on L, then 660 Hz on R. The device opens with the selected sample rate, format supported by CoreAudio, and buffer size; “Device default” and “CoreAudio default” leave those choices to the device.
         </p>
         <div className="mt-3 space-y-1.5" aria-label="Digital output levels">
           {([ ["L", outputLevels.left], ["R", outputLevels.right] ] as const).map(([channel, level]) => {
