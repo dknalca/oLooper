@@ -9,6 +9,7 @@ import {
   libraryRemoveLooper,
   libraryRenameLooper,
   librarySetFavorite,
+  librarySyncSeratoMetadata,
   libraryUpdateMetadata,
   playerLoad,
   playerSetDiagnostics,
@@ -78,6 +79,17 @@ export default function Sidebar({ libraryReady, refreshKey, activeTrackId, onReg
   useEffect(() => {
     if (libraryReady) refresh();
   }, [libraryReady, refreshKey]);
+
+  useEffect(() => {
+    const updateBpm = (event: Event) => {
+      const { trackId, bpm } = (event as CustomEvent<{ trackId: number; bpm: number }>).detail;
+      setTracks((current) => current.map((track) => track.id === trackId
+        ? { ...track, bpm, bpm_source: "serato", bpm_confidence: null }
+        : track));
+    };
+    window.addEventListener("olooper:track-bpm", updateBpm);
+    return () => window.removeEventListener("olooper:track-bpm", updateBpm);
+  }, []);
 
   useEffect(() => {
     if (activeTrackId === null) return;
@@ -246,7 +258,18 @@ export default function Sidebar({ libraryReady, refreshKey, activeTrackId, onReg
     if (bpm !== null && (!Number.isFinite(bpm) || bpm < 20 || bpm > 300)) { setError("BPM must be between 20 and 300"); return; }
     const tags = window.prompt("Tags (comma separated)", track.tags)?.trim();
     if (tags === undefined) return;
-    libraryUpdateMetadata(track.id, title, bpm, tags).then(refresh).catch((e) => setError(String(e)));
+    libraryUpdateMetadata(track.id, title, bpm, tags).then(async (updated) => {
+      if (updated.bpm !== null && updated.bpm !== track.bpm) {
+        try {
+          await librarySyncSeratoMetadata(track.id);
+        } catch (cause) {
+          refresh();
+          setError(`BPM saved in oLooper, but Serato sync failed: ${String(cause)}`);
+          return;
+        }
+      }
+      refresh();
+    }).catch((cause) => setError(String(cause)));
     setContextMenu(null);
   };
 

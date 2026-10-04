@@ -43,8 +43,12 @@ Never executes ActionScript; never requires Flash.
 
 - MP3 frames are preserved; Flash ADPCM is written as derived PCM WAV. Validated
   audio files are atomically written as `<library>/<looper-name>/NN_<id>.<codec>`.
+- Extracted MP3/WAV files get ID3 `TPE1` from a source filename prefix of
+  `Artist - Looper Name` and `TALB` from `Looper Name`; without that separator,
+  artist is left unset and album uses the full looper name.
 - A valid cover is normalized to a bounded JPEG thumbnail stored beside audio
-  as `cover.jpg`; it is removed with the final track or its group.
+  as `cover.jpg`; it is also embedded in every extracted track as an ID3
+  `APIC` front-cover frame and is removed with the final track or its group.
 - Provenance per track: `source_type=swf`, `source_path`, `source_hash` (of the
   `.swf`), `source_sound_id`, `imported_at`.
 
@@ -85,7 +89,8 @@ Never executes ActionScript; never requires Flash.
 - [x] Synthetic ADPCM fixture decodes to a valid WAV; local ignored fixture
   `turntable_training_looper_low_res.swf` extracts its ADPCM sounds.
 - [x] JPEG2 table/image streams merge into a decodable cover; library cover
-  thumbnails persist and are served to the UI.
+  thumbnails persist and are served to the UI; extracted audio carries ID3
+  artist/album tags and the cover image.
 - [x] Malformed inputs never panic, never write partial files.
 
 ## Non-goals

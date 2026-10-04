@@ -32,10 +32,10 @@ Waveform rendering and library integration are separate specs.
    tracks shown in the selected library view. Loop enablement, AUTO detection,
    and manual boundaries are in the collapsible Loop controls panel. PITCH LOCK
    remains hidden.
-8. The transport labels the saved slot buttons with **CUE**. Cues `1`–`4`:
-    cue `1` always seeks to the track start. Cues `2`–`4` start empty, capture
-    the current playback position on first click, seek on later clicks, can be
-    cleared with Shift+cue, and are drawn on the waveform.
+8. The player has four persistent CUEs. CUE 1 is fixed at the start of the track;
+   CUEs 2–4 can be saved, recalled, and cleared. They are read from the audio
+   file when the track opens; CUE positions are drawn on the waveform. Manual
+   playback loops remain separate and are not saved as Serato loop slots.
 9. `+` and `-` change playback speed in 5% steps from 50% to 200%. This is
    vinyl-style playback, so pitch changes with speed unless pitch lock is on.
 10. Pitch lock is non-blocking: enabling it (or changing speed while locked)
@@ -113,7 +113,7 @@ Waveform rendering and library integration are separate specs.
 - [x] Unit tests cover wrap math + a synthetic WAV end-to-end (no hardware).
 - [x] Manual: an extracted loop from `loopersFlash/` plays and loops audibly.
 - [x] Keyboard shortcuts control transport without mouse.
-- [x] CUE 1–4 recall/save as documented; saved cues 2–4 persist per track.
+- [x] CUE 1 is track start; CUEs 2–4 come from audio tags.
 - [x] Loading another track resets playback speed to 100%.
 - [ ] Stereo output can follow the system default or route to any supported
   stereo channel pair on a selected device.

@@ -34,6 +34,7 @@ import {
   type Track,
 } from "./tauri";
 import { firstMidiStartTrack } from "./midiPlayback";
+import { normalizeStereoPair } from "./audioOutputPreferences";
 
 type TrackNavigator = (direction: -1 | 1) => void;
 type MidiBindings = Partial<Record<MidiAction, MidiBinding>>;
@@ -48,7 +49,7 @@ function readAudioSelection(): AudioOutputSelection {
       && Number.isInteger(selection.firstChannel)
       && (selection.firstChannel ?? -1) >= 0
       && (selection.firstChannel ?? 0) <= 62
-    ) return { deviceName: selection.deviceName ?? null, firstChannel: selection.firstChannel! };
+    ) return { deviceName: selection.deviceName ?? null, firstChannel: normalizeStereoPair(selection.firstChannel!) };
   } catch { /* Use the system default when the local preference is invalid. */ }
   return { deviceName: null, firstChannel: 0 };
 }
@@ -87,6 +88,7 @@ export default function App() {
   const [refreshKey, setRefreshKey] = useState(0);
   const [playerStatus, setPlayerStatus] = useState<PlayerStatus | null>(null);
   const [activeTrackId, setActiveTrackId] = useState<number | null>(null);
+  const [trackOpenGeneration, setTrackOpenGeneration] = useState(0);
   const [activeTrack, setActiveTrack] = useState<Track | null>(null);
   const [trackNavigator, setTrackNavigator] = useState<TrackNavigator | null>(null);
   const [libraryView, setLibraryView] = useState<"local" | "tablist">("local");
@@ -95,6 +97,7 @@ export default function App() {
   const [midiOptionsOpen, setMidiOptionsOpen] = useState(false);
   const [audioOptionsOpen, setAudioOptionsOpen] = useState(false);
   const [audioSelection, setAudioSelection] = useState<AudioOutputSelection>(readAudioSelection);
+  const [audioStartupError, setAudioStartupError] = useState<string | null>(null);
   const [midiInputId, setMidiInputId] = useState<string | null>(() => localStorage.getItem("olooper.midi.input"));
   const [midiBindings, setMidiBindings] = useState<MidiBindings>(readMidiBindings);
   const [midiLearningAction, setMidiLearningAction] = useState<MidiAction | null>(null);
@@ -109,7 +112,8 @@ export default function App() {
   const onLibraryReady = useCallback(() => setLibraryReady(true), []);
 
   useEffect(() => {
-    audioSetOutput(audioSelection).catch(() => {});
+    audioSetOutput(audioSelection)
+      .catch((cause) => setAudioStartupError(`Saved audio output was not applied: ${String(cause)}. Reconnect the device and press Apply.`));
     // Set the saved output before the first playback request.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -128,6 +132,7 @@ export default function App() {
     setActiveTrackId(track.id);
     setActiveTrack(track);
     setPlayerStatus(status);
+    setTrackOpenGeneration((generation) => generation + 1);
   }, []);
 
   const registerTrackNavigator = useCallback((navigate: TrackNavigator | null) => {
@@ -162,6 +167,7 @@ export default function App() {
     setActiveTrackId(track.id);
     setActiveTrack(track);
     setPlayerStatus(playing);
+    setTrackOpenGeneration((current) => current + 1);
   }, [activeTrackId]);
 
   const playFirstLibraryTrack = useCallback(async () => {
@@ -341,6 +347,7 @@ export default function App() {
         <Player
           status={playerStatus}
           trackId={activeTrackId}
+          trackOpenGeneration={trackOpenGeneration}
           canRandom={libraryReady && activeTrackId !== null}
           onRandomTrack={playRandomTrack}
           canNavigateTracks={trackNavigator !== null}
@@ -459,7 +466,11 @@ export default function App() {
       <AudioSettingsDialog
         open={audioOptionsOpen}
         selection={audioSelection}
-        onSelectionChange={setAudioSelection}
+        startupError={audioStartupError}
+        onSelectionChange={(next) => {
+          setAudioStartupError(null);
+          setAudioSelection(next);
+        }}
         onPlayerStatusChange={setPlayerStatus}
         onOutputTestStarted={refreshPlayerAfterAudioTest}
         onClose={() => setAudioOptionsOpen(false)}

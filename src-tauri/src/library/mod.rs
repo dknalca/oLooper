@@ -16,6 +16,8 @@ use sha2::{Digest as _, Sha256};
 
 use crate::import::swf::Sound;
 
+mod serato;
+
 /// Current schema version (`PRAGMA user_version`).
 const SCHEMA_VERSION: i32 = 6;
 
@@ -79,6 +81,44 @@ fn now_secs() -> i64 {
         .unwrap_or(0)
 }
 
+fn cue_label_for_slot(slot: i64) -> String {
+    char::from(b'A' + slot.saturating_sub(1) as u8).to_string()
+}
+
+fn ensure_default_serato_cue(metadata: &mut SeratoMetadata) -> bool {
+    let mut changed = false;
+    if metadata
+        .cues
+        .iter()
+        .find(|cue| cue.slot == 1)
+        .is_none_or(|cue| cue.position_ms != 0)
+    {
+        metadata.cues.retain(|cue| cue.slot != 1);
+        metadata.cues.push(SeratoCue {
+            slot: 1,
+            label: cue_label_for_slot(1),
+            position_ms: 0,
+        });
+        changed = true;
+    }
+    metadata.cues.sort_by_key(|cue| cue.slot);
+    metadata.loops.sort_by_key(|saved| saved.slot);
+    changed
+}
+
+fn looper_audio_tags(looper: &str) -> (Option<String>, String) {
+    for separator in [" - ", " – ", " — ", " ‐ "] {
+        if let Some((artist, album)) = looper.split_once(separator) {
+            let artist = artist.trim();
+            let album = album.trim();
+            if !artist.is_empty() && !album.is_empty() {
+                return (Some(artist.to_string()), album.to_string());
+            }
+        }
+    }
+    (None, looper.trim().to_string())
+}
+
 pub fn sha256_hex(data: &[u8]) -> String {
     format!("{:x}", Sha256::digest(data))
 }
@@ -88,7 +128,9 @@ pub fn sanitize_name(raw: &str) -> String {
     let mut s: String = raw
         .chars()
         .map(|c| {
-            if c.is_alphanumeric() || matches!(c, ' ' | '-' | '_' | '.' | '(' | ')') {
+            if c.is_alphanumeric()
+                || matches!(c, ' ' | '-' | '–' | '—' | '‐' | '_' | '.' | '(' | ')')
+            {
                 c
             } else {
                 '_'
@@ -108,7 +150,7 @@ pub fn sanitize_name(raw: &str) -> String {
     }
 }
 
-/// A named cue/loop slot (A-D) attached to a track.
+/// Legacy SQLite cue/loop entry, read only while migrating old libraries.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LoopSlot {
     pub id: i64,
@@ -119,6 +161,32 @@ pub struct LoopSlot {
     pub loop_start_ms: i64,
     pub loop_end_ms: i64,
     pub enabled: bool,
+}
+
+/// A hot cue stored in the track's audio metadata. `slot` is one-based in oLooper;
+/// Serato's Markers2 uses zero-based cue indexes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SeratoCue {
+    pub slot: i64,
+    pub label: String,
+    pub position_ms: i64,
+}
+
+/// A Serato saved loop retained for tag preservation; oLooper does not edit or show it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SeratoLoop {
+    pub slot: i64,
+    pub label: String,
+    pub start_ms: i64,
+    pub end_ms: i64,
+}
+
+/// CUE and BPM values managed by oLooper, plus Serato loops retained on read.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SeratoMetadata {
+    pub cues: Vec<SeratoCue>,
+    pub loops: Vec<SeratoLoop>,
+    pub bpm: Option<f64>,
 }
 
 pub struct Library {
@@ -800,9 +868,9 @@ impl Library {
         Ok(n)
     }
 
-    // --- Loop slots ---
+    // --- Audio-file CUEs ---
 
-    pub fn get_slots(&self, track_id: i64) -> Result<Vec<LoopSlot>, String> {
+    fn get_legacy_loop_slots(&self, track_id: i64) -> Result<Vec<LoopSlot>, String> {
         let mut stmt = self
             .conn
             .prepare(
@@ -828,60 +896,147 @@ impl Library {
             .map_err(|e| e.to_string())
     }
 
-    pub fn set_slot(
+    fn audio_path_for_track(&self, track_id: i64) -> Result<(Track, PathBuf), String> {
+        let track = self
+            .get_track(track_id)?
+            .ok_or_else(|| format!("track {track_id} not found"))?;
+        let path = self.confine(Path::new(&track.file_path))?;
+        let canonical_path = path
+            .canonicalize()
+            .map_err(|error| format!("cannot resolve library audio file: {error}"))?;
+        let canonical_root = self
+            .root
+            .canonicalize()
+            .map_err(|error| format!("cannot resolve library root: {error}"))?;
+        if !canonical_path.starts_with(&canonical_root) {
+            return Err("CUE and loop metadata is confined to library-managed audio".to_string());
+        }
+        Ok((track, canonical_path))
+    }
+
+    /// Read markers from the audio file on every track open. For pre-file-tag
+    /// libraries, migrate old SQLite slots to the file once, then discard them.
+    pub fn get_serato_metadata(&self, track_id: i64) -> Result<SeratoMetadata, String> {
+        let (track, path) = self.audio_path_for_track(track_id)?;
+        let mut read = serato::read_audio_file(&path)?;
+        let legacy_slots = self.get_legacy_loop_slots(track_id)?;
+        if !read.markers_present && !legacy_slots.is_empty() {
+            let mut migrated = SeratoMetadata {
+                bpm: read.metadata.bpm.or(track.bpm),
+                ..SeratoMetadata::default()
+            };
+            for old in legacy_slots.iter().filter(|slot| slot.enabled) {
+                if (0..=track.duration_ms).contains(&old.cue_ms) {
+                    migrated.cues.push(SeratoCue {
+                        slot: old.slot,
+                        label: old.label.clone(),
+                        position_ms: old.cue_ms,
+                    });
+                }
+            }
+            serato::write_audio_file(&path, &migrated, track.duration_ms)?;
+            self.clear_legacy_loop_slots(track_id)?;
+            read = serato::read_audio_file(&path)?;
+        } else if read.markers_present && !legacy_slots.is_empty() {
+            // Audio tags win over stale private database copies.
+            self.clear_legacy_loop_slots(track_id)?;
+        }
+
+        if read.needs_wave_id3_normalization {
+            // Migrate SQLite slots first: normalizing an empty ID3 chunk writes
+            // default markers, which would otherwise hide legacy CUEs.
+            serato::write_audio_file(&path, &read.metadata, track.duration_ms)?;
+            read = serato::read_audio_file(&path)?;
+        }
+
+        read.metadata
+            .cues
+            .retain(|cue| (0..=track.duration_ms).contains(&cue.position_ms));
+        read.metadata.loops.retain(|saved| {
+            saved.start_ms >= 0
+                && saved.end_ms > saved.start_ms
+                && saved.end_ms <= track.duration_ms
+                && saved.end_ms <= 0x00ff_ffff
+        });
+        let defaults_added = ensure_default_serato_cue(&mut read.metadata);
+        if defaults_added {
+            serato::write_audio_file(&path, &read.metadata, track.duration_ms)?;
+            read = serato::read_audio_file(&path)?;
+        }
+        if let Some(bpm) = read.metadata.bpm {
+            if track.bpm != Some(bpm) {
+                self.conn
+                    .execute(
+                        "UPDATE tracks SET bpm=?1,bpm_confidence=NULL,bpm_source='serato',updated_at=?2 WHERE id=?3",
+                        rusqlite::params![bpm, now_secs(), track_id],
+                    )
+                    .map_err(|error| format!("cannot update BPM from audio tags: {error}"))?;
+            }
+        } else {
+            read.metadata.bpm = track.bpm;
+        }
+        Ok(read.metadata)
+    }
+
+    fn clear_legacy_loop_slots(&self, track_id: i64) -> Result<(), String> {
+        self.conn
+            .execute("DELETE FROM loop_slots WHERE track_id=?1", [track_id])
+            .map_err(|error| format!("cannot clear migrated CUE database rows: {error}"))?;
+        Ok(())
+    }
+
+    fn save_serato_metadata(
+        &self,
+        track_id: i64,
+        mut metadata: SeratoMetadata,
+    ) -> Result<SeratoMetadata, String> {
+        let (track, path) = self.audio_path_for_track(track_id)?;
+        if metadata.bpm.is_none() {
+            metadata.bpm = track.bpm;
+        }
+        serato::write_audio_file(&path, &metadata, track.duration_ms)?;
+        self.clear_legacy_loop_slots(track_id)?;
+        Ok(serato::read_audio_file(&path)?.metadata)
+    }
+
+    pub fn set_serato_cue(
         &self,
         track_id: i64,
         slot: i64,
-        label: &str,
-        cue_ms: i64,
-        loop_start_ms: i64,
-        loop_end_ms: i64,
-        enabled: bool,
-    ) -> Result<LoopSlot, String> {
+        position_ms: Option<i64>,
+    ) -> Result<SeratoMetadata, String> {
         if !(1..=4).contains(&slot) {
-            return Err("slot must be 1–4".to_string());
+            return Err("CUE slot must be between 1 and 4".to_string());
         }
-        self.get_track(track_id)?
-            .ok_or_else(|| format!("track {track_id} not found"))?;
-        self.conn
-            .execute(
-                "INSERT INTO loop_slots(track_id,slot,label,cue_ms,loop_start_ms,loop_end_ms,enabled) \
-                 VALUES (?1,?2,?3,?4,?5,?6,?7) \
-                 ON CONFLICT(track_id,slot) DO UPDATE SET \
-                 label=excluded.label,cue_ms=excluded.cue_ms,loop_start_ms=excluded.loop_start_ms,\
-                 loop_end_ms=excluded.loop_end_ms,enabled=excluded.enabled",
-                rusqlite::params![track_id, slot, label, cue_ms, loop_start_ms, loop_end_ms, enabled],
-            )
-            .map_err(|e| e.to_string())?;
-        let id: i64 = self
-            .conn
-            .query_row(
-                "SELECT id FROM loop_slots WHERE track_id=?1 AND slot=?2",
-                rusqlite::params![track_id, slot],
-                |r| r.get(0),
-            )
-            .map_err(|e| e.to_string())?;
-        Ok(LoopSlot {
-            id,
-            track_id,
-            slot,
-            label: label.to_string(),
-            cue_ms,
-            loop_start_ms,
-            loop_end_ms,
-            enabled,
-        })
+        let mut metadata = self.get_serato_metadata(track_id)?;
+        metadata.cues.retain(|cue| cue.slot != slot);
+        let position_ms = if slot == 1 { Some(0) } else { position_ms };
+        if let Some(position_ms) = position_ms {
+            let duration = self
+                .get_track(track_id)?
+                .ok_or_else(|| format!("track {track_id} not found"))?
+                .duration_ms;
+            if !(0..=duration).contains(&position_ms) {
+                return Err("CUE position is outside the track".to_string());
+            }
+            metadata.cues.push(SeratoCue {
+                slot,
+                label: cue_label_for_slot(slot),
+                position_ms,
+            });
+            metadata.cues.sort_by_key(|cue| cue.slot);
+        }
+        self.save_serato_metadata(track_id, metadata)
     }
 
-    pub fn delete_slot(&self, track_id: i64, slot: i64) -> Result<bool, String> {
-        let n = self
-            .conn
-            .execute(
-                "DELETE FROM loop_slots WHERE track_id=?1 AND slot=?2",
-                rusqlite::params![track_id, slot],
-            )
-            .map_err(|e| e.to_string())?;
-        Ok(n == 1)
+    pub fn sync_serato_metadata(&self, track_id: i64) -> Result<(), String> {
+        let metadata = self.get_serato_metadata(track_id)?;
+        let (_, path) = self.audio_path_for_track(track_id)?;
+        let duration = self
+            .get_track(track_id)?
+            .ok_or_else(|| format!("track {track_id} not found"))?
+            .duration_ms;
+        serato::write_audio_file(&path, &metadata, duration)
     }
 
     /// Ensure `path` resolves inside the library root (after canonicalize).
@@ -905,20 +1060,23 @@ impl Library {
     /// Returns the final path. Cleans the tmp file on any failure.
     fn atomic_write(&self, dest: &Path, frames: &[u8]) -> Result<PathBuf, String> {
         let dest = self.confine(dest)?;
-        let tmp = dest.with_extension("mp3.tmp");
-        let out = (|| -> Result<PathBuf, String> {
-            std::fs::write(&tmp, frames).map_err(|e| format!("write failed: {e}"))?;
-            let back = std::fs::read(&tmp).map_err(|e| format!("verify failed: {e}"))?;
-            if back != frames {
-                return Err("verify failed: bytes differ".to_string());
-            }
-            std::fs::rename(&tmp, &dest).map_err(|e| format!("rename failed: {e}"))?;
-            Ok(dest)
-        })();
-        if out.is_err() {
-            let _ = std::fs::remove_file(&tmp);
+        let parent = dest.parent().ok_or("bad destination path")?;
+        let mut tmp = tempfile::NamedTempFile::new_in(parent)
+            .map_err(|e| format!("cannot create temporary audio: {e}"))?;
+        use std::io::{Read, Seek, SeekFrom, Write};
+        tmp.write_all(frames)
+            .and_then(|_| tmp.as_file_mut().sync_all())
+            .and_then(|_| tmp.seek(SeekFrom::Start(0)).map(|_| ()))
+            .map_err(|e| format!("write failed: {e}"))?;
+        let mut back = Vec::new();
+        tmp.read_to_end(&mut back)
+            .map_err(|e| format!("verify failed: {e}"))?;
+        if back != frames {
+            return Err("verify failed: bytes differ".to_string());
         }
-        out
+        tmp.persist(&dest)
+            .map_err(|e| format!("rename failed: {e}"))?;
+        Ok(dest)
     }
 
     /// Persist extracted sounds: files under `<looper>/` + rows.
@@ -1020,6 +1178,35 @@ impl Library {
         exe_offset: Option<i64>,
         exe_length: Option<i64>,
         sounds: &[Sound],
+        progress: F,
+    ) -> Result<ImportReport, (ImportReport, String)>
+    where
+        F: FnMut(&str, usize, usize) -> Result<(), String>,
+    {
+        self.import_sounds_with_cover_and_progress(
+            looper,
+            source_type,
+            source_path,
+            source_hash,
+            exe_offset,
+            exe_length,
+            sounds,
+            None,
+            progress,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn import_sounds_with_cover_and_progress<F>(
+        &self,
+        looper: &str,
+        source_type: &str,
+        source_path: &str,
+        source_hash: &str,
+        exe_offset: Option<i64>,
+        exe_length: Option<i64>,
+        sounds: &[Sound],
+        cover_image: Option<&[u8]>,
         mut progress: F,
     ) -> Result<ImportReport, (ImportReport, String)>
     where
@@ -1037,6 +1224,7 @@ impl Library {
                 "no extractable sounds".to_string(),
             ));
         }
+        let (artist_tag, album_tag) = looper_audio_tags(looper);
         let looper = sanitize_name(looper);
         let dir = self.root.join(&looper);
         std::fs::create_dir_all(&dir).map_err(|e| {
@@ -1210,6 +1398,19 @@ impl Library {
                             error,
                         )
                     })?;
+                if let Err(reason) = serato::write_extracted_audio_tags(
+                    &final_path,
+                    artist_tag.as_deref(),
+                    &album_tag,
+                    cover_image,
+                ) {
+                    let _ = std::fs::remove_file(&final_path);
+                    failed.push(FailedSound {
+                        id: sound.id as i64,
+                        reason,
+                    });
+                    continue;
+                }
                 let title = format!("{:02} · {}", index + 1, looper);
                 progress("inserting in library", current, total).map_err(|error| {
                     (

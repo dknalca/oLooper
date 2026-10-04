@@ -15,8 +15,9 @@ practice with a persistent local library, prepare cue/loop metadata
 4. Library persists across restarts; missing/moved files reported, never silently duplicated.
 5. Infinite (perceptually gapless) looping with scrolling waveform, BPM and cue/slot controls.
 6. Keyboard shortcuts for hands-free practice: Space (play/pause), S (stop), arrows (seek), L (loop toggle).
-7. Four numbered CUE controls per track; cues 2–4 persist to SQLite and cue 1
-   always returns to track start.
+7. Four CUEs per track, persisted in supported audio-file metadata and shared
+   with Serato. CUE 1 is fixed at the start of the track; existing Serato saved
+   loops are preserved but not managed by oLooper.
 8. Native OS file dialogs for importing SWF/EXE/audio and selecting library root.
 9. File/Edit application menus, plus dark UI with Tailwind CSS: two-pane library,
    transport controls, and track-management menus.

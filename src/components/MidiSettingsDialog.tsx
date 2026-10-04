@@ -18,13 +18,16 @@ export const MIDI_ACTIONS: { id: MidiAction; label: string; group: string }[] = 
   { id: "auto-loop", label: "Auto-detect loop", group: "Transport" },
   { id: "speed-down", label: "Slower (5%)", group: "Transport" },
   { id: "speed-up", label: "Faster (5%)", group: "Transport" },
-  { id: "cue-1", label: "Cue 1 (track start)", group: "Cues" },
-  { id: "cue-2", label: "Cue 2", group: "Cues" },
-  { id: "cue-3", label: "Cue 3", group: "Cues" },
-  { id: "cue-4", label: "Cue 4", group: "Cues" },
-  { id: "clear-cue-2", label: "Clear Cue 2", group: "Cues" },
-  { id: "clear-cue-3", label: "Clear Cue 3", group: "Cues" },
-  { id: "clear-cue-4", label: "Clear Cue 4", group: "Cues" },
+  ...Array.from({ length: 4 }, (_, index) => ({
+    id: `cue-${index + 1}` as MidiAction,
+    label: `CUE ${index + 1}`,
+    group: "Cues",
+  })),
+  ...Array.from({ length: 3 }, (_, index) => ({
+    id: `clear-cue-${index + 2}` as MidiAction,
+    label: `Clear CUE ${index + 2}`,
+    group: "Cues",
+  })),
 ];
 
 interface Props {

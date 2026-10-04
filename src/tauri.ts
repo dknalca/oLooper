@@ -580,39 +580,41 @@ export async function pickDirectory(): Promise<string | null> {
   return Array.isArray(result) ? result[0] : result;
 }
 
-// --- Loop slots ---
+// --- Audio-file CUE metadata ---
 
-export interface LoopSlot {
-  id: number;
-  track_id: number;
+export interface SeratoCue {
   slot: number;
   label: string;
-  cue_ms: number;
-  loop_start_ms: number;
-  loop_end_ms: number;
-  enabled: boolean;
+  position_ms: number;
 }
 
-export function libraryGetSlots(trackId: number): Promise<LoopSlot[]> {
-  return invoke<LoopSlot[]>("library_get_slots", { trackId });
+export interface SeratoLoop {
+  slot: number;
+  label: string;
+  start_ms: number;
+  end_ms: number;
 }
 
-export function librarySetSlot(
+export interface SeratoMetadata {
+  cues: SeratoCue[];
+  loops: SeratoLoop[];
+  bpm: number | null;
+}
+
+export function libraryGetSeratoMetadata(trackId: number): Promise<SeratoMetadata> {
+  return invoke<SeratoMetadata>("library_get_serato_metadata", { trackId });
+}
+
+export function librarySetSeratoCue(
   trackId: number,
   slot: number,
-  label: string,
-  cueMs: number,
-  loopStartMs: number,
-  loopEndMs: number,
-  enabled: boolean,
-): Promise<LoopSlot> {
-  return invoke<LoopSlot>("library_set_slot", {
-    trackId, slot, label, cueMs, loopStartMs, loopEndMs, enabled,
-  });
+  positionMs: number | null,
+): Promise<SeratoMetadata> {
+  return invoke<SeratoMetadata>("library_set_serato_cue", { trackId, slot, positionMs });
 }
 
-export function libraryDeleteSlot(trackId: number, slot: number): Promise<boolean> {
-  return invoke<boolean>("library_delete_slot", { trackId, slot });
+export function librarySyncSeratoMetadata(trackId: number): Promise<void> {
+  return invoke<void>("library_sync_serato_metadata", { trackId });
 }
 
 // --- Library management ---

@@ -205,19 +205,24 @@ fn copy_dropped_source_to(
             }
             continue;
         }
-        let tmp = dest.with_extension(format!("{ext}.tmp"));
-        std::fs::write(&tmp, data).map_err(|e| format!("cannot copy source: {e}"))?;
-        let verified =
-            std::fs::read(&tmp).map_err(|e| format!("cannot verify source copy: {e}"))?;
+        use std::io::{Read, Seek, SeekFrom, Write};
+        let mut tmp = tempfile::NamedTempFile::new_in(source_dir)
+            .map_err(|e| format!("cannot create temporary source copy: {e}"))?;
+        tmp.write_all(data)
+            .and_then(|_| tmp.as_file_mut().sync_all())
+            .and_then(|_| tmp.seek(SeekFrom::Start(0)).map(|_| ()))
+            .map_err(|e| format!("cannot copy source: {e}"))?;
+        let mut verified = Vec::new();
+        tmp.read_to_end(&mut verified)
+            .map_err(|e| format!("cannot verify source copy: {e}"))?;
         if verified != data {
-            let _ = std::fs::remove_file(&tmp);
             return Err("cannot verify source copy".to_string());
         }
-        if let Err(e) = std::fs::rename(&tmp, &dest) {
-            let _ = std::fs::remove_file(&tmp);
-            return Err(format!("cannot save source copy: {e}"));
+        match tmp.persist_noclobber(&dest) {
+            Ok(_) => return Ok(dest.to_string_lossy().to_string()),
+            Err(e) if e.error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("cannot save source copy: {e}")),
         }
-        return Ok(dest.to_string_lossy().to_string());
     }
     Err("too many files with the same source name".to_string())
 }
@@ -477,9 +482,9 @@ pub fn run() {
             library_remove_looper,
             library_group_directory,
             library_group_cover,
-            library_get_slots,
-            library_set_slot,
-            library_delete_slot,
+            library_get_serato_metadata,
+            library_set_serato_cue,
+            library_sync_serato_metadata,
             midi_list_inputs,
             midi_connected_input,
             midi_connect,
@@ -854,38 +859,29 @@ fn library_group_cover(source_hash: String, db: Db<'_>) -> Result<Option<String>
 }
 
 #[tauri::command]
-fn library_get_slots(track_id: i64, db: Db<'_>) -> Result<Vec<library::LoopSlot>, String> {
+fn library_get_serato_metadata(
+    track_id: i64,
+    db: Db<'_>,
+) -> Result<library::SeratoMetadata, String> {
     let g = self::db(&db)?;
-    require_lib(&g)?.get_slots(track_id)
+    require_lib(&g)?.get_serato_metadata(track_id)
 }
 
 #[tauri::command]
-fn library_set_slot(
+fn library_set_serato_cue(
     track_id: i64,
     slot: i64,
-    label: String,
-    cue_ms: i64,
-    loop_start_ms: i64,
-    loop_end_ms: i64,
-    enabled: bool,
+    position_ms: Option<i64>,
     db: Db<'_>,
-) -> Result<library::LoopSlot, String> {
+) -> Result<library::SeratoMetadata, String> {
     let g = self::db(&db)?;
-    require_lib(&g)?.set_slot(
-        track_id,
-        slot,
-        &label,
-        cue_ms,
-        loop_start_ms,
-        loop_end_ms,
-        enabled,
-    )
+    require_lib(&g)?.set_serato_cue(track_id, slot, position_ms)
 }
 
 #[tauri::command]
-fn library_delete_slot(track_id: i64, slot: i64, db: Db<'_>) -> Result<bool, String> {
+fn library_sync_serato_metadata(track_id: i64, db: Db<'_>) -> Result<(), String> {
     let g = self::db(&db)?;
-    require_lib(&g)?.delete_slot(track_id, slot)
+    require_lib(&g)?.sync_serato_metadata(track_id)
 }
 
 #[tauri::command]
@@ -1064,7 +1060,7 @@ fn run_container_job(app: &tauri::AppHandle, job: &ImportJob, exe: bool) {
         }
     };
     let source_hash = library::sha256_hex(&data);
-    let report = lib.import_sounds_with_progress(
+    let report = lib.import_sounds_with_cover_and_progress(
         &looper_name(&copied_path),
         source_type,
         &copied_path,
@@ -1072,6 +1068,7 @@ fn run_container_job(app: &tauri::AppHandle, job: &ImportJob, exe: bool) {
         exe_offset,
         exe_length,
         &sounds.sounds,
+        sounds.cover_image.as_deref(),
         |stage, current, total| {
             if import_cancelled(&job.job_id) {
                 return Err("import cancelled".to_string());
@@ -1544,6 +1541,17 @@ mod tests {
         assert!(collision.ends_with("My Looper (2).swf"));
         assert_eq!(std::fs::read(collision).unwrap(), b"second");
         assert!(source_root.is_dir());
+
+        #[cfg(unix)]
+        {
+            let sentinel = root.join("outside-source");
+            std::fs::write(&sentinel, b"untouched").unwrap();
+            std::os::unix::fs::symlink(&sentinel, source_root.join("Another.exe.tmp")).unwrap();
+            let copied =
+                copy_dropped_source(&library_root, "/drop/Another.exe", b"projector").unwrap();
+            assert_eq!(std::fs::read(copied).unwrap(), b"projector");
+            assert_eq!(std::fs::read(sentinel).unwrap(), b"untouched");
+        }
 
         std::fs::remove_dir_all(root).unwrap();
     }

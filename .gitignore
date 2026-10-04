@@ -18,7 +18,7 @@ loopersFlash/
 # Local library data (user-specific)
 audios/
 olooper-library.json
-library/
+/library/
 
 # Scratch verification artifacts (dumps, screenshots, icons): project-local, never committed
 .dev/

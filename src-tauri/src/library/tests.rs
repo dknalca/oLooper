@@ -5,6 +5,7 @@
 use super::*;
 use crate::import::fixture::*;
 use crate::import::swf::FORMAT_MP3;
+use id3::{Tag, TagLike};
 
 fn tmp_root(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
@@ -17,6 +18,21 @@ fn tmp_root(tag: &str) -> PathBuf {
     ));
     std::fs::create_dir_all(&dir).unwrap();
     dir
+}
+
+#[cfg(unix)]
+#[test]
+fn extracted_audio_does_not_follow_a_predictable_temporary_symlink() {
+    let root = tmp_root("atomic-audio-symlink");
+    let lib = Library::open(&root).unwrap();
+    let sentinel = root.join("sentinel");
+    std::fs::write(&sentinel, b"untouched").unwrap();
+    let dest = root.join("Custom Loops").join("test.mp3");
+    std::os::unix::fs::symlink(&sentinel, dest.with_extension("mp3.tmp")).unwrap();
+    lib.atomic_write(&dest, b"audio").unwrap();
+    assert_eq!(std::fs::read(&dest).unwrap(), b"audio");
+    assert_eq!(std::fs::read(&sentinel).unwrap(), b"untouched");
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 fn wav_buf() -> crate::player::LoopBuffer {
@@ -37,6 +53,21 @@ fn wav_buf() -> crate::player::LoopBuffer {
         v.extend_from_slice(&(i as i16).to_le_bytes());
     }
     crate::player::decode_bytes(&v).unwrap()
+}
+
+fn wav_id3_tag(path: &Path) -> Tag {
+    let bytes = std::fs::read(path).unwrap();
+    let mut offset = 12;
+    while offset + 8 <= bytes.len() {
+        let size = u32::from_le_bytes(bytes[offset + 4..offset + 8].try_into().unwrap()) as usize;
+        let start = offset + 8;
+        let end = start + size;
+        if bytes[offset..offset + 4].eq_ignore_ascii_case(b"ID3 ") {
+            return Tag::read_from2(std::io::Cursor::new(bytes[start..end].to_vec())).unwrap();
+        }
+        offset = end + (size & 1);
+    }
+    panic!("WAV has no embedded ID3 chunk");
 }
 
 #[test]
@@ -106,6 +137,188 @@ fn add_list_get_dedup() {
 }
 
 #[test]
+fn audio_file_is_the_source_of_truth_for_four_cues_and_bpm() {
+    let root = tmp_root("audio-markers");
+    let lib = Library::open(&root).unwrap();
+    let audio = root.join("Custom Loops").join("markers.wav");
+    let buf = wav_buf();
+    std::fs::write(&audio, Library::loop_buffer_to_wav(&buf)).unwrap();
+    let (track_id, _) = lib
+        .add_track(
+            "markers",
+            "Custom Loops",
+            &audio,
+            "custom",
+            "/source/markers.wav",
+            "markers-hash",
+            0,
+            None,
+            None,
+            "wav",
+            &buf,
+            0,
+            0,
+        )
+        .unwrap();
+    lib.update_bpm(track_id, 120.0, None, true).unwrap();
+    lib.set_serato_cue(track_id, 2, Some(35)).unwrap();
+    assert!(lib.set_serato_cue(track_id, 5, Some(40)).is_err());
+    let saved = lib.get_serato_metadata(track_id).unwrap();
+    assert_eq!(
+        saved
+            .cues
+            .iter()
+            .find(|cue| cue.slot == 2)
+            .unwrap()
+            .position_ms,
+        35
+    );
+    assert_eq!(
+        saved
+            .cues
+            .iter()
+            .find(|cue| cue.slot == 1)
+            .unwrap()
+            .position_ms,
+        0
+    );
+    assert!(saved.loops.is_empty());
+    assert_eq!(saved.bpm, Some(120.0));
+
+    let db_rows: i64 = lib
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM loop_slots WHERE track_id=?1",
+            [track_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(db_rows, 0);
+    drop(lib);
+
+    let lib = Library::open(&root).unwrap();
+    let reopened = lib.get_serato_metadata(track_id).unwrap();
+    assert_eq!(
+        reopened
+            .cues
+            .iter()
+            .find(|cue| cue.slot == 2)
+            .unwrap()
+            .position_ms,
+        35
+    );
+    assert_eq!(reopened.cues[0].position_ms, 0);
+    assert!(reopened.loops.is_empty());
+
+    // Simulate Serato changing a cue and BPM.
+    let mut serato_edit = reopened;
+    serato_edit
+        .cues
+        .iter_mut()
+        .find(|cue| cue.slot == 2)
+        .unwrap()
+        .position_ms = 45;
+    serato_edit.bpm = Some(124.0);
+    serato::write_audio_file(&audio, &serato_edit, 100).unwrap();
+
+    let refreshed = lib.get_serato_metadata(track_id).unwrap();
+    assert_eq!(
+        refreshed
+            .cues
+            .iter()
+            .find(|cue| cue.slot == 2)
+            .unwrap()
+            .position_ms,
+        45
+    );
+    assert_eq!(refreshed.cues[0].position_ms, 0);
+    assert!(refreshed.loops.is_empty());
+    assert_eq!(refreshed.bpm, Some(124.0));
+    assert_eq!(lib.get_track(track_id).unwrap().unwrap().bpm, Some(124.0));
+
+    let db_rows: i64 = lib
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM loop_slots WHERE track_id=?1",
+            [track_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(db_rows, 0);
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn legacy_database_cues_are_migrated_into_the_audio_file_on_open() {
+    let root = tmp_root("legacy-marker-migration");
+    let lib = Library::open(&root).unwrap();
+    let audio = root.join("Custom Loops").join("legacy.wav");
+    let buf = wav_buf();
+    std::fs::write(&audio, Library::loop_buffer_to_wav(&buf)).unwrap();
+    let (track_id, _) = lib
+        .add_track(
+            "legacy",
+            "Custom Loops",
+            &audio,
+            "custom",
+            "/source/legacy.wav",
+            "legacy-hash",
+            0,
+            None,
+            None,
+            "wav",
+            &buf,
+            0,
+            0,
+        )
+        .unwrap();
+    lib.conn
+        .execute(
+            "INSERT INTO loop_slots(track_id,slot,label,cue_ms,loop_start_ms,loop_end_ms,enabled) \
+             VALUES (?1,2,'B',30,10,70,1)",
+            [track_id],
+        )
+        .unwrap();
+    // A legacy uppercase ID3 chunk with unrelated metadata must not cause
+    // normalization to write default markers before SQLite slots migrate.
+    let mut old_tag = id3::Tag::new();
+    old_tag.set_title("Legacy title");
+    old_tag.write_to_path(&audio, id3::Version::Id3v24).unwrap();
+
+    let migrated = lib.get_serato_metadata(track_id).unwrap();
+    assert_eq!(
+        migrated
+            .cues
+            .iter()
+            .find(|cue| cue.slot == 1)
+            .unwrap()
+            .position_ms,
+        0
+    );
+    assert_eq!(
+        migrated
+            .cues
+            .iter()
+            .find(|cue| cue.slot == 2)
+            .unwrap()
+            .position_ms,
+        30
+    );
+    assert!(migrated.loops.is_empty());
+    let legacy_rows: i64 = lib
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM loop_slots WHERE track_id=?1",
+            [track_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(legacy_rows, 0);
+    assert!(serato::read_audio_file(&audio).unwrap().markers_present);
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
 fn looper_group_rename_and_remove_delete_derived_audio_only() {
     let root = tmp_root("group-management");
     let lib = Library::open(&root).unwrap();
@@ -154,7 +367,14 @@ fn looper_group_rename_and_remove_delete_derived_audio_only() {
     )
     .unwrap();
     std::fs::write(old_dir.join("cover.jpg"), b"cover bytes").unwrap();
-    lib.set_slot(first_id, 1, "A", 0, 0, 90, true).unwrap();
+    // Legacy CUE rows are retained only for the one-time audio-tag migration.
+    lib.conn
+        .execute(
+            "INSERT INTO loop_slots(track_id,slot,label,cue_ms,loop_start_ms,loop_end_ms,enabled) \
+             VALUES (?1,1,'A',0,0,90,1)",
+            [first_id],
+        )
+        .unwrap();
 
     lib.rename_looper("group-hash", "Renamed Looper").unwrap();
     let renamed_dir = root.join("Renamed Looper");
@@ -168,7 +388,15 @@ fn looper_group_rename_and_remove_delete_derived_audio_only() {
 
     assert_eq!(lib.remove_looper("group-hash").unwrap(), 2);
     assert!(lib.list_tracks().unwrap().is_empty());
-    assert!(lib.get_slots(first_id).unwrap().is_empty());
+    let legacy_cues: i64 = lib
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM loop_slots WHERE track_id=?1",
+            [first_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(legacy_cues, 0);
     assert!(!renamed_dir.join("01_1.mp3").exists());
     assert!(!renamed_dir.join("02_2.mp3").exists());
     assert!(!renamed_dir.join("cover.jpg").exists());
@@ -342,6 +570,70 @@ fn sanitize_confines_names() {
     assert!(!sanitize_name("a/b\\c")
         .chars()
         .any(|c| c == '/' || c == '\\'));
+}
+
+#[test]
+fn looper_filename_provides_artist_and_album_tag_values() {
+    assert_eq!(
+        looper_audio_tags("Nina Simone - Friendly Melodies"),
+        (
+            Some("Nina Simone".to_string()),
+            "Friendly Melodies".to_string()
+        )
+    );
+    assert_eq!(
+        looper_audio_tags("Nina Simone – Friendly Melodies"),
+        (
+            Some("Nina Simone".to_string()),
+            "Friendly Melodies".to_string()
+        )
+    );
+    assert_eq!(
+        looper_audio_tags("Untitled Looper"),
+        (None, "Untitled Looper".to_string())
+    );
+}
+
+#[test]
+fn extracted_wav_gets_looper_artist_album_and_front_cover_tags() {
+    let root = tmp_root("extracted-tags");
+    let lib = Library::open(&root).unwrap();
+    let buf = wav_buf();
+    let sound = crate::import::swf::Sound {
+        id: 17,
+        format: 0,
+        codec: "wav".to_string(),
+        sample_count: buf.frames() as u32,
+        seek_samples: 0,
+        trimmed_leading: 0,
+        frames: Library::loop_buffer_to_wav(&buf),
+    };
+    let mut cover = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut cover, 85)
+        .encode(&[255, 0, 0], 1, 1, image::ExtendedColorType::Rgb8)
+        .unwrap();
+    let report = lib
+        .import_sounds_with_cover_and_progress(
+            "Nina Simone - Friendly Melodies",
+            "swf",
+            "/source/Nina Simone - Friendly Melodies.swf",
+            "metadata-tag-source",
+            None,
+            None,
+            &[sound],
+            Some(&cover),
+            |_, _, _| Ok(()),
+        )
+        .unwrap();
+    let track = lib.get_track(report.track_ids[0]).unwrap().unwrap();
+    let tag = wav_id3_tag(Path::new(&track.file_path));
+    assert_eq!(tag.artist(), Some("Nina Simone"));
+    assert_eq!(tag.album(), Some("Friendly Melodies"));
+    let picture = tag.pictures().next().unwrap();
+    assert_eq!(picture.mime_type, "image/jpeg");
+    assert_eq!(picture.picture_type, id3::frame::PictureType::CoverFront);
+    assert_eq!(picture.data, cover);
+    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]

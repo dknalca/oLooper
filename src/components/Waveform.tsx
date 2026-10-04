@@ -4,7 +4,7 @@ import {
   playerSetLoopSnapped,
   playerWaveformPeaks,
   type PlayerStatus,
-  type LoopSlot,
+  type SeratoCue,
   type WaveformData,
 } from "../tauri";
 import Logo from "./Logo";
@@ -22,7 +22,7 @@ export default function Waveform({ refreshKey, status, trackTitle, loopEditing, 
   const wrapRef = useRef<HTMLDivElement>(null);
   const statusRef = useRef<PlayerStatus | null>(null);
   const waveRef = useRef<WaveformData | null>(null);
-  const cuesRef = useRef<LoopSlot[]>([]);
+  const cuesRef = useRef<SeratoCue[]>([]);
   const zoomRef = useRef(1);
   const previewRef = useRef<{ start: number; end: number } | null>(null);
   const loopEditingRef = useRef(loopEditing);
@@ -59,7 +59,7 @@ export default function Waveform({ refreshKey, status, trackTitle, loopEditing, 
   }, [contextMenu]);
 
   useEffect(() => {
-    const setCues = (event: Event) => { cuesRef.current = (event as CustomEvent<LoopSlot[]>).detail; };
+    const setCues = (event: Event) => { cuesRef.current = (event as CustomEvent<SeratoCue[]>).detail; };
     window.addEventListener("olooper:cues", setCues);
     return () => window.removeEventListener("olooper:cues", setCues);
   }, []);
@@ -287,7 +287,7 @@ function render(
   wave: WaveformData,
   st: PlayerStatus,
   posMs: number,
-  cues: LoopSlot[],
+  cues: SeratoCue[],
   zoom: number,
   preview: { start: number; end: number } | null,
   loopEditing: boolean,
@@ -357,11 +357,10 @@ function render(
     ctx.fillRect(x, mid - h, Math.max(1, step - 1), h * 2);
   }
 
-  // Cue 1 is fixed at the track start; optional cues are saved per track.
-  [{ slot: 1, cue_ms: 0 }, ...cues].forEach((cue) => {
-    const cx = xOf(cue.cue_ms);
+  cues.forEach((cue) => {
+    const cx = xOf(cue.position_ms);
     if (cx < 0 || cx > width) return;
-    ctx.fillStyle = cue.slot === 1 ? "#fbbf24" : "#f97316";
+    ctx.fillStyle = "#f97316";
     ctx.fillRect(cx - 1, 0, 2, height);
     ctx.font = "10px sans-serif";
     ctx.fillText(String(cue.slot), cx + 3, 11);

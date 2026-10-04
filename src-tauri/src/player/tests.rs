@@ -25,9 +25,9 @@ fn routes_stereo_source_to_selected_multichannel_pair() {
     });
     let source = LoopRegion::new(buffer, 0, 0, 2, false, cursor());
     let meter = Arc::new(OutputMeter::default());
-    let routed = RoutedLoopRegion::new(source, 4, 1, meter.clone());
+    let routed = RoutedLoopRegion::new(source, 4, 2, meter.clone());
     assert_eq!(rodio::Source::channels(&routed), 4);
-    assert_eq!(routed.collect::<Vec<_>>(), vec![0, 10, 11, 0, 0, 20, 21, 0]);
+    assert_eq!(routed.collect::<Vec<_>>(), vec![0, 0, 10, 11, 0, 0, 20, 21]);
     let (left, right) = meter.take_percentages();
     assert!(left > 0.0 && right > 0.0);
 }
@@ -40,8 +40,72 @@ fn routes_mono_source_to_both_channels_of_selected_pair() {
         rate: 44_100,
     });
     let source = LoopRegion::new(buffer, 0, 0, 2, false, cursor());
-    let routed = RoutedLoopRegion::new(source, 3, 1, Arc::new(OutputMeter::default()));
-    assert_eq!(routed.collect::<Vec<_>>(), vec![0, 7, 7, 0, 9, 9]);
+    let routed = RoutedLoopRegion::new(source, 4, 2, Arc::new(OutputMeter::default()));
+    assert_eq!(routed.collect::<Vec<_>>(), vec![0, 0, 7, 7, 0, 0, 9, 9]);
+}
+
+#[test]
+fn stereo_pairs_do_not_straddle_two_hardware_outputs() {
+    assert!(validate_output_pair(0, 8).is_ok());
+    assert!(validate_output_pair(2, 8).is_ok());
+    assert!(validate_output_pair(6, 8).is_ok());
+    assert!(validate_output_pair(1, 8).is_err());
+    assert!(validate_output_pair(4, 4).is_err());
+}
+
+#[test]
+fn rodio_stream_keeps_all_unselected_djm_channels_silent_after_resampling() {
+    // Exercise the same Sink -> queue -> Rodio mixer path that feeds CPAL,
+    // including its 44.1 kHz -> 48 kHz conversion. The test tone alone cannot
+    // detect leaks introduced later than RoutedLoopRegion.
+    for first_channel in [0, 2, 4, 6] {
+        let samples = (0..4_410)
+            .flat_map(|frame| [1_000 + (frame % 100) as i16, -2_000])
+            .collect();
+        let buffer = Arc::new(LoopBuffer {
+            samples,
+            channels: 2,
+            rate: 44_100,
+        });
+        let source = LoopRegion::new(buffer, 0, 0, 4_410, true, cursor());
+        let (sink, queue) = Sink::new_idle();
+        sink.set_volume(0.8);
+        queue_routed_source(
+            &sink,
+            source,
+            8,
+            first_channel,
+            Arc::new(OutputMeter::default()),
+            true,
+        );
+        let (controller, mut stream) = rodio::dynamic_mixer::mixer::<f32>(8, 48_000);
+        controller.add(RoutedOutputQueue {
+            inner: queue,
+            channels: 8,
+            rate: 44_100,
+        });
+
+        let rendered: Vec<_> = stream.by_ref().take(8 * 1_000).collect();
+        assert_eq!(rendered.len(), 8 * 1_000);
+        for frame in rendered.chunks_exact(8) {
+            for (channel, sample) in frame.iter().enumerate() {
+                if channel != first_channel as usize && channel != first_channel as usize + 1 {
+                    assert!(
+                        sample.abs() < 1e-6,
+                        "unexpected signal on output {} for pair {}–{}: {sample}",
+                        channel + 1,
+                        first_channel + 1,
+                        first_channel + 2
+                    );
+                }
+            }
+        }
+        assert!(rendered
+            .iter()
+            .skip(first_channel as usize)
+            .step_by(8)
+            .any(|sample| *sample != 0.0));
+    }
 }
 
 #[test]
@@ -190,6 +254,13 @@ fn synthetic_wav_decodes_end_to_end() {
     assert_eq!(buf.frames(), 800);
     assert_eq!(buf.duration_ms(), 100);
     assert_eq!(&buf.samples[0..4], &[0, 1, 2, 3]);
+}
+
+#[test]
+fn decoding_stops_when_pcm_exceeds_the_practice_duration() {
+    let frames = (MAX_DURATION_MS as usize + 1) * 8;
+    let error = decode_bytes(&pcm_wav(frames)).unwrap_err();
+    assert!(error.contains("15 min practice limit"), "{error}");
 }
 
 #[test]

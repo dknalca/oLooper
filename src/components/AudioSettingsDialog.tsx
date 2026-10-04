@@ -12,6 +12,7 @@ import {
 } from "../tauri";
 import {
   parseOutputPairSelections,
+  normalizeStereoPair,
   rememberedOutputPair,
   rememberOutputPair,
 } from "../audioOutputPreferences";
@@ -19,6 +20,7 @@ import {
 interface Props {
   open: boolean;
   selection: AudioOutputSelection;
+  startupError: string | null;
   onSelectionChange: (selection: AudioOutputSelection) => void;
   onPlayerStatusChange: (status: PlayerStatus) => void;
   onOutputTestStarted: () => void;
@@ -28,6 +30,7 @@ interface Props {
 export default function AudioSettingsDialog({
   open,
   selection,
+  startupError,
   onSelectionChange,
   onPlayerStatusChange,
   onOutputTestStarted,
@@ -68,7 +71,7 @@ export default function AudioSettingsDialog({
   useEffect(() => {
     if (!open) return;
     setDeviceName(selection.deviceName ?? "");
-    setFirstChannel(selection.firstChannel);
+    setFirstChannel(normalizeStereoPair(selection.firstChannel));
     const remembered = rememberOutputPair(
       parseOutputPairSelections(localStorage.getItem("olooper.audio.output-pairs")),
       selection,
@@ -138,7 +141,7 @@ export default function AudioSettingsDialog({
   const systemDefault = devices.find((device) => device.is_default);
   const selectedAvailable = deviceName ? Boolean(selectedDevice) : Boolean(systemDefault);
   const channelCount = deviceName ? selectedDevice?.channels ?? 0 : systemDefault?.channels ?? 0;
-  const pairCount = Math.max(1, channelCount - 1);
+  const pairCount = Math.floor(channelCount / 2);
 
   if (!open) return null;
 
@@ -235,7 +238,7 @@ export default function AudioSettingsDialog({
             className="mt-1 block w-full rounded border border-border bg-elevated px-2 py-2 text-xs text-text disabled:opacity-50"
           >
             {Array.from({ length: pairCount }, (_, index) => (
-              <option key={index} value={index}>Output {index + 1}–{index + 2}</option>
+              <option key={index} value={index * 2}>Output {index * 2 + 1}–{index * 2 + 2}</option>
             ))}
           </select>
         </label>
@@ -284,7 +287,7 @@ export default function AudioSettingsDialog({
             <span className="ml-1 text-text">Testing {testChannel === "left" ? "left" : "right"} channel…</span>
           </div>
         )}
-        {error && <p className="mt-3 text-xs text-danger" role="alert">{error}</p>}
+        {(error || startupError) && <p className="mt-3 text-xs text-danger" role="alert">{error || startupError}</p>}
 
         <footer className="mt-5 flex items-center justify-between">
           <button onClick={() => void refreshDevices()} disabled={loading || busy} className="rounded bg-border px-3 py-2 text-[10px] text-text-secondary hover:text-text disabled:opacity-40">

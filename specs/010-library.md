@@ -16,11 +16,13 @@ slots.
    (dedup on `(source_hash, source_sound_id)`), reported as "already imported".
 3. Track list survives restarts with no re-analysis; missing or moved files are
    flagged per-track (`exists: false`), never silently dropped or duplicated.
-4. Cue/loop/BPM edits persist per track and are never overwritten by later
-   imports or re-analysis.
-5. Four numbered cue slots per track are stored in `loop_slots`. Cues 2–4
-   persist across sessions; cue 1 is the fixed track start. Removing a track
-   cascades to delete its saved cues.
+4. BPM remains catalog metadata and is mirrored to the audio file as ID3 `TBPM`.
+   CUEs are persisted in supported audio files and re-read when a track is
+   opened, so changes made in Serato are reflected in oLooper.
+5. Each track supports four hot cues. CUE 1 is fixed at the start of the track.
+   The audio file is their source of truth; legacy schema-v6 cue positions are
+   migrated to the file on first read. Existing Serato saved loops are retained
+   but are not managed by oLooper.
 6. The left pane lists **Favoritos** first, followed by loopers; selecting one
    shows its tracks in the right pane. Tracks show their name, duration, and BPM. Automatically
    analyzed BPM is normalized by octave into 65–150 BPM; user-entered BPM is
@@ -50,8 +52,7 @@ slots.
   imports; custom audio returns per-file results.
 - `Track { id, title, file_path, exists, duration_ms, bpm?, cue/loop…,
   provenance… }` for UI and player handoff (`player_load(track.file_path)`).
-- `LoopSlot { id, track_id, slot, label, cue_ms, loop_start_ms, loop_end_ms, enabled }`
-  for loop slot CRUD.
+- `SeratoMetadata { cues, loops, bpm }` for audio-file marker data.
 
 ## Failure behavior
 

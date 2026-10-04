@@ -282,6 +282,55 @@ impl rodio::Source for RoutedLoopRegion {
     }
 }
 
+/// Rodio's Sink queue starts with an empty *mono* source. If that changing
+/// metadata reaches Rodio's output mixer, its initial channel conversion can
+/// copy real samples onto unselected hardware outputs when a track begins.
+/// All sources queued on this sink use the same routed channel count and rate,
+/// so advertise those stable properties from the moment the queue is attached.
+struct RoutedOutputQueue {
+    inner: rodio::queue::SourcesQueueOutput<f32>,
+    channels: u16,
+    rate: u32,
+}
+
+impl Iterator for RoutedOutputQueue {
+    type Item = f32;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next()
+    }
+}
+
+impl rodio::Source for RoutedOutputQueue {
+    fn current_frame_len(&self) -> Option<usize> {
+        self.inner.current_frame_len()
+    }
+
+    fn channels(&self) -> u16 {
+        self.channels
+    }
+
+    fn sample_rate(&self) -> u32 {
+        self.rate
+    }
+
+    fn total_duration(&self) -> Option<std::time::Duration> {
+        self.inner.total_duration()
+    }
+}
+
+fn routed_sink(handle: &OutputStreamHandle, channels: u16, rate: u32) -> Result<Sink, String> {
+    let (sink, queue) = Sink::new_idle();
+    handle
+        .play_raw(RoutedOutputQueue {
+            inner: queue,
+            channels,
+            rate,
+        })
+        .map_err(|error| format!("audio error: {error}"))?;
+    Ok(sink)
+}
+
 fn queue_routed_source(
     sink: &Sink,
     source: LoopRegion,
@@ -350,6 +399,19 @@ pub struct OutputSelection {
     pub first_channel: u16,
 }
 
+fn validate_output_pair(first_channel: u16, channels: u16) -> Result<(), String> {
+    if first_channel % 2 != 0 {
+        return Err("stereo output must start on channel 1, 3, 5, etc.".to_string());
+    }
+    if first_channel.saturating_add(2) > channels {
+        return Err(format!(
+            "selected output pair requires {} channels, but the device exposes {channels}",
+            first_channel.saturating_add(2)
+        ));
+    }
+    Ok(())
+}
+
 pub fn list_output_devices() -> Result<Vec<AudioOutputDevice>, String> {
     let host = cpal::default_host();
     let default_name = host
@@ -379,6 +441,9 @@ pub fn list_output_devices() -> Result<Vec<AudioOutputDevice>, String> {
 fn open_output(
     selection: &OutputSelection,
 ) -> Result<(OutputStream, OutputStreamHandle, u16), String> {
+    if selection.first_channel % 2 != 0 {
+        return Err("stereo output must start on channel 1, 3, 5, etc.".to_string());
+    }
     let host = cpal::default_host();
     let device = if let Some(name) = &selection.device_name {
         host.output_devices()
@@ -391,7 +456,18 @@ fn open_output(
     };
 
     let required_channels = selection.first_channel.saturating_add(2);
-    let (stream, handle, channels) = if selection.first_channel == 0 {
+    let max_channels = device
+        .supported_output_configs()
+        .map_err(|error| error.to_string())?
+        .map(|config| config.channels())
+        .max()
+        .unwrap_or(0);
+    // An explicit multichannel interface must use its full stream even for
+    // 1–2. Its default *stereo* configuration may represent a different
+    // hardware destination (for example the DJ mixer master bus).
+    let use_default_config =
+        selection.first_channel == 0 && (selection.device_name.is_none() || max_channels <= 2);
+    let (stream, handle, channels) = if use_default_config {
         let channels = device
             .default_output_config()
             .map_err(|error| error.to_string())?
@@ -405,7 +481,7 @@ fn open_output(
             .map_err(|error| error.to_string())?
             .filter(|config| config.channels() >= required_channels)
             .collect();
-        configs.sort_by_key(|config| config.channels());
+        configs.sort_by_key(|config| std::cmp::Reverse(config.channels()));
         let config = configs.into_iter().next().ok_or_else(|| {
             format!(
                 "device does not expose output channels {}–{}",
@@ -432,11 +508,7 @@ fn open_output(
             .map_err(|error| format!("cannot open selected audio channels: {error}"))?;
         (stream, handle, channels)
     };
-    if channels < required_channels {
-        return Err(format!(
-            "selected output pair requires {required_channels} channels, but the device opened {channels}"
-        ));
-    }
+    validate_output_pair(selection.first_channel, channels)?;
     Ok((stream, handle, channels))
 }
 
@@ -557,6 +629,11 @@ fn decode_isomp4(data: &[u8]) -> Result<LoopBuffer, String> {
         let trim_end = (packet.trim_end() as usize).min(frame_count - trim_start);
         let start_sample = trim_start * channels;
         let end_sample = (frame_count - trim_end) * channels;
+        let max_samples =
+            (MAX_DURATION_MS as u128 * rate as u128 / 1000).saturating_mul(channels as u128);
+        if samples.len() as u128 + (end_sample - start_sample) as u128 > max_samples {
+            return Err("track is over the 15 min practice limit".to_string());
+        }
         samples.extend_from_slice(&decoded_samples[start_sample..end_sample]);
     }
     if samples.is_empty() || channels == 0 || rate == 0 {
@@ -582,7 +659,12 @@ fn decode_owned(data: Vec<u8>) -> Result<LoopBuffer, String> {
     if channels == 0 || rate == 0 {
         return Err("decoded stream has no channels or rate".to_string());
     }
-    let samples: Vec<i16> = dec.collect();
+    let max_samples =
+        (MAX_DURATION_MS as u128 * rate as u128 / 1000).saturating_mul(channels as u128) as usize;
+    let samples: Vec<i16> = dec.take(max_samples.saturating_add(1)).collect();
+    if samples.len() > max_samples {
+        return Err("track is over the 15 min practice limit".to_string());
+    }
     let buf = LoopBuffer {
         samples,
         channels,
@@ -770,7 +852,7 @@ impl Player {
                     track.enabled,
                     track.cursor.clone(),
                 );
-                let sink = match Sink::try_new(&handle) {
+                let sink = match routed_sink(&handle, output_channels, track.buf.rate) {
                     Ok(sink) => sink,
                     Err(error) => {
                         if was_playing {
@@ -816,7 +898,7 @@ impl Player {
         if self.output_test_sink.is_some() {
             return Err("an audio output test is already running".to_string());
         }
-        let sink = Sink::try_new(&self.handle).map_err(|error| error.to_string())?;
+        let sink = routed_sink(&self.handle, self.output_channels, OUTPUT_TEST_RATE)?;
         sink.set_volume(0.65);
         let buffer = Arc::new(output_test_buffer());
         let source = LoopRegion::new(
@@ -878,7 +960,8 @@ impl Player {
     }
 
     fn fresh_sink(&mut self, volume: f32, speed: f32) -> Result<Sink, String> {
-        let sink = Sink::try_new(&self.handle).map_err(|e| format!("audio error: {e}"))?;
+        let rate = self.track.as_ref().ok_or("nothing loaded")?.buf.rate;
+        let sink = routed_sink(&self.handle, self.output_channels, rate)?;
         sink.set_volume(volume);
         sink.set_speed(speed);
         sink.pause();
@@ -1759,18 +1842,17 @@ impl Engine {
     }
 
     fn cmd_set_output(&mut self, selection: OutputSelection) -> Result<(), String> {
+        if selection.first_channel % 2 != 0 {
+            return Err("stereo output must start on channel 1, 3, 5, etc.".to_string());
+        }
         let devices = list_output_devices()?;
         let device = match &selection.device_name {
             Some(name) => devices.iter().find(|device| &device.id == name),
             None => devices.iter().find(|device| device.is_default),
         }
         .ok_or_else(|| "selected audio output is unavailable".to_string())?;
-        if selection.first_channel.saturating_add(2) > device.channels {
-            return Err(format!(
-                "selected output pair is unavailable on {}",
-                device.name
-            ));
-        }
+        validate_output_pair(selection.first_channel, device.channels)
+            .map_err(|error| format!("{error} on {}", device.name))?;
         if selection == self.output_selection {
             return Ok(());
         }
@@ -2000,7 +2082,7 @@ impl Engine {
                     // Restart on the stretched buffer at locked (1.0x) rate.
                     let src =
                         LoopRegion::new(new_buf.clone(), from, new_start, new_end, enabled, cursor);
-                    let sink = match Sink::try_new(&p.handle) {
+                    let sink = match routed_sink(&p.handle, p.output_channels, new_buf.rate) {
                         Ok(sink) => {
                             sink.set_volume(volume);
                             sink.set_speed(1.0);

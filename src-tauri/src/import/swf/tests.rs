@@ -60,6 +60,19 @@ fn jpeg_table_stream(jpeg: &[u8]) -> Vec<u8> {
 }
 
 #[test]
+fn rejects_declared_length_shorter_than_swf_header_for_both_encodings() {
+    for magic in [b"FWS", b"CWS"] {
+        for declared in [0u32, 7] {
+            let mut input = Vec::from(magic.as_slice());
+            input.push(10);
+            input.extend_from_slice(&declared.to_le_bytes());
+            input.extend_from_slice(&[0; 4]);
+            assert!(matches!(parse(&input), Err(SwfError::TooSmall)));
+        }
+    }
+}
+
+#[test]
 fn valid_fws_extracts_mp3_in_order() {
     let mut tags = define_sound_tag(7, FORMAT_MP3, &fake_mp3(0));
     tags.extend(define_sound_tag(3, FORMAT_MP3, &fake_mp3(2112)));

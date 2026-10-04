@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
-  libraryGetSlots,
-  libraryDeleteSlot,
-  librarySetSlot,
+  libraryGetSeratoMetadata,
+  librarySetSeratoCue,
+  librarySyncSeratoMetadata,
   playerPause,
   playerPlay,
   playerSeek,
@@ -13,8 +13,9 @@ import {
   playerSetVolume,
   playerStatus,
   playerStop,
-  type LoopSlot,
   type PlayerStatus,
+  type SeratoCue,
+  type SeratoMetadata,
 } from "../tauri";
 import { exposePlayerState } from "../hooks/useKeyboardShortcuts";
 
@@ -25,11 +26,12 @@ function fmt(ms: number): string {
   )}`;
 }
 
-const SLOT_LABELS = ["1", "2", "3", "4"];
+const CUE_SLOTS = Array.from({ length: 4 }, (_, index) => index + 1);
 
 interface Props {
   status: PlayerStatus | null;
   trackId: number | null;
+  trackOpenGeneration: number;
   canRandom: boolean;
   onRandomTrack: () => Promise<void>;
   canNavigateTracks: boolean;
@@ -40,7 +42,7 @@ interface Props {
   onStatusChange: (status: PlayerStatus) => void;
 }
 
-export default function Player({ status: st, trackId, canRandom, onRandomTrack, canNavigateTracks, onPreviousTrack, onNextTrack, loopEditing, onToggleLoopEditing, onStatusChange }: Props) {
+export default function Player({ status: st, trackId, trackOpenGeneration, canRandom, onRandomTrack, canNavigateTracks, onPreviousTrack, onNextTrack, loopEditing, onToggleLoopEditing, onStatusChange }: Props) {
   const [error, setError] = useState<string | null>(null);
   const scrubRef = useRef<HTMLDivElement>(null);
   const loopStartRef = useRef<HTMLInputElement>(null);
@@ -89,13 +91,21 @@ export default function Player({ status: st, trackId, canRandom, onRandomTrack, 
     };
   }, [randomEnabled, canRandom, validInterval, minutes, onRandomTrack]);
 
-  // Loop slots
-  const [slots, setSlots] = useState<LoopSlot[]>([]);
-  const [slotsTrackId, setSlotsTrackId] = useState<number | null>(null);
-  const [activeSlot, setActiveSlot] = useState<number>(1);
+  // CUEs live in the audio file, not the private catalog DB.
+  const [cues, setCues] = useState<SeratoCue[]>([]);
+  const [metadataTrackId, setMetadataTrackId] = useState<number | null>(null);
+  const [activeCueSlot, setActiveCueSlot] = useState<number | null>(null);
+  const [seratoSyncing, setSeratoSyncing] = useState(false);
+  const [seratoSyncMessage, setSeratoSyncMessage] = useState<string | null>(null);
+  const [seratoSyncError, setSeratoSyncError] = useState(false);
   const statusRef = useRef(st);
 
   useEffect(() => { statusRef.current = st; }, [st]);
+
+  useEffect(() => {
+    setSeratoSyncMessage(null);
+    setSeratoSyncError(false);
+  }, [trackId]);
 
   useEffect(() => {
     if (!st?.loaded) {
@@ -108,8 +118,8 @@ export default function Player({ status: st, trackId, canRandom, onRandomTrack, 
   }, [st?.path, st?.loaded, st?.loop_start_ms, st?.loop_end_ms]);
 
   useEffect(() => {
-    window.dispatchEvent(new CustomEvent<LoopSlot[]>("olooper:cues", { detail: slots }));
-  }, [slots]);
+    window.dispatchEvent(new CustomEvent<SeratoCue[]>("olooper:cues", { detail: cues }));
+  }, [cues]);
 
   const run = useCallback(
     (p: Promise<PlayerStatus>) =>
@@ -142,28 +152,32 @@ export default function Player({ status: st, trackId, canRandom, onRandomTrack, 
     }
   }, [st]);
 
-  // Load slots when trackId changes.
+  // Read markers from the audio file every time a track is opened.
   useEffect(() => {
     let cancelled = false;
-    setSlots([]);
-    setSlotsTrackId(null);
-    setActiveSlot(1);
-    if (!trackId) {
+    setCues([]);
+    setMetadataTrackId(null);
+    setActiveCueSlot(null);
+    if (!trackId || !st?.loaded) {
       return () => { cancelled = true; };
     }
-    libraryGetSlots(trackId)
-      .then((saved) => {
+    libraryGetSeratoMetadata(trackId)
+      .then((metadata) => {
         if (cancelled) return;
-        setSlots(saved.filter((slot) => slot.slot > 1 && slot.enabled));
+        setCues(metadata.cues);
+        setMetadataTrackId(trackId);
+        setError(null);
+        if (metadata.bpm !== null) {
+          window.dispatchEvent(new CustomEvent("olooper:track-bpm", {
+            detail: { trackId, bpm: metadata.bpm },
+          }));
+        }
       })
-      .catch(() => {
-        if (!cancelled) setSlots([]);
-      })
-      .finally(() => {
-        if (!cancelled) setSlotsTrackId(trackId);
+      .catch((cause) => {
+        if (!cancelled) setError(`Cannot read CUEs from audio file: ${String(cause)}`);
       });
     return () => { cancelled = true; };
-  }, [trackId]);
+  }, [trackId, trackOpenGeneration, st?.path, st?.loaded]);
 
   const scrub = (e: React.MouseEvent<HTMLDivElement>) => {
     if (!scrubRef.current || !st?.loaded || st.duration_ms <= 0) return;
@@ -194,42 +208,57 @@ export default function Player({ status: st, trackId, canRandom, onRandomTrack, 
     };
   }, [isScrubbing, st?.loaded, st?.duration_ms]);
 
-  const saveToSlot = (slot: number) => {
-    if (!trackId || slotsTrackId !== trackId) return;
-    const label = SLOT_LABELS[slot - 1];
-    const current = statusRef.current;
-    const cueMs = current?.position_ms ?? 0;
-    const startMs = current?.loop_start_ms ?? 0;
-    const endMs = current?.loop_end_ms ?? 0;
-    librarySetSlot(trackId, slot, label, cueMs, startMs, endMs, true)
-      .then((saved) => {
-        setSlots((prev) => {
-          const idx = prev.findIndex((s) => s.slot === slot);
-          if (idx >= 0) {
-            const next = [...prev];
-            next[idx] = saved;
-            return next;
-          }
-          return [...prev, saved];
-        });
+  const applyMetadata = (metadata: SeratoMetadata) => {
+    setCues(metadata.cues);
+    if (metadata.bpm !== null && trackId !== null) {
+      window.dispatchEvent(new CustomEvent("olooper:track-bpm", {
+        detail: { trackId, bpm: metadata.bpm },
+      }));
+    }
+  };
+
+  const saveCue = (slot: number) => {
+    if (!trackId || metadataTrackId !== trackId) return;
+    const cueMs = statusRef.current?.position_ms ?? 0;
+    librarySetSeratoCue(trackId, slot, cueMs)
+      .then((metadata) => {
+        applyMetadata(metadata);
+        setActiveCueSlot(slot);
       })
-      .catch((e) => setError(String(e)));
+      .catch((cause) => setError(String(cause)));
   };
 
-  const loadSlot = (slot: number) => {
-    if (slotsTrackId !== trackId) return;
-    const s = slots.find((sl) => sl.slot === slot);
-    if (!s) return;
-    setActiveSlot(slot);
-    run(playerSeek(s.cue_ms));
+  const syncSeratoMetadata = useCallback(async (id: number) => {
+    setSeratoSyncing(true);
+    setSeratoSyncError(false);
+    setSeratoSyncMessage("Writing CUEs and BPM to the audio file…");
+    try {
+      await librarySyncSeratoMetadata(id);
+      setSeratoSyncMessage("Serato metadata synced. Reload this file in Serato to refresh it.");
+    } catch (cause) {
+      setSeratoSyncError(true);
+      setSeratoSyncMessage(`Data is saved in oLooper, but Serato sync failed: ${String(cause)}`);
+    } finally {
+      setSeratoSyncing(false);
+    }
+  }, []);
+
+  const loadCue = (slot: number) => {
+    if (metadataTrackId !== trackId) return;
+    const cue = cues.find((saved) => saved.slot === slot);
+    if (!cue) return;
+    setActiveCueSlot(slot);
+    run(playerSeek(cue.position_ms));
   };
 
-  const clearSlot = (slot: number) => {
-    if (!trackId || slotsTrackId !== trackId || slot === 1) return;
-    libraryDeleteSlot(trackId, slot).then(() => {
-      setSlots((current) => current.filter((item) => item.slot !== slot));
-      if (activeSlot === slot) setActiveSlot(1);
-    }).catch((e) => setError(String(e)));
+  const clearCue = (slot: number) => {
+    if (!trackId || metadataTrackId !== trackId || slot === 1) return;
+    librarySetSeratoCue(trackId, slot, null)
+      .then((metadata) => {
+        applyMetadata(metadata);
+        if (activeCueSlot === slot) setActiveCueSlot(null);
+      })
+      .catch((cause) => setError(String(cause)));
   };
 
   const applyManualLoop = () => {
@@ -256,23 +285,21 @@ export default function Player({ status: st, trackId, canRandom, onRandomTrack, 
     const handleCueShortcut = (event: Event) => {
       const { slot, clear } = (event as CustomEvent<{ slot: number; clear: boolean }>).detail;
       if (!trackId || !st?.loaded || !Number.isInteger(slot) || slot < 1 || slot > 4) return;
-      setActiveSlot(slot);
       if (slot === 1) {
-        // CUE 1 is the fixed track-start cue, so Shift+1 returns to its default.
-        run(playerSeek(0));
+        loadCue(1);
       } else if (clear) {
-        clearSlot(slot);
-      } else if (slotsTrackId !== trackId) {
+        clearCue(slot);
+      } else if (metadataTrackId !== trackId) {
         return;
-      } else if (slots.some((saved) => saved.slot === slot)) {
-        loadSlot(slot);
+      } else if (cues.some((cue) => cue.slot === slot)) {
+        loadCue(slot);
       } else {
-        saveToSlot(slot);
+        saveCue(slot);
       }
     };
     window.addEventListener("olooper:cue-shortcut", handleCueShortcut);
     return () => window.removeEventListener("olooper:cue-shortcut", handleCueShortcut);
-  }, [trackId, st?.loaded, activeSlot, slots, slotsTrackId, run]);
+  }, [trackId, st?.loaded, metadataTrackId, cues, clearCue, loadCue, saveCue]);
 
   const posFrac = st?.loaded && st.duration_ms > 0 ? st.position_ms / st.duration_ms : 0;
   const loaded = st?.loaded ?? false;
@@ -400,47 +427,38 @@ export default function Player({ status: st, trackId, canRandom, onRandomTrack, 
 
           <div className="w-px h-5 bg-border" />
 
-          {/* Cue selector */}
-        {loaded && trackId && (
-           <div className="flex items-center gap-1">
-             <span className="mr-1 text-[9px] font-semibold uppercase tracking-wide text-text-secondary">CUE</span>
-             {SLOT_LABELS.map((label, i) => {
-              const slotNum = i + 1;
-              const slotsReady = slotsTrackId === trackId;
-              const hasData = slotNum === 1 || (slotsReady && slots.some((s) => s.slot === slotNum));
-              const isActive = activeSlot === slotNum;
-              return (
-                <span key={label} className="flex items-center">
+          {loaded && trackId && (
+            <div className="flex items-center gap-1">
+                <span className="mr-1 text-[9px] font-semibold uppercase tracking-wide text-text-secondary">CUE</span>
+                {CUE_SLOTS.map((slot) => {
+                  const cue = cues.find((saved) => saved.slot === slot);
+                  const ready = metadataTrackId === trackId;
+                  return (
+                    <span key={slot} className="flex items-center">
+                      <button
+                        onClick={() => cue ? loadCue(slot) : saveCue(slot)}
+                        disabled={!ready}
+                        title={slot === 1 ? "CUE 1 is fixed at the start of the track" : cue ? `Jump to CUE ${slot}` : `Save CUE ${slot} at the current position`}
+                        className={`w-6 h-6 rounded text-[10px] font-bold transition-colors disabled:opacity-40 ${
+                          activeCueSlot === slot
+                            ? "bg-accent text-app"
+                            : cue
+                              ? "bg-success/20 text-success hover:bg-success/30"
+                              : "bg-border text-text-secondary hover:bg-border hover:text-text"
+                        }`}
+                      >{slot}</button>
+                      {cue && slot > 1 && <button onClick={() => clearCue(slot)} title={`Clear CUE ${slot}`} aria-label={`Clear CUE ${slot}`} className="-ml-1 rounded px-1 text-[10px] text-text-secondary hover:bg-danger/10 hover:text-danger">×</button>}
+                    </span>
+                  );
+                })}
                 <button
-                  onClick={() => {
-                    if (slotNum > 1 && !slotsReady) return;
-                    setActiveSlot(slotNum);
-                    if (slotNum === 1) {
-                      run(playerSeek(0));
-                    } else if (hasData) {
-                      loadSlot(slotNum);
-                    } else {
-                      saveToSlot(slotNum);
-                    }
-                  }}
-                  title={hasData ? `Jump to cue ${label}` : `Set cue ${label} at current position`}
-                  disabled={slotNum > 1 && !slotsReady}
-                  className={`w-6 h-6 rounded text-[10px] font-bold transition-colors disabled:opacity-40 ${
-                    isActive
-                      ? "bg-accent text-app"
-                      : hasData
-                        ? "bg-success/20 text-success hover:bg-success/30"
-                        : "bg-border text-text-secondary hover:bg-border hover:text-text"
-                  }`}
-                >
-                  {label}
-                </button>
-                {slotNum > 1 && hasData && <button onClick={() => clearSlot(slotNum)} title={`Clear cue ${label}`} aria-label={`Clear cue ${label}`} className="-ml-1 rounded px-1 text-[10px] text-text-secondary hover:bg-danger/10 hover:text-danger">×</button>}
-                </span>
-              );
-            })}
-          </div>
-        )}
+                  onClick={() => void syncSeratoMetadata(trackId)}
+                  disabled={metadataTrackId !== trackId || seratoSyncing}
+                  title="Write CUEs and BPM into this audio file"
+                  className="ml-1 rounded bg-accent/15 px-2 py-1 text-[9px] font-medium text-accent hover:bg-accent/25 disabled:opacity-40"
+                >{seratoSyncing ? "Sync…" : "Audio tags"}</button>
+            </div>
+          )}
 
         <button
           onClick={onToggleLoopEditing}
@@ -491,10 +509,6 @@ export default function Player({ status: st, trackId, canRandom, onRandomTrack, 
         </div>
 
         <div className="flex-1" />
-
-        {shownError && (
-          <span className="text-[10px] text-danger truncate max-w-64" role="alert">{shownError}</span>
-        )}
       </div>
       {loopEditing && (
         <div id="loop-edit-controls" className="flex flex-wrap items-center gap-2 border-t border-border pt-2">
@@ -546,6 +560,16 @@ export default function Player({ status: st, trackId, canRandom, onRandomTrack, 
             className="rounded bg-accent/15 px-2.5 py-1 text-[10px] font-medium text-accent hover:bg-accent/25 disabled:opacity-40"
           >Apply</button>
           <span className="text-[10px] text-text-secondary">Drag a loop edge on the waveform to adjust it.</span>
+        </div>
+      )}
+      {(shownError || seratoSyncMessage) && (
+        <div className="flex flex-col gap-1 border-t border-border pt-2 text-[11px] leading-relaxed break-words">
+          {shownError && <p className="text-danger" role="alert">{shownError}</p>}
+          {seratoSyncMessage && (
+            <p className={seratoSyncError ? "text-danger" : "text-success"} role="status">
+              {seratoSyncMessage}
+            </p>
+          )}
         </div>
       )}
     </div>

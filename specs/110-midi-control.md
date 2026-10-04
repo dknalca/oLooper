@@ -19,7 +19,7 @@ Options…**, with assignments remembered locally.
 - CC is discrete: a transition from 0 to nonzero triggers once; a value of 0
   re-arms that control. Continuous CC values do not drive parameters.
 - Assignable actions: Play/Pause, Stop, Previous/Next, Toggle Loop, AUTO loop,
-  Speed ±5%, CUE 1–4, and Clear CUE 2–4. CUE 1 is fixed at track start.
+  Speed ±5%, CUE 1–4, and Clear CUE 2–4. CUE 1 recalls the start of the track.
 - Assignments and the selected input ID persist in local application storage;
   no SQLite migration is required.
 

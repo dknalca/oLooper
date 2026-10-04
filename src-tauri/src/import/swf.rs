@@ -184,6 +184,9 @@ fn body_bytes(data: &[u8]) -> Result<(u8, Vec<u8>), SwfError> {
     if declared > MAX_SWF_LEN {
         return Err(SwfError::DeclaredTooLarge(declared));
     }
+    if declared < 8 {
+        return Err(SwfError::TooSmall);
+    }
     match &magic {
         b"FWS" => {
             if data.len() < declared as usize {
