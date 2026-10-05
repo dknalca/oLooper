@@ -12,8 +12,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/dknalca/oLooper/releases/tag/v0.5.0"><strong>macOS (v0.5.0)</strong></a>
-  · <a href="https://github.com/dknalca/oLooper/releases/tag/v0.5.1"><strong>Windows (v0.5.1)</strong></a>
+  <a href="https://github.com/dknalca/oLooper/releases/tag/v0.5.1"><strong>Download oLooper v0.5.1</strong></a>
   · <a href="https://github.com/dknalca/oLooper/releases">All releases</a>
   · <a href="#what-olooper-does">Explore features</a>
 </p>
@@ -61,17 +60,17 @@ It is designed for **scratch DJs, beat jugglers, and turntablists** who want to 
 
 ### macOS — Intel and Apple silicon
 
-Download the [macOS v0.5.0 release](https://github.com/dknalca/oLooper/releases/tag/v0.5.0). Its Universal 2 DMG contains native Intel (`x86_64`) and Apple silicon (`arm64`) versions; Rosetta is not required.
+Download the [macOS v0.5.1 release](https://github.com/dknalca/oLooper/releases/tag/v0.5.1). Its Universal 2 DMG contains native Intel (`x86_64`) and Apple silicon (`arm64`) versions; Rosetta is not required.
 
 1. Open the downloaded `.dmg` and drag **oLooper** into **Applications**.
 2. Eject the oLooper disk image, then launch the app from Applications.
 3. The DMG is not signed or notarized. On the first launch, Control-click oLooper, choose **Open**, then confirm. If macOS still blocks it, follow [Apple's instructions for opening an app from an unidentified developer](https://support.apple.com/en-us/102445).
 
-The published v0.5.0 DMG requires **macOS 12 or later**. Builds from this source checkout now target macOS 11.0, but Big Sur runtime compatibility still needs testing before a release can claim support for macOS 11. No additional runtime or developer tools are needed to install the DMG.
+The v0.5.1 DMG is built with a **macOS 11.0 (Big Sur) minimum deployment target**. CI verifies the Universal 2 binary and bundle metadata; runtime testing on a Big Sur machine is still pending. No additional runtime or developer tools are needed to install the DMG.
 
 ### Windows 11 — x64
 
-Download the [Windows v0.5.1 release](https://github.com/dknalca/oLooper/releases/tag/v0.5.1) and run `oLooper-0.5.1-windows-x64-setup.exe`. Windows 11 includes WebView2 in most installations. If it is missing, install the [Microsoft Edge WebView2 Evergreen Runtime](https://developer.microsoft.com/microsoft-edge/webview2/); the NSIS installer can also bootstrap it when needed. The new Windows package is x64; the previous macOS v0.5.0 DMG remains available separately.
+Download the [Windows v0.5.1 release](https://github.com/dknalca/oLooper/releases/tag/v0.5.1) and run `oLooper-0.5.1-windows-x64-setup.exe`. Windows 11 includes WebView2 in most installations. If it is missing, install the [Microsoft Edge WebView2 Evergreen Runtime](https://developer.microsoft.com/microsoft-edge/webview2/); the NSIS installer can also bootstrap it when needed. The Windows package is x64.
 
 The unsigned installer may prompt Windows SmartScreen. The app's library and preferences remain in your user profile; installing or removing the app does not delete the selected library.
 
