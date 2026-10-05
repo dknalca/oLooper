@@ -11,8 +11,10 @@ other than 1–2.
 
 1. **oLooper → Audio Output…** opens device, stereo-pair, sample-rate and
    buffer-size selectors.
-2. System default is the initial setting and follows the default output chosen
-   in macOS. Selecting a device overrides that default for oLooper only.
+2. System default is the initial setting and follows the operating system's
+   default output. While System default is selected, a changed default endpoint
+   is reopened automatically; an explicitly selected device stays pinned for
+   oLooper only.
 3. Available stereo pairs are derived from the device's supported output
    channel count. Pair labels use one-based channel numbers (Output 1–2,
    Output 3–4, etc.). Overlapping pairs such as 2–3 are not valid stereo
@@ -20,7 +22,7 @@ other than 1–2.
    The dialog shows device availability and the number of output channels;
    disconnected saved devices can be refreshed or replaced.
 4. Sample rate can follow the device default or use one of its advertised rates.
-   Buffer size can remain at CoreAudio's default or use a frame count inside the
+   Buffer size can remain at the device's default or use a frame count inside the
    selected device's advertised range. Unsupported combinations return an error
    without replacing the current stream.
 5. Mono audio is duplicated to both channels of the selected pair. Stereo audio
@@ -46,8 +48,9 @@ other than 1–2.
 ## Failure behavior
 
 - Device enumeration failures are shown in the dialog.
-- A disconnected device, unsupported channel pair, or stream creation error
-  leaves the existing stream and selection active.
+- An unsupported selection leaves the current stream and selection unchanged. If
+  opening a newly selected route fails, playback remains paused on the old stream
+  so audio cannot continue unexpectedly through a different endpoint.
 - The test signal is canceled safely when its stream ends; the transport resumes
   only if it was active when the test began.
 - Digital L/R meters report the signal oLooper sends, not analog/interface
@@ -80,7 +83,7 @@ other than 1–2.
 - On library initialization, diagnostics are appended to
   `<library>/log/audio-output.log`; the previous file is retained as
   `audio-output.previous.log` when the active log reaches 2 MiB. Entries record
-  session OS/CPU/Rosetta facts, enumerated output capabilities, selection and
+  session OS/CPU facts (plus Rosetta state on macOS), enumerated output capabilities, selection and
   stream results/errors, output-test peak levels, and decoded audio/loop shape.
   They omit track names, source paths, and audio data; no per-buffer callback
   logging or disk I/O is performed.
@@ -94,7 +97,7 @@ other than 1–2.
   resampling produces zero samples on all unselected DJM-S11 output channels.
 - [x] The selector exposes only complete stereo pairs; the backend rejects
   overlapping pairs that straddle two hardware outputs.
-- [x] Device sample rate and CoreAudio buffer can be selected or left at their
+- [x] Device sample rate and output buffer can be selected or left at their
   advertised defaults; incompatible requests are rejected.
 - [x] The opened CPAL stream uses its selected channel count/sample format and
   has no hidden Rodio device-configuration fallback.
@@ -103,6 +106,9 @@ other than 1–2.
 - [x] The frontend remembers channel pairs independently per output device.
 - [x] The dialog shows device availability, channel count, and routed digital
   L/R peak levels.
-- [ ] Manual on macOS: system-default output follows the selected system route.
+- [ ] Manual on macOS and Windows: system-default output follows a changed
+  system route while audio is playing.
+- [ ] Manual on Windows: selecting a different explicit output switches the
+  stream and playback resumes only on that output.
 - [ ] Manual on macOS: a DJ interface routes to a non-1–2 stereo pair.
 - [ ] Opening/closing output settings follows the documented stop-and-restart behavior.

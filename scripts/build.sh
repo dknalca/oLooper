@@ -7,6 +7,10 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
+# Keep the generated universal binary and its bundle metadata compatible with
+# the oldest supported macOS release (Big Sur).
+export MACOSX_DEPLOYMENT_TARGET="11.0"
+
 case "${1:-}" in
   "") BUILD_MODE="release"; BUILD_TARGET="universal-apple-darwin" ;;
   --dev) BUILD_MODE="debug"; BUILD_TARGET="" ;;

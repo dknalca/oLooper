@@ -10,7 +10,9 @@ Make existing playback, import, library selection, and CWS extraction reliable w
 - `Cmd+O`/`Ctrl+O` imports audio, SWF, and projector files through their matching backend command.
 - Toggling looping while playing changes the active audio source immediately.
 - Valid CWS files whose compressed bytes are smaller than their declared uncompressed length import successfully; decompression cannot exceed the declared safety bound.
-- First launch asks the user to confirm a library root, defaulting to `~/Documents/oLooper_data`; the selected path is remembered in application preferences, never in a file beside the app.
+- First launch asks the user to confirm a library root, defaulting to
+  `oLooper_data` inside the OS-resolved Documents folder; the selected path is
+  remembered in application preferences, never in a file beside the app.
 - Revealing a track uses a typed backend command; the webview has no general shell-execute permission.
 - Automated tests cover CWS size handling, migrations to schema v2, player loop toggling, and the repaired frontend command routing where practical.
 

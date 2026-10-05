@@ -87,8 +87,8 @@ fn portable_root() -> Result<std::path::PathBuf, String> {
     portable_root_for_executable(&executable)
 }
 
-fn suggested_library_root(home: &std::path::Path) -> std::path::PathBuf {
-    home.join("Documents").join("oLooper_data")
+fn suggested_library_root(documents_dir: &std::path::Path) -> std::path::PathBuf {
+    documents_dir.join("oLooper_data")
 }
 
 fn legacy_library_selection_path() -> Result<std::path::PathBuf, String> {
@@ -682,12 +682,12 @@ fn require_lib<'a>(
 }
 
 #[tauri::command]
-fn library_default_root() -> Result<String, String> {
-    let home = std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(std::path::PathBuf::from)
-        .ok_or_else(|| "cannot determine the user's home directory".to_string())?;
-    let root = suggested_library_root(&home);
+fn library_default_root(app: tauri::AppHandle) -> Result<String, String> {
+    let documents_dir = app
+        .path()
+        .document_dir()
+        .map_err(|error| format!("cannot determine the user's Documents folder: {error}"))?;
+    let root = suggested_library_root(&documents_dir);
     Ok(root.to_string_lossy().to_string())
 }
 
@@ -1495,7 +1495,7 @@ mod tests {
     #[test]
     fn first_run_library_suggestion_uses_documents_folder() {
         assert_eq!(
-            suggested_library_root(std::path::Path::new("/Users/dj")),
+            suggested_library_root(std::path::Path::new("/Users/dj/Documents")),
             std::path::PathBuf::from("/Users/dj/Documents/oLooper_data"),
         );
     }

@@ -1,8 +1,9 @@
-//! Persistent, privacy-conscious diagnostics for CoreAudio output routing.
+//! Persistent, privacy-conscious diagnostics for audio output routing.
 
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "macos")]
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -25,13 +26,22 @@ impl AudioLog {
             .path
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(path);
-        let os_version = command_value("/usr/bin/sw_vers", &["-productVersion"])
-            .unwrap_or_else(|| "unknown".to_string());
-        let hardware_arch = command_value("/usr/sbin/sysctl", &["-n", "hw.machine"])
-            .unwrap_or_else(|| "unknown".to_string());
-        let rosetta = command_value("/usr/sbin/sysctl", &["-in", "sysctl.proc_translated"])
-            .map(|value| if value == "1" { "yes" } else { "no" })
-            .unwrap_or("unknown");
+        #[cfg(target_os = "macos")]
+        let (os_version, hardware_arch, rosetta) = (
+            command_value("/usr/bin/sw_vers", &["-productVersion"])
+                .unwrap_or_else(|| "unknown".to_string()),
+            command_value("/usr/sbin/sysctl", &["-n", "hw.machine"])
+                .unwrap_or_else(|| "unknown".to_string()),
+            command_value("/usr/sbin/sysctl", &["-in", "sysctl.proc_translated"])
+                .map(|value| if value == "1" { "yes" } else { "no" })
+                .unwrap_or("unknown"),
+        );
+        #[cfg(not(target_os = "macos"))]
+        let (os_version, hardware_arch, rosetta) = (
+            "unavailable".to_string(),
+            "not_applicable".to_string(),
+            "not_applicable",
+        );
         self.write(&format!(
             "session_start version={} os={} os_version={} build_arch={} hardware_arch={} rosetta_translated={} pid={}",
             env!("CARGO_PKG_VERSION"),
@@ -69,6 +79,7 @@ impl AudioLog {
 
 static AUDIO_LOG: OnceLock<AudioLog> = OnceLock::new();
 
+#[cfg(target_os = "macos")]
 fn command_value(program: &str, arguments: &[&str]) -> Option<String> {
     let output = Command::new(program).args(arguments).output().ok()?;
     if !output.status.success() {

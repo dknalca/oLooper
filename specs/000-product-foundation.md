@@ -2,7 +2,7 @@
 
 ## Scope
 
-Cross-platform desktop app (macOS 12 verified first) for DJs/turntablists:
+Cross-platform desktop app for DJs/turntablists, targeting macOS 11+ and Windows 11 x64:
 extract practice loops from legacy `.swf` / Flash-projector `.exe`,
 practice with a persistent local library, prepare cue/loop metadata
 (Serato-write explicitly out of MVP).
@@ -38,7 +38,10 @@ practice with a persistent local library, prepare cue/loop metadata
 
 ## Platform considerations
 
-- MVP verified on macOS 12. Architecture stays cross-platform (no macOS-only core logic). `.app`/`.dmg` self-contained: no Rust/Node/FFmpeg required of end users.
+- MVP was initially verified on macOS 12. The current source also targets macOS
+  11 and builds on Windows 11 x64; Windows audio devices have been enumerated and
+  opened, with physical route switching still requiring manual acceptance. The
+  `.app`/`.dmg` and NSIS installer do not require Rust/Node/FFmpeg from end users.
 
 ## Security implications
 

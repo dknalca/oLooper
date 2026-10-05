@@ -19,9 +19,10 @@ computation; rendering is canvas-only (no audio decoding per frame).
    update the shaded region.
 4. Tracks shorter than the view window render whole; longer tracks render a
    ~30 s window around the position.
-5. The waveform occupies the upper fifth of the workspace. The transport,
-   cue, loop and slot controls form a compact band immediately below it; the
-   loop library uses all remaining vertical space.
+5. The waveform occupies a compact upper section; the transport, cue, loop,
+   and slot controls form a band immediately below it. The remaining height
+   is reserved for the loop library. The 0.6.0 cover/import/ALL layout proposal
+   is specified in [140 — Library Layout and All Collection](140-library-layout-060.md).
 6. Selecting a track loads playback first. Waveform analysis starts after a
    short idle delay, is cancelled when another track is selected, and must not
    delay selection or playback controls.

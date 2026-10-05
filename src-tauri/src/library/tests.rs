@@ -570,6 +570,11 @@ fn sanitize_confines_names() {
     assert!(!sanitize_name("a/b\\c")
         .chars()
         .any(|c| c == '/' || c == '\\'));
+    assert_eq!(sanitize_name("CON"), "_CON");
+    assert_eq!(sanitize_name("aux.wav"), "_aux.wav");
+    assert_eq!(sanitize_name("COM9.mp3"), "_COM9.mp3");
+    assert_eq!(sanitize_name("LPT²"), "_LPT²");
+    assert_eq!(sanitize_name("COM10"), "COM10");
 }
 
 #[test]

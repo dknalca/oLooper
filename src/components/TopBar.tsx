@@ -8,6 +8,7 @@ import {
   type AppStatus,
 } from "../tauri";
 import Logo from "./Logo";
+import { displayLibraryPath } from "../displayLibraryPath";
 
 interface Props {
   onLibraryReady: (root: string) => void;
@@ -127,7 +128,7 @@ export default function TopBar({ onLibraryReady, playing, onAudioOptions }: Prop
         >
           ♫ Audio
         </button>
-        {root && <span className="ml-auto truncate max-w-64 text-[10px] text-text-secondary" title={root}>{root}</span>}
+        {root && <span className="ml-auto truncate max-w-64 text-[10px] text-text-secondary" title={displayLibraryPath(root)}>{displayLibraryPath(root)}</span>}
         <div className="flex shrink-0 items-center gap-1.5 rounded bg-elevated px-2 py-1" title="Practice time while audio is playing">
           <span className="text-[9px] uppercase tracking-wide text-text-secondary">Practice</span>
           <span className="font-mono text-[11px] tabular-nums text-text" aria-live="off">
@@ -151,11 +152,11 @@ export default function TopBar({ onLibraryReady, playing, onAudioOptions }: Prop
         <div className="fixed inset-0 z-[70] flex items-center justify-center bg-app/80 backdrop-blur-sm">
           <div className="w-[28rem] rounded-lg border border-border bg-surface p-5 shadow-2xl">
             <h2 className="text-base font-semibold text-text">Choose your library folder</h2>
-            <p className="mt-1 text-xs text-text-secondary">Audio will be stored here. The suggested location is `~/Documents/oLooper_data`; you can choose another folder.</p>
+            <p className="mt-1 text-xs text-text-secondary">Audio will be stored here. The suggested location is the Documents folder inside `oLooper_data`; you can choose another folder.</p>
             <div className="mt-4 flex gap-2">
               <input
                 aria-label="Library root path"
-                value={root}
+                value={displayLibraryPath(root)}
                 onChange={(event) => setRoot(event.target.value)}
                 className="min-w-0 flex-1 rounded border border-border bg-elevated px-2 py-1.5 text-xs text-text focus:border-accent"
               />

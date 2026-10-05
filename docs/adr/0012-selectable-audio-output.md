@@ -28,7 +28,7 @@ unselected outputs when Rodio converts/resamples for a multichannel mixer.
   resamples sources into a two-channel mixer at the selected device rate; the
   CPAL callback then maps that stereo bus to the selected hardware pair and
   zeros all other channels.
-- Default to the device's default sample rate and CoreAudio buffer. Explicit
+- Default to the device's default sample rate and buffer. Explicit
   sample rates and buffers are chosen only from the device's advertised ranges.
 - Serialize setting changes through the existing audio engine command queue.
 - Persist the active device and each device's stereo-pair choice in frontend
@@ -45,8 +45,9 @@ unselected outputs when Rodio converts/resamples for a multichannel mixer.
 - L/R meters are digital peak measurements in the routed source before the
   hardware interface; no analog loopback is implied.
 - After the library root is initialized, timestamped audio diagnostics are
-  persisted under `<library>/log/`, including host architecture/Rosetta state,
-  CoreAudio capabilities and stream choices, and output-test levels. Logs omit
+  persisted under `<library>/log/`, including OS and host architecture (and
+  Rosetta state on macOS), device capabilities and stream choices, and
+  output-test levels. Logs omit
   track names and source paths and are capped by rotating at 2 MiB. The
   real-time sample callback never writes to disk.
 - The CPAL callback only pulls prepared stereo Rodio-mixer samples, applies the
@@ -55,5 +56,10 @@ unselected outputs when Rodio converts/resamples for a multichannel mixer.
 - Device names are used as selection identifiers because CPAL 0.15 does not
   expose stable cross-session device IDs. If an interface is renamed or
   disconnected, the user can select another device or return to system default.
-- Hardware routing remains a manual macOS acceptance test; CI covers the
-  channel mapping source without requiring an audio device.
+- When system default is selected, the engine checks the host default endpoint
+  periodically and reopens the stream if its name changes. Explicit endpoint
+  selections remain pinned.
+- Windows device enumeration and stream creation have been exercised on a
+  Windows 11 machine; switching a physical output and macOS routing remain
+  manual hardware acceptance tests. CI covers channel mapping without requiring
+  an audio device.

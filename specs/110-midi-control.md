@@ -9,8 +9,9 @@ Options…**, with assignments remembered locally.
 
 - List available MIDI inputs, connect one input at a time, disconnect it, and
   restore the selected input on the next app launch when it is still available.
-  USB and Bluetooth devices are supported when macOS exposes them as MIDI
-  inputs; Bluetooth pairing happens in macOS, then the user refreshes this list.
+  USB and Bluetooth devices are supported when the operating system exposes
+  them as MIDI inputs; Bluetooth pairing happens in system settings, then the
+  user refreshes this list.
 - **Learn** records a pad/button for a selected action. The assignment shows the
   input, channel, message type, and note/CC number. Learning a control already
   assigned elsewhere moves that binding to the new action.
@@ -44,7 +45,7 @@ Options…**, with assignments remembered locally.
 ## Acceptance criteria
 
 - [x] MIDI inputs can be listed, connected, disconnected, and restored by ID.
-- [x] System-exposed Bluetooth MIDI inputs use the same device flow as USB.
+- [x] OS-exposed Bluetooth MIDI inputs use the same device flow as USB.
 - [x] MIDI Learn binds Note On and CC controls to supported app actions.
 - [x] CC assignments trigger only on a zero-to-nonzero transition.
 - [x] Duplicate control assignments move to the most recently learned action.

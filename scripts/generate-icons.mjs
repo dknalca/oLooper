@@ -148,29 +148,34 @@ for (const { name, size } of sizes) {
   console.log(`✓ ${name} (${size}x${size})`);
 }
 
-// Generate icns for macOS
+// Generate icns for macOS. The Windows build uses the committed icon.ico;
+// iconutil is an Apple-only tool and is not available on other platforms.
 const icnsPath = join(ICONS_DIR, "icon.icns");
-try {
-  // Use sips to convert 1024px PNG to icns via iconset
-  const { execSync } = await import("node:child_process");
-  const tmpDir = join(ROOT, ".dev", "icon.iconset");
-  mkdirSync(tmpDir, { recursive: true });
+if (process.platform === "darwin") {
+  try {
+    // Use iconutil to convert the PNGs to icns via an iconset.
+    const { execSync } = await import("node:child_process");
+    const tmpDir = join(ROOT, ".dev", "icon.iconset");
+    mkdirSync(tmpDir, { recursive: true });
 
-  const icnsSizes = [16, 32, 64, 128, 256, 512, 1024];
-  for (const s of icnsSizes) {
-    const name1x = `icon_${s}x${s}.png`;
-    const name2x = `icon_${s}x${s}@2x.png`;
-    await sharp(svgPath).resize(s, s).png().toFile(join(tmpDir, name1x));
-    if (s * 2 <= 1024) {
-      await sharp(svgPath).resize(s * 2, s * 2).png().toFile(join(tmpDir, name2x));
+    const icnsSizes = [16, 32, 64, 128, 256, 512, 1024];
+    for (const s of icnsSizes) {
+      const name1x = `icon_${s}x${s}.png`;
+      const name2x = `icon_${s}x${s}@2x.png`;
+      await sharp(svgPath).resize(s, s).png().toFile(join(tmpDir, name1x));
+      if (s * 2 <= 1024) {
+        await sharp(svgPath).resize(s * 2, s * 2).png().toFile(join(tmpDir, name2x));
+      }
     }
-  }
 
-  execSync(`iconutil -c icns "${tmpDir}" -o "${icnsPath}"`);
-  console.log(`✓ icon.icns (macOS)`);
-} catch (e) {
-  console.error(`icns generation failed: ${e.message}`);
-  process.exit(1);
+    execSync(`iconutil -c icns "${tmpDir}" -o "${icnsPath}"`);
+    console.log(`✓ icon.icns (macOS)`);
+  } catch (e) {
+    console.error(`icns generation failed: ${e.message}`);
+    process.exit(1);
+  }
+} else {
+  console.log(`Skipping icon.icns generation on ${process.platform}; using committed platform icons.`);
 }
 
 console.log("\nDone! All icons generated in src-tauri/icons/");

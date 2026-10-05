@@ -142,12 +142,38 @@ pub fn sanitize_name(raw: &str) -> String {
         s = s.replace("__", "_");
     }
     let s = s.trim().trim_matches(['.', '_', ' ']).to_string();
-    let s: String = s.chars().take(80).collect();
+    let mut s: String = s.chars().take(80).collect();
+    if is_windows_reserved_name(&s) {
+        s.insert(0, '_');
+    }
     if s.is_empty() {
         "untitled".to_string()
     } else {
         s
     }
+}
+
+fn is_windows_reserved_name(name: &str) -> bool {
+    let stem = name
+        .split('.')
+        .next()
+        .unwrap_or(name)
+        .trim_end_matches([' ', '.'])
+        .to_ascii_uppercase();
+    if matches!(
+        stem.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+    ) {
+        return true;
+    }
+    ["COM", "LPT"].iter().any(|prefix| {
+        stem.strip_prefix(prefix).is_some_and(|suffix| {
+            matches!(
+                suffix,
+                "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+            )
+        })
+    })
 }
 
 /// Legacy SQLite cue/loop entry, read only while migrating old libraries.

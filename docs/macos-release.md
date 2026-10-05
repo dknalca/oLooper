@@ -14,6 +14,10 @@ the Rust targets for both architectures and invokes Tauri with
 single-architecture release build is specifically needed; `--dev` remains a
 native-architecture debug build.
 
+The bundle declares macOS 11.0 (Big Sur) as its minimum and the build sets
+`MACOSX_DEPLOYMENT_TARGET=11.0`. Test the release on macOS 11 before claiming
+runtime compatibility; previous releases were verified on macOS 12.
+
 The result is `dist/oLooper-<version>-unsigned.dmg`. It is not suitable for
 normal Gatekeeper distribution until signed and notarized.
 

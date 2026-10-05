@@ -181,7 +181,7 @@ export default function MidiSettingsDialog({
             {selectedIsConnected ? `Connected: ${connected.name}` : connected ? `Connected to ${connected.name}; select Switch input to change.` : "Connect a MIDI input to learn or use assignments."}
           </p>
           <p className="mt-1 text-[10px] text-text-secondary">
-            USB and Bluetooth MIDI inputs are supported when macOS exposes them here. Pair Bluetooth devices in macOS first, then select Refresh.
+            USB and Bluetooth MIDI inputs appear here when the operating system exposes them. Connect Bluetooth devices in system settings first, then select Refresh.
           </p>
           {error && <p className="mt-1 text-[10px] text-danger" role="alert">{error}</p>}
         </section>

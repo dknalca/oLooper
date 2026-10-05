@@ -179,6 +179,7 @@ export default function AudioSettingsDialog({
       await audioSetOutput(next);
       saveSelection(next);
     } catch (cause) {
+      resumeFromBeginningOnClose.current = false;
       setError(String(cause));
     } finally {
       setBusy(false);
@@ -206,6 +207,7 @@ export default function AudioSettingsDialog({
         }, 900),
       ];
     } catch (cause) {
+      resumeFromBeginningOnClose.current = false;
       setError(String(cause));
       setTesting(false);
       setBusy(false);
@@ -224,7 +226,7 @@ export default function AudioSettingsDialog({
         <header className="mb-5 flex items-center justify-between gap-3">
           <div>
             <h2 id="audio-options-title" className="text-base font-semibold text-text">Audio Output</h2>
-            <p className="mt-1 text-[10px] text-text-secondary">Playback stops while changing outputs; closing resumes from the start of the loop.</p>
+            <p className="mt-1 text-[10px] text-text-secondary">System default follows the operating system when its default output changes. Playback stops while choosing an output; closing resumes from the start of the loop.</p>
           </div>
           <button onClick={onClose} disabled={busy} className="rounded px-2 py-1 text-xs text-text-secondary hover:bg-border hover:text-text disabled:opacity-40">Close</button>
         </header>
@@ -286,7 +288,7 @@ export default function AudioSettingsDialog({
               disabled={loading || busy || !selectedAvailable}
               className="mt-1 block w-full rounded border border-border bg-elevated px-2 py-2 text-xs text-text disabled:opacity-50"
             >
-              <option value="">CoreAudio default</option>
+              <option value="">Device default</option>
               {bufferFrames && !bufferPresets.includes(Number(bufferFrames)) && (
                 <option value={bufferFrames}>Saved {bufferFrames} frames</option>
               )}
@@ -322,7 +324,7 @@ export default function AudioSettingsDialog({
         </p>
 
         <p className="mt-3 text-[10px] text-text-secondary">
-          Test plays a 440 Hz tone on L, then 660 Hz on R. The device opens with the selected sample rate, format supported by CoreAudio, and buffer size; “Device default” and “CoreAudio default” leave those choices to the device.
+          Test plays a 440 Hz tone on L, then 660 Hz on R. The device opens with the selected sample rate and buffer size; “Device default” leaves those choices to the audio device.
         </p>
         <div className="mt-3 space-y-1.5" aria-label="Digital output levels">
           {([ ["L", outputLevels.left], ["R", outputLevels.right] ] as const).map(([channel, level]) => {

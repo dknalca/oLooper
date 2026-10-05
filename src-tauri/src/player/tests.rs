@@ -67,6 +67,50 @@ fn stereo_pairs_do_not_straddle_two_hardware_outputs() {
 }
 
 #[test]
+fn only_system_default_selection_tracks_system_default_device_changes() {
+    assert!(should_reopen_default_output(
+        &OutputSelection::default(),
+        "Speakers",
+        "USB Headset",
+    ));
+    assert!(!should_reopen_default_output(
+        &OutputSelection {
+            device_name: Some("Speakers".to_string()),
+            ..OutputSelection::default()
+        },
+        "Speakers",
+        "USB Headset",
+    ));
+    assert!(!should_reopen_default_output(
+        &OutputSelection::default(),
+        "Speakers",
+        "Speakers",
+    ));
+}
+
+#[test]
+fn reapplying_system_default_reopens_an_old_device_after_default_changed() {
+    assert!(!output_selection_matches_device(
+        &OutputSelection::default(),
+        "Realtek Digital Output",
+        Some("Plantronics Headphones"),
+    ));
+    assert!(output_selection_matches_device(
+        &OutputSelection::default(),
+        "Plantronics Headphones",
+        Some("Plantronics Headphones"),
+    ));
+    assert!(output_selection_matches_device(
+        &OutputSelection {
+            device_name: Some("Realtek Digital Output".to_string()),
+            ..OutputSelection::default()
+        },
+        "Realtek Digital Output",
+        Some("Plantronics Headphones"),
+    ));
+}
+
+#[test]
 fn output_config_selection_respects_channels_rate_format_and_buffer() {
     let supported = vec![
         cpal::SupportedStreamConfigRange::new(

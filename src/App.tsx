@@ -439,10 +439,10 @@ export default function App() {
               <section aria-label="Application shortcuts">
                 <h3 className="mb-2 text-[10px] font-semibold uppercase tracking-wider text-text-secondary">Application</h3>
                 <ShortcutRow keys="⌘ / Ctrl + O" action="Open File → Import Files…" />
-                <ShortcutRow keys="⌘ + W" action="Close window" />
-                <ShortcutRow keys="⌘ + Q" action="Quit oLooper" />
-                <ShortcutRow keys="⌘ + Z / ⇧⌘ + Z" action="Undo / redo text edits" />
-                <ShortcutRow keys="⌘ + X / C / V / A" action="Cut / copy / paste / select all" />
+                <ShortcutRow keys="⌘ / Ctrl + W" action="Close window" />
+                <ShortcutRow keys="⌘ / Ctrl + Q" action="Quit oLooper" />
+                <ShortcutRow keys="⌘ + Z / ⇧⌘ + Z · Ctrl + Z / Ctrl + Y" action="Undo / redo text edits" />
+                <ShortcutRow keys="⌘ / Ctrl + X / C / V / A" action="Cut / copy / paste / select all" />
               </section>
             </div>
             <p className="mt-4 text-[10px] text-text-secondary">Transport shortcuts are disabled while typing in text fields.</p>

@@ -333,7 +333,7 @@ pub struct OutputSelection {
     pub first_channel: u16,
     /// None uses the output device's preferred sample rate.
     pub sample_rate: Option<u32>,
-    /// None asks CoreAudio to choose its default buffer size.
+    /// None asks the output device to choose its default buffer size.
     pub buffer_frames: Option<u32>,
 }
 
@@ -439,6 +439,7 @@ struct OutputRuntime {
     mixer: Arc<DynamicMixerController<f32>>,
     channels: u16,
     sample_rate: u32,
+    device_name: String,
 }
 
 fn sample_format_rank(format: SampleFormat) -> u8 {
@@ -540,11 +541,11 @@ where
                 );
             },
             |error| {
-                crate::audio_log::write(&format!("coreaudio_stream_error error={error}"));
+                crate::audio_log::write(&format!("audio_stream_error error={error}"));
             },
             None,
         )
-        .map_err(|error| format!("cannot open requested CoreAudio format: {error}"))
+        .map_err(|error| format!("cannot open requested audio format: {error}"))
 }
 
 fn build_output_stream(
@@ -637,7 +638,7 @@ fn build_output_stream(
             first_channel,
             output_meter,
         ),
-        format => Err(format!("unsupported CoreAudio sample format: {format:?}")),
+        format => Err(format!("unsupported audio sample format: {format:?}")),
     }
 }
 
@@ -800,7 +801,7 @@ fn open_output(
         crate::audio_log::write(&format!(
             "output_stream_start_failed device={name:?} error={error}"
         ));
-        format!("cannot start CoreAudio output: {error}")
+        format!("cannot start audio output: {error}")
     })?;
     crate::audio_log::write(&format!(
         "output_stream_started device={name:?} channels={channels} sample_rate={sample_rate} sample_format={sample_format:?} buffer_size={:?} route_left_output={} route_right_output={}",
@@ -813,7 +814,24 @@ fn open_output(
         mixer,
         channels,
         sample_rate,
+        device_name: name,
     })
+}
+
+fn should_reopen_default_output(
+    selection: &OutputSelection,
+    opened_device: &str,
+    system_default_device: &str,
+) -> bool {
+    selection.device_name.is_none() && opened_device != system_default_device
+}
+
+fn output_selection_matches_device(
+    selection: &OutputSelection,
+    opened_device: &str,
+    system_default_device: Option<&str>,
+) -> bool {
+    selection.device_name.as_deref().or(system_default_device) == Some(opened_device)
 }
 
 /// Decode any rodio-supported bytes into a buffer. Hardware-free.
@@ -1093,6 +1111,7 @@ struct PendingLoad {
 
 pub struct Player {
     _output_stream: cpal::Stream,
+    output_device_name: String,
     output_mixer: Arc<DynamicMixerController<f32>>,
     output_channels: u16,
     output_sample_rate: u32,
@@ -1117,6 +1136,7 @@ impl Player {
         let output = open_output(selection, output_meter.clone())?;
         Ok(Self {
             _output_stream: output.stream,
+            output_device_name: output.device_name,
             output_mixer: output.mixer,
             output_channels: output.channels,
             output_sample_rate: output.sample_rate,
@@ -1135,7 +1155,6 @@ impl Player {
         if self.output_test_sink.is_some() {
             return Err("wait for the audio output test to finish".to_string());
         }
-        let output = open_output(selection, self.output_meter.clone())?;
         let was_playing = self
             .sink
             .as_ref()
@@ -1145,7 +1164,14 @@ impl Player {
             if let Some(sink) = &self.sink {
                 sink.pause();
             }
+            if let Some(track) = self.track.as_mut() {
+                track.resume_frame = track.cursor.load(Ordering::Relaxed);
+            }
         }
+        // Stop the old route before attempting to open the new one. If the new
+        // device rejects its stream configuration, playback remains safely
+        // paused instead of continuing through the previously selected output.
+        let output = open_output(selection, self.output_meter.clone())?;
         let new_sink = if had_sink {
             if let Some(track) = self.track.as_mut() {
                 let from = track.cursor.load(Ordering::Relaxed);
@@ -1166,14 +1192,7 @@ impl Player {
                     if track.pitch_lock { 1.0 } else { track.speed },
                 ) {
                     Ok(sink) => sink,
-                    Err(error) => {
-                        if was_playing {
-                            if let Some(sink) = &self.sink {
-                                sink.play();
-                            }
-                        }
-                        return Err(error.to_string());
-                    }
+                    Err(error) => return Err(error.to_string()),
                 };
                 Some(sink)
             } else {
@@ -1185,6 +1204,7 @@ impl Player {
 
         self.sink = new_sink;
         self._output_stream = output.stream;
+        self.output_device_name = output.device_name;
         self.output_mixer = output.mixer;
         self.output_channels = output.channels;
         self.output_sample_rate = output.sample_rate;
@@ -1928,6 +1948,7 @@ impl PlayerStatus {
 pub struct Engine {
     player: Option<Player>,
     output_selection: OutputSelection,
+    last_default_output_failure: Option<String>,
     /// Cloned into background workers so completions re-enter this loop.
     tx: std::sync::mpsc::Sender<EngineCmd>,
     pending_volume: f32,
@@ -2033,6 +2054,7 @@ impl Engine {
         Self {
             player: None,
             output_selection: OutputSelection::default(),
+            last_default_output_failure: None,
             tx,
             pending_volume: 0.8,
             generation: 0,
@@ -2067,7 +2089,15 @@ impl Engine {
     }
 
     fn run(mut self, rx: std::sync::mpsc::Receiver<EngineCmd>) {
-        while let Ok(cmd) = rx.recv() {
+        loop {
+            let cmd = match rx.recv_timeout(std::time::Duration::from_secs(1)) {
+                Ok(cmd) => cmd,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    self.follow_system_default_output();
+                    continue;
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            };
             match cmd {
                 // Worker completions carry no reply: they were requested
                 // by an earlier command whose reply already went out.
@@ -2159,17 +2189,87 @@ impl Engine {
         }
     }
 
+    fn follow_system_default_output(&mut self) {
+        if self.output_selection.device_name.is_some() {
+            return;
+        }
+        let Some(player) = self.player.as_ref() else {
+            return;
+        };
+        if player.output_test_sink.is_some() {
+            return;
+        }
+        let Some(default_name) = cpal::default_host()
+            .default_output_device()
+            .and_then(|device| device.name().ok())
+        else {
+            return;
+        };
+        if !should_reopen_default_output(
+            &self.output_selection,
+            &player.output_device_name,
+            &default_name,
+        ) {
+            if self.last_default_output_failure.as_deref() != Some(default_name.as_str()) {
+                self.last_default_output_failure = None;
+            }
+            return;
+        }
+        if self.last_default_output_failure.as_deref() == Some(default_name.as_str()) {
+            return;
+        }
+
+        crate::audio_log::write(&format!(
+            "system_default_output_changed old={:?} new={default_name:?}",
+            player.output_device_name
+        ));
+        let result = self
+            .player
+            .as_mut()
+            .expect("player was checked above")
+            .set_output(&self.output_selection);
+        match result {
+            Ok(()) => {
+                self.last_default_output_failure = None;
+                crate::audio_log::write(&format!(
+                    "system_default_output_applied device={default_name:?}"
+                ));
+            }
+            Err(error) => {
+                self.last_default_output_failure = Some(default_name.clone());
+                crate::audio_log::write(&format!(
+                    "system_default_output_failed device={default_name:?} error={error}"
+                ));
+            }
+        }
+    }
+
     fn cmd_set_output(&mut self, selection: OutputSelection) -> Result<(), String> {
         // Validate the exact channel/rate/format/buffer tuple even while the
-        // lazy player has not opened a CoreAudio stream yet.
+        // lazy player has not opened an output stream yet.
         select_output_config(&selection)?;
-        if selection == self.output_selection {
+        let output_matches = self.player.as_ref().is_none_or(|player| {
+            let system_default = if selection.device_name.is_none() {
+                cpal::default_host()
+                    .default_output_device()
+                    .and_then(|device| device.name().ok())
+            } else {
+                None
+            };
+            output_selection_matches_device(
+                &selection,
+                &player.output_device_name,
+                system_default.as_deref(),
+            )
+        });
+        if selection == self.output_selection && output_matches {
             return Ok(());
         }
         if let Some(player) = self.player.as_mut() {
             player.set_output(&selection)?;
         }
         self.output_selection = selection;
+        self.last_default_output_failure = None;
         Ok(())
     }
 

@@ -12,12 +12,13 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/dknalca/oLooper/releases/latest"><strong>Download the latest release</strong></a>
+  <a href="https://github.com/dknalca/oLooper/releases/tag/v0.5.0"><strong>macOS (v0.5.0)</strong></a>
+  · <a href="https://github.com/dknalca/oLooper/releases/tag/v0.5.1"><strong>Windows (v0.5.1)</strong></a>
   · <a href="https://github.com/dknalca/oLooper/releases">All releases</a>
   · <a href="#what-olooper-does">Explore features</a>
 </p>
 
-<p align="center"><strong>macOS 12+</strong> · Native desktop app · Your library stays on your machine</p>
+<p align="center"><strong>macOS 12+ · Windows 11</strong> · Native desktop app · Your library stays on your machine</p>
 
 ## Made for scratch practice
 
@@ -54,13 +55,25 @@ It is designed for **scratch DJs, beat jugglers, and turntablists** who want to 
 - **Work at your pace.** Adjust speed from 50% to 200% in 5% steps; optional pitch lock keeps the key steady.
 - **Hit your spots.** CUE 1 returns to the start; save per-track CUE 2–4 for drops, chops, and juggle points.
 - **Stay in the session.** Use the practice timer or let timed random practice serve up another library loop.
-- **Play from your rig.** Map MIDI Note On pads or discrete CC buttons to transport, navigation, loop, speed, AUTO, and cues. USB and Bluetooth MIDI work when macOS exposes them as MIDI inputs.
+- **Play from your rig.** Map MIDI Note On pads or discrete CC buttons to transport, navigation, loop, speed, AUTO, and cues. USB and Bluetooth MIDI work when the operating system exposes them as inputs.
 
-## Get oLooper
+## Install oLooper
 
-**[Download the latest macOS release →](https://github.com/dknalca/oLooper/releases/latest)**
+### macOS — Intel and Apple silicon
 
-The current release provides an unsigned DMG for **macOS 12 or later**; it is not notarized. See the [macOS release notes](docs/macos-release.md). Your catalog and extracted audio are stored in your local library; imported SWF/EXE originals are not altered or removed.
+Download the [macOS v0.5.0 release](https://github.com/dknalca/oLooper/releases/tag/v0.5.0). Its Universal 2 DMG contains native Intel (`x86_64`) and Apple silicon (`arm64`) versions; Rosetta is not required.
+
+1. Open the downloaded `.dmg` and drag **oLooper** into **Applications**.
+2. Eject the oLooper disk image, then launch the app from Applications.
+3. The DMG is not signed or notarized. On the first launch, Control-click oLooper, choose **Open**, then confirm. If macOS still blocks it, follow [Apple's instructions for opening an app from an unidentified developer](https://support.apple.com/en-us/102445).
+
+The published v0.5.0 DMG requires **macOS 12 or later**. Builds from this source checkout now target macOS 11.0, but Big Sur runtime compatibility still needs testing before a release can claim support for macOS 11. No additional runtime or developer tools are needed to install the DMG.
+
+### Windows 11 — x64
+
+Download the [Windows v0.5.1 release](https://github.com/dknalca/oLooper/releases/tag/v0.5.1) and run `oLooper-0.5.1-windows-x64-setup.exe`. Windows 11 includes WebView2 in most installations. If it is missing, install the [Microsoft Edge WebView2 Evergreen Runtime](https://developer.microsoft.com/microsoft-edge/webview2/); the NSIS installer can also bootstrap it when needed. The new Windows package is x64; the previous macOS v0.5.0 DMG remains available separately.
+
+The unsigned installer may prompt Windows SmartScreen. The app's library and preferences remain in your user profile; installing or removing the app does not delete the selected library.
 
 ## Build from source
 
@@ -69,7 +82,9 @@ pnpm install
 pnpm tauri dev
 ```
 
-For a bundled app, run `./scripts/build.sh`. See [macOS release notes](docs/macos-release.md) for packaging details.
+For a bundled macOS app, run `./scripts/build.sh`; see the [macOS release notes](docs/macos-release.md). Building on macOS requires [Xcode](https://developer.apple.com/xcode/) (or a [compatible older version](https://developer.apple.com/download/all/?q=Xcode)), [Node.js](https://nodejs.org/en/download/), [pnpm](https://pnpm.io/installation), and [Rust](https://www.rust-lang.org/tools/install).
+
+On Windows, install [App Installer (winget)](https://apps.microsoft.com/detail/9nblggh4nns1) if it is not present. Open PowerShell as Administrator and run `scripts/install-windows.ps1`; it installs Node.js, pnpm, Rust MSVC, Visual Studio C++ Build Tools, and WebView2. Restart PowerShell, then run `scripts/build.ps1` to create `dist/installers/oLooper-0.5.1-windows-x64-setup.exe`. Use `scripts/build.ps1 -Dev` for an unbundled debug executable. The setup script's prerequisites can also be installed individually: [Node.js](https://nodejs.org/en/download/), [pnpm](https://pnpm.io/installation), [Rust](https://www.rust-lang.org/tools/install), and [Visual Studio C++ Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/).
 
 ## Checks
 
