@@ -1,0 +1,61 @@
+name: Build macOS Universal DMG
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to build (for example, v0.5.1)
+        required: true
+        default: v0.5.1
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - name: Check out release source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+          fetch-depth: 0
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 12.9.1
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build Universal 2 app and DMG
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          ./scripts/build.sh
+          lipo -archs oLooper.app/Contents/MacOS/oLooper | grep -q x86_64
+          lipo -archs oLooper.app/Contents/MacOS/oLooper | grep -q arm64
+          plutil -extract LSMinimumSystemVersion raw -o - oLooper.app/Contents/Info.plist | grep -qx '11.0'
+          ./scripts/package-dmg.sh
+          version="$(node -p "require('./src-tauri/tauri.conf.json').version")"
+          test "v$version" = "$RELEASE_TAG"
+          test -s "dist/oLooper-${version}-unsigned.dmg"
+
+      - name: Attach DMG to the existing GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          version="$(node -p "require('./src-tauri/tauri.conf.json').version")"
+          gh release upload "$RELEASE_TAG" "dist/oLooper-${version}-unsigned.dmg" --clobber
