@@ -1,5 +1,11 @@
 # Release notes
 
+## 0.6.2
+
+- Fixed **Reveal audio file** on Windows: files are selected in Explorer and
+  folders open directly, including paths canonicalized with the Windows
+  extended-length prefix.
+
 ## 0.6.1
 
 - Fixed looper selection on Windows when pointer capture is active for sidebar

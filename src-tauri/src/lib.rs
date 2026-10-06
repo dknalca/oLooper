@@ -752,15 +752,20 @@ fn reveal_in_file_manager(path: String) -> Result<(), String> {
     if !path.exists() {
         return Err("file no longer exists".to_string());
     }
-    let mut command = if cfg!(target_os = "macos") {
+    #[cfg(target_os = "macos")]
+    let mut command = {
         let mut command = std::process::Command::new("open");
         command.arg("-R").arg(path);
         command
-    } else if cfg!(target_os = "windows") {
+    };
+    #[cfg(target_os = "windows")]
+    let mut command = {
         let mut command = std::process::Command::new("explorer.exe");
-        command.arg(format!("/select,{}", path.display()));
+        command.args(windows_explorer_args(path));
         command
-    } else {
+    };
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let mut command = {
         let mut command = std::process::Command::new("xdg-open");
         command.arg(path.parent().unwrap_or(path));
         command
@@ -769,6 +774,35 @@ fn reveal_in_file_manager(path: String) -> Result<(), String> {
         .spawn()
         .map_err(|e| format!("cannot reveal file: {e}"))?;
     Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn windows_shell_path(path: &std::path::Path) -> std::ffi::OsString {
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+
+    const EXTENDED_UNC_PREFIX: [u16; 8] = [92, 92, 63, 92, 85, 78, 67, 92]; // \\?\UNC\
+    const EXTENDED_PATH_PREFIX: [u16; 4] = [92, 92, 63, 92]; // \\?\
+
+    let wide = path.as_os_str().encode_wide().collect::<Vec<_>>();
+    if wide.starts_with(&EXTENDED_UNC_PREFIX) {
+        let mut normalized = vec![92, 92];
+        normalized.extend_from_slice(&wide[EXTENDED_UNC_PREFIX.len()..]);
+        std::ffi::OsString::from_wide(&normalized)
+    } else if wide.starts_with(&EXTENDED_PATH_PREFIX) {
+        std::ffi::OsString::from_wide(&wide[EXTENDED_PATH_PREFIX.len()..])
+    } else {
+        path.as_os_str().to_os_string()
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn windows_explorer_args(path: &std::path::Path) -> Vec<std::ffi::OsString> {
+    let path = windows_shell_path(path);
+    if std::path::Path::new(&path).is_dir() {
+        vec![path]
+    } else {
+        vec![std::ffi::OsString::from("/select,"), path]
+    }
 }
 
 #[tauri::command]
@@ -1580,6 +1614,40 @@ mod tests {
         assert_eq!(
             portable_root_for_executable(executable).unwrap(),
             std::path::PathBuf::from("/tmp/olooper"),
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_reveal_selects_files_with_separate_explorer_arguments() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("loop with spaces.wav");
+        std::fs::write(&file, b"audio").unwrap();
+
+        assert_eq!(
+            windows_explorer_args(&file),
+            vec![
+                std::ffi::OsString::from("/select,"),
+                file.as_os_str().to_os_string(),
+            ],
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_reveal_opens_directories_and_normalizes_extended_paths() {
+        let root = tempfile::tempdir().unwrap();
+        assert_eq!(
+            windows_explorer_args(root.path()),
+            vec![root.path().as_os_str().to_os_string()],
+        );
+        assert_eq!(
+            windows_shell_path(std::path::Path::new(r"\\?\C:\Users\DJ\Music\oLooper",)),
+            std::ffi::OsString::from(r"C:\Users\DJ\Music\oLooper"),
+        );
+        assert_eq!(
+            windows_shell_path(std::path::Path::new(r"\\?\UNC\server\share\oLooper",)),
+            std::ffi::OsString::from(r"\\server\share\oLooper"),
         );
     }
 
