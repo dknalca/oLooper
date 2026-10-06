@@ -1,6 +1,8 @@
+#[cfg(any(target_os = "macos", test))]
 use std::io::Write;
 use std::path::Path;
 
+#[cfg(any(target_os = "macos", test))]
 fn copy_managed_audio_to_destination(source: &Path, destination: &Path) -> Result<(), String> {
     let source_metadata = std::fs::symlink_metadata(source)
         .map_err(|error| format!("cannot inspect managed audio: {error}"))?;

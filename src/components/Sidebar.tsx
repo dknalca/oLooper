@@ -611,7 +611,14 @@ export default function Sidebar({ libraryReady, refreshKey, activeTrackId, onReg
       sourceHash,
       active: false,
     };
-    event.currentTarget.setPointerCapture(event.pointerId);
+    // Keep a simple click targeted at the nested selection button; capturing
+    // on the row wrapper can retarget its click and prevent the button firing.
+    const selectionButton = (event.target as HTMLElement).closest("button");
+    if (selectionButton && event.currentTarget.contains(selectionButton)) {
+      selectionButton.setPointerCapture(event.pointerId);
+    } else {
+      event.currentTarget.setPointerCapture(event.pointerId);
+    }
   };
 
   const beginDesktopAudioDrag = async (trackId: number, releasePointerCapture: () => void) => {
@@ -868,6 +875,13 @@ export default function Sidebar({ libraryReady, refreshKey, activeTrackId, onReg
                   onPointerMove={movePointerDrag}
                   onPointerUp={dropPointerDrag}
                   onPointerCancel={cancelPointerDrag}
+                  onClick={(event) => {
+                    // Pointer capture during reorder can retarget the click to
+                    // this wrapper instead of the nested selection button.
+                    if (event.target !== event.currentTarget) return;
+                    if (suppressRowClick.current) { suppressRowClick.current = false; return; }
+                    setSelectedGroup(sourceHash);
+                  }}
                   onContextMenu={entries[0].source_type === "custom" ? undefined : (event) => openGroupMenu(event, sourceHash)}
                   className={`group flex select-none items-center rounded transition-colors ${dropTarget?.kind === "looper" && dropTarget.sourceHash === sourceHash ? "bg-accent/25 ring-1 ring-accent" : isSelected ? "bg-accent/15 text-accent" : "text-text-secondary hover:bg-surface-hover hover:text-text"}`}
                 >

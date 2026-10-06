@@ -1,5 +1,10 @@
 # Release notes
 
+## 0.6.1
+
+- Fixed looper selection on Windows when pointer capture is active for sidebar
+  reordering; clicking a looper opens its tracks again.
+
 ## 0.6.0
 
 - Added an **ALL** collection, ordered playlists, and persistent looper ordering.
