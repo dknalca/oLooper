@@ -48,18 +48,25 @@ fn onset_envelope(mono: &[f32]) -> Vec<f32> {
 }
 
 fn autocorr(env: &[f32], lag: usize) -> f64 {
-    let mut num = 0f64;
-    let mut den = 0f64;
-    for (i, &v) in env.iter().enumerate() {
-        den += f64::from(v) * f64::from(v);
-        if i + lag < env.len() {
-            num += f64::from(v) * f64::from(env[i + lag]);
-        }
+    let paired = env.len().saturating_sub(lag);
+    if paired == 0 {
+        return 0.0;
     }
-    if den <= 0.0 {
+    let mut num = 0f64;
+    let mut left_energy = 0f64;
+    let mut right_energy = 0f64;
+    for i in 0..paired {
+        let left = f64::from(env[i]);
+        let right = f64::from(env[i + lag]);
+        num += left * right;
+        left_energy += left * left;
+        right_energy += right * right;
+    }
+    let den = (left_energy * right_energy).sqrt();
+    if den <= f64::EPSILON {
         0.0
     } else {
-        num / den
+        (num / den).clamp(0.0, 1.0)
     }
 }
 
@@ -115,13 +122,23 @@ pub fn estimate(buf: &crate::player::LoopBuffer) -> Option<BpmEstimate> {
     } else {
         lag
     };
-    let bpm = 60.0 * env_rate / refined;
-    if !(MIN_BPM..=MAX_BPM).contains(&bpm) {
+    let raw_bpm = 60.0 * env_rate / refined;
+    if !(MIN_BPM..=MAX_BPM).contains(&raw_bpm) {
         return None;
     }
+    // A strong beat often also correlates at half- and double-time. Do not
+    // arbitrarily treat the strongest octave-related peak as certain: use the
+    // alternative tempos to lower confidence when the audio cannot distinguish
+    // the intended beat. The UI can then invite a manual correction.
+    let octave_peak = [raw_bpm / 2.0, raw_bpm * 2.0]
+        .into_iter()
+        .filter(|candidate| (MIN_BPM..=MAX_BPM).contains(candidate))
+        .map(|candidate| autocorr(&env, lag_for(candidate).max(1)))
+        .fold(0.0, f64::max);
+    let confidence = (peak.clamp(0.0, 1.0) * (1.0 - 0.7 * octave_peak)).clamp(0.0, 1.0);
     Some(BpmEstimate {
-        bpm: normalize_bpm(bpm)?,
-        confidence: peak.clamp(0.0, 1.0),
+        bpm: normalize_bpm(raw_bpm)?,
+        confidence,
     })
 }
 

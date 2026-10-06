@@ -55,6 +55,30 @@ fn wav_buf() -> crate::player::LoopBuffer {
     crate::player::decode_bytes(&v).unwrap()
 }
 
+fn add_test_looper_track(lib: &Library, root: &Path, title: &str, source_hash: &str) -> i64 {
+    let audio = root.join("Custom Loops").join(format!("{title}.wav"));
+    std::fs::write(&audio, title.as_bytes()).unwrap();
+    let (id, added) = lib
+        .add_track(
+            title,
+            title,
+            &audio,
+            "swf",
+            &format!("/{title}.swf"),
+            source_hash,
+            0,
+            None,
+            None,
+            "wav",
+            &wav_buf(),
+            0,
+            0,
+        )
+        .unwrap();
+    assert!(added);
+    id
+}
+
 fn wav_id3_tag(path: &Path) -> Tag {
     let bytes = std::fs::read(path).unwrap();
     let mut offset = 12;
@@ -74,10 +98,271 @@ fn wav_id3_tag(path: &Path) -> Tag {
 fn migrate_starts_at_current_schema() {
     let root = tmp_root("migrate");
     let lib = Library::open(&root).unwrap();
-    assert_eq!(lib.schema_version().unwrap(), 6);
+    assert_eq!(lib.schema_version().unwrap(), 8);
     assert!(root.join("Custom Loops").is_dir());
     assert!(root.join("olooper.db").is_file());
     std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn migration_v6_adds_empty_playlists_without_changing_tracks() {
+    let root = tmp_root("playlist-migration-v6");
+    let lib = Library::open(&root).unwrap();
+    let audio = root.join("Custom Loops/preserved.wav");
+    std::fs::write(&audio, b"preserved audio").unwrap();
+    let (track_id, _) = lib
+        .add_track(
+            "Preserved",
+            "Custom Loops",
+            &audio,
+            "custom",
+            "/source/preserved.wav",
+            "playlist-migration-preserved",
+            0,
+            None,
+            None,
+            "wav",
+            &wav_buf(),
+            0,
+            0,
+        )
+        .unwrap();
+    drop(lib);
+
+    let conn = Connection::open(root.join("olooper.db")).unwrap();
+    conn.execute_batch(
+        "DROP TABLE playlist_tracks; DROP TABLE playlists; DROP TABLE looper_order; \
+         PRAGMA user_version=6;",
+    )
+    .unwrap();
+    drop(conn);
+
+    let migrated = Library::open(&root).unwrap();
+    assert_eq!(migrated.schema_version().unwrap(), 8);
+    assert!(migrated.list_playlists().unwrap().is_empty());
+    assert_eq!(migrated.list_tracks().unwrap()[0].id, track_id);
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn migration_v7_adds_looper_order_and_preserves_existing_groups() {
+    let root = tmp_root("looper-order-migration-v7");
+    let lib = Library::open(&root).unwrap();
+    add_test_looper_track(&lib, &root, "First", "looper-order-first");
+    drop(lib);
+
+    let conn = Connection::open(root.join("olooper.db")).unwrap();
+    conn.execute_batch("DROP TABLE looper_order; PRAGMA user_version=7;")
+        .unwrap();
+    drop(conn);
+
+    let migrated = Library::open(&root).unwrap();
+    assert_eq!(migrated.schema_version().unwrap(), 8);
+    assert_eq!(
+        migrated.list_looper_order().unwrap(),
+        vec!["looper-order-first"]
+    );
+    assert_eq!(migrated.list_tracks().unwrap().len(), 1);
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn looper_order_persists_and_rejects_incomplete_or_duplicate_orders() {
+    let root = tmp_root("looper-order");
+    let lib = Library::open(&root).unwrap();
+    add_test_looper_track(&lib, &root, "First", "looper-order-first");
+    add_test_looper_track(&lib, &root, "Second", "looper-order-second");
+    assert_eq!(
+        lib.list_looper_order().unwrap(),
+        vec!["looper-order-first", "looper-order-second"]
+    );
+    let reordered = vec![
+        "looper-order-second".to_string(),
+        "looper-order-first".to_string(),
+    ];
+    lib.reorder_loopers(&reordered).unwrap();
+    assert!(lib
+        .reorder_loopers(&["looper-order-first".to_string()])
+        .is_err());
+    assert!(lib
+        .reorder_loopers(&[
+            "looper-order-first".to_string(),
+            "looper-order-first".to_string(),
+        ])
+        .is_err());
+    drop(lib);
+
+    let reopened = Library::open(&root).unwrap();
+    assert_eq!(reopened.list_looper_order().unwrap(), reordered);
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn playlists_store_ordered_track_references_without_copying_or_reassigning_tracks() {
+    let root = tmp_root("playlists");
+    let lib = Library::open(&root).unwrap();
+    let buf = wav_buf();
+    let first_path = root.join("Custom Loops/first.wav");
+    let second_path = root.join("Custom Loops/second.wav");
+    std::fs::write(&first_path, b"first audio").unwrap();
+    std::fs::write(&second_path, b"second audio").unwrap();
+    let (first_id, _) = lib
+        .add_track(
+            "First",
+            "Custom Loops",
+            &first_path,
+            "custom",
+            "/source/first.wav",
+            "playlist-first",
+            0,
+            None,
+            None,
+            "wav",
+            &buf,
+            0,
+            0,
+        )
+        .unwrap();
+    let (second_id, _) = lib
+        .add_track(
+            "Second",
+            "Custom Loops",
+            &second_path,
+            "custom",
+            "/source/second.wav",
+            "playlist-second",
+            0,
+            None,
+            None,
+            "wav",
+            &buf,
+            0,
+            0,
+        )
+        .unwrap();
+
+    let playlist = lib.create_playlist("Practice set").unwrap();
+    assert!(lib.add_track_to_playlist(playlist.id, first_id).unwrap());
+    assert!(!lib.add_track_to_playlist(playlist.id, first_id).unwrap());
+    assert!(lib.add_track_to_playlist(playlist.id, second_id).unwrap());
+    lib.reorder_playlist(playlist.id, &[second_id, first_id])
+        .unwrap();
+    assert_eq!(
+        lib.list_playlists().unwrap()[0].track_ids,
+        vec![second_id, first_id]
+    );
+    assert!(lib
+        .reorder_playlist(playlist.id, &[first_id, first_id])
+        .is_err());
+    assert_eq!(
+        lib.list_playlists().unwrap()[0].track_ids,
+        vec![second_id, first_id]
+    );
+
+    assert!(lib
+        .remove_track_from_playlist(playlist.id, second_id)
+        .unwrap());
+    assert_eq!(lib.list_playlists().unwrap()[0].track_ids, vec![first_id]);
+    assert!(lib.add_track_to_playlist(playlist.id, second_id).unwrap());
+    assert!(lib.remove_track(second_id).unwrap());
+    assert!(first_path.is_file());
+    assert!(!second_path.exists());
+    assert_eq!(lib.list_playlists().unwrap()[0].track_ids, vec![first_id]);
+    assert_eq!(
+        lib.get_track(first_id).unwrap().unwrap().looper_name,
+        "Custom Loops"
+    );
+    assert!(lib.rename_playlist(playlist.id, "Warmup").is_ok());
+    assert!(lib.create_playlist("warmup").is_err());
+
+    drop(lib);
+    let reopened = Library::open(&root).unwrap();
+    let playlists = reopened.list_playlists().unwrap();
+    assert_eq!(playlists.len(), 1);
+    assert_eq!(playlists[0].name, "Warmup");
+    assert_eq!(playlists[0].track_ids, vec![first_id]);
+    assert!(reopened.remove_playlist(playlist.id).unwrap());
+    assert!(first_path.is_file());
+    assert_eq!(reopened.list_tracks().unwrap().len(), 1);
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn converting_wav_replaces_only_managed_copy_and_preserves_track_identity_and_tags() {
+    let root = tmp_root("wav-to-mp3");
+    let outside = tmp_root("wav-to-mp3-source");
+    let source = outside.join("original.wav");
+    let wav = root.join("Custom Loops/Practice.wav");
+    let samples = (0..44_100 * 2)
+        .map(|frame| {
+            ((frame as f32 * 440.0 * std::f32::consts::TAU / 44_100.0).sin() * 12_000.0) as i16
+        })
+        .collect::<Vec<_>>();
+    write_wav(&source, &samples, 44_100);
+    let lib = Library::open(&root).unwrap();
+    write_wav(&wav, &samples, 44_100);
+    let input = std::fs::read(&wav).unwrap();
+    let buffer = crate::player::decode_bytes(&input).unwrap();
+    let (track_id, _) = lib
+        .add_track(
+            "Practice",
+            "Custom Loops",
+            &wav,
+            "custom",
+            source.to_str().unwrap(),
+            "wav-conversion-track",
+            0,
+            None,
+            None,
+            "wav",
+            &buffer,
+            0,
+            0,
+        )
+        .unwrap();
+    lib.update_bpm(track_id, 128.0, Some(0.8), true).unwrap();
+    let expected_metadata = SeratoMetadata {
+        cues: vec![
+            SeratoCue {
+                slot: 1,
+                label: "A".to_string(),
+                position_ms: 0,
+            },
+            SeratoCue {
+                slot: 2,
+                label: "B".to_string(),
+                position_ms: 250,
+            },
+        ],
+        loops: Vec::new(),
+        bpm: Some(128.0),
+    };
+    serato::write_audio_file(&wav, &expected_metadata, buffer.duration_ms() as i64).unwrap();
+    let playlist = lib.create_playlist("Converted").unwrap();
+    lib.add_track_to_playlist(playlist.id, track_id).unwrap();
+
+    let converted = lib.convert_wav_to_mp3_320(track_id).unwrap();
+    let mp3 = PathBuf::from(&converted.file_path);
+    assert!(mp3.is_file());
+    assert_eq!(
+        mp3.extension().and_then(|value| value.to_str()),
+        Some("mp3")
+    );
+    assert_eq!(converted.codec, "mp3");
+    assert_eq!(converted.id, track_id);
+    assert_eq!(converted.source_path, source.to_str().unwrap());
+    assert_eq!(converted.bpm, Some(128.0));
+    assert_eq!(converted.bpm_source.as_deref(), Some("manual"));
+    assert!(!wav.exists());
+    assert!(source.is_file());
+    assert_eq!(lib.list_playlists().unwrap()[0].track_ids, vec![track_id]);
+    let decoded_mp3 = crate::player::decode_bytes(&std::fs::read(&mp3).unwrap()).unwrap();
+    assert_eq!(decoded_mp3.rate, 44_100);
+    let metadata = lib.get_serato_metadata(track_id).unwrap();
+    assert_eq!(metadata.cues, expected_metadata.cues);
+    assert_eq!(metadata.bpm, Some(128.0));
+    std::fs::remove_dir_all(root).ok();
+    std::fs::remove_dir_all(outside).ok();
 }
 
 #[test]
@@ -485,6 +770,62 @@ fn track_removal_refuses_to_delete_a_file_outside_the_library_root() {
     assert!(lib.get_track(id).unwrap().is_some());
     std::fs::remove_dir_all(&root).ok();
     std::fs::remove_dir_all(&outside).ok();
+}
+
+#[test]
+fn desktop_drag_path_only_returns_audio_confined_to_the_library() {
+    let root = tmp_root("desktop-drag-managed");
+    let outside = tmp_root("desktop-drag-outside");
+    let lib = Library::open(&root).unwrap();
+    let managed_audio = root.join("Custom Loops/managed.wav");
+    let external_audio = outside.join("external.wav");
+    std::fs::write(&managed_audio, b"managed audio").unwrap();
+    std::fs::write(&external_audio, b"external audio").unwrap();
+    let buffer = wav_buf();
+    let (managed_id, _) = lib
+        .add_track(
+            "Managed",
+            "Custom Loops",
+            &managed_audio,
+            "custom",
+            "/source/managed.wav",
+            "desktop-drag-managed",
+            0,
+            None,
+            None,
+            "wav",
+            &buffer,
+            0,
+            0,
+        )
+        .unwrap();
+    let (external_id, _) = lib
+        .add_track(
+            "External",
+            "Custom Loops",
+            &external_audio,
+            "custom",
+            "/source/external.wav",
+            "desktop-drag-external",
+            0,
+            None,
+            None,
+            "wav",
+            &buffer,
+            0,
+            0,
+        )
+        .unwrap();
+
+    assert_eq!(
+        lib.managed_audio_path_for_track(managed_id).unwrap(),
+        managed_audio.canonicalize().unwrap()
+    );
+    assert!(lib.managed_audio_path_for_track(external_id).is_err());
+    assert!(managed_audio.is_file());
+    assert!(external_audio.is_file());
+    std::fs::remove_dir_all(root).ok();
+    std::fs::remove_dir_all(outside).ok();
 }
 
 #[test]

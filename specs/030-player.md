@@ -54,9 +54,11 @@ Waveform rendering and library integration are separate specs.
     hit/miss. The UI shows `Loading audio…` (track row + transport) and
     `Preparing pitch lock…` while those jobs run.
 12. Practice time accumulates only while audio is playing and can be reset
-    from the top bar. Optional random mode switches to another playable local
-    library track at 2-minute, 5-minute, or custom (1–1440 minute) intervals;
-    the timer repeats until disabled and avoids the current track when possible.
+     from the top bar. Optional random mode switches to another playable local
+     library track at 2-minute, 5-minute, or custom (1–1440 minute) intervals;
+     the timer repeats until disabled and avoids the current track when possible.
+     A **Next random** button immediately switches to another playable local
+     library track and restarts the interval when timed random mode is enabled.
 13. The waveform shows the current track name in its upper-left corner.
 14. Audio output follows the system default unless a device and stereo output
     pair are selected in **oLooper → Audio Output…**. For multichannel devices,
@@ -115,6 +117,8 @@ Waveform rendering and library integration are separate specs.
 - [x] Keyboard shortcuts control transport without mouse.
 - [x] CUE 1 is track start; CUEs 2–4 come from audio tags.
 - [x] Loading another track resets playback speed to 100%.
+- [x] Next random immediately plays another library track, including when no
+  track is currently active.
 - [ ] Stereo output can follow the system default or route to any supported
   stereo channel pair on a selected device.
 

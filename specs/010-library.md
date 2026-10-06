@@ -23,22 +23,29 @@ slots.
    The audio file is their source of truth; legacy schema-v6 cue positions are
    migrated to the file on first read. Existing Serato saved loops are retained
    but are not managed by oLooper.
-6. The left pane lists **Favoritos** first, followed by loopers; selecting one
-   shows its tracks in the right pane. Tracks show their name, duration, and BPM. Automatically
-   analyzed BPM is normalized by octave into 65–150 BPM; user-entered BPM is
-   never changed. Tracks are alphabetical by default; clicking the BPM heading
-   sorts by BPM, clicking it again reverses the order, and clicking Loop restores
-   alphabetical order. The active track's
-   looper is selected automatically and its row is highlighted in blue.
-   The looper pane divider can be dragged to resize the left column; its width
-   is saved between launches.
-7. A source-looper group can be renamed, revealed in the file manager, or
+6. The left pane lists **ALL**, **Favoritos**, playlists, then looper groups.
+   ALL contains each catalog track exactly once. Selecting ALL or a group shows
+   its matching tracks; search, source/BPM/duration filters, sorting, playback,
+   navigation, and export operate on the selected set. Tracks show name,
+   duration, BPM, and a review indicator for low-confidence analyzed BPM.
+   Automatically analyzed BPM is normalized by octave into 65–150 BPM;
+   user-entered BPM is never changed. The active track's group is selected
+   automatically only while browsing a source group. The pane divider remains
+   resizable and its width is saved between launches.
+7. Playlists are ordered sets of unique track references. Users can create,
+   rename, delete, add/remove tracks, and change order. Playlist membership does
+   not copy audio or change owning groups; playback navigation follows playlist
+   order. Removing a track removes its playlist references; deleting a playlist
+   leaves all tracks untouched.
+8. Users can reorder source-looper groups by dragging them in the left pane. The
+   order persists across restarts; newly imported groups are appended.
+9. A source-looper group can be renamed, revealed in the file manager, or
    removed. Removing a group removes its catalog rows, loop slots, library audio
    copies and cover. Original SWF/EXE/source files remain on disk.
-8. Each loop can be marked as a persistent favorite. The visible per-loop
+10. Each loop can be marked as a persistent favorite. The visible per-loop
    trash control removes that loop and its library audio copy after confirmation;
    its original input file is not touched.
-9. Each loop has a Play button beside its name; double-clicking a row also starts
+11. Each loop has a Play button beside its name; double-clicking a row also starts
    playback.
 
 ## Supported inputs
@@ -67,7 +74,7 @@ slots.
 
 ## Persistence behavior
 
-- Schema versioned through v6 via `PRAGMA user_version`; forward migrations are
+- Schema versioned through v8 via `PRAGMA user_version`; forward migrations are
   transactional and covered by temporary-database tests. Downgrades are unsupported.
 - `updated_at` bumps on every user edit; `imported_at` never changes.
 - Foreign keys enforced via `PRAGMA foreign_keys = ON`.
@@ -96,10 +103,17 @@ slots.
 - [x] Cue/loop edit → restart → edit preserved.
 - [x] Temp-DB tests: migrate, CRUD, dedup conflict, atomicity (no partial rows).
 - [x] Loop slots: CRUD works, cascade delete on track removal, schema migration v1→v2.
-- [x] Two-pane library lists Favoritos first and shows the selected group's tracks.
+- [ ] Library pane lists ALL, Favoritos, playlists, and source groups while
+  preserving existing favorites and group behavior.
 - [x] Play button and double-click start the selected track.
+- [ ] ALL contains every track once; filters, playback, navigation, and export use
+  the full catalog.
+- [x] Playlist references, order, migration, and foreign-key cleanup persist
+  without copying/deleting audio or changing group ownership.
+- [ ] Source-looper order persists through restart; drag-reordering does not
+  change group ownership or audio paths.
 
 ## Non-goals
 
 - Library relocation wizard, duplicate-audio detection across different
-  sources, playlists.
+  sources, direct Serato crate export.

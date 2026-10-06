@@ -314,6 +314,43 @@ fn output_test_buffer() -> LoopBuffer {
     }
 }
 
+fn metronome_buffer(sample_rate: u32, bpm: f32) -> Result<LoopBuffer, String> {
+    if sample_rate == 0 || !bpm.is_finite() || !(30.0..=300.0).contains(&bpm) {
+        return Err("metronome BPM must be between 30 and 300".to_string());
+    }
+    let beat_frames = (f64::from(sample_rate) * 60.0 / f64::from(bpm)).round() as usize;
+    let bar_frames = beat_frames
+        .checked_mul(4)
+        .ok_or_else(|| "metronome buffer is too large".to_string())?;
+    let max_bar_frames = sample_rate as usize * 8;
+    if beat_frames == 0 || bar_frames > max_bar_frames {
+        return Err("metronome buffer is outside supported limits".to_string());
+    }
+    let mut samples = vec![0i16; bar_frames * 2];
+    let click_frames = ((sample_rate as usize * 32) / 1000).max(1).min(beat_frames);
+    for beat in 0..4 {
+        let frequency = if beat == 0 { 1_760.0 } else { 1_180.0 };
+        let amplitude = if beat == 0 { 0.68 } else { 0.44 };
+        for frame in 0..click_frames {
+            let time = frame as f32 / sample_rate as f32;
+            let envelope = (-(frame as f32) / (sample_rate as f32 * 0.009)).exp();
+            let value = (time * frequency * std::f32::consts::TAU).sin()
+                * envelope
+                * amplitude
+                * i16::MAX as f32;
+            let sample = value as i16;
+            let index = (beat * beat_frames + frame) * 2;
+            samples[index] = sample;
+            samples[index + 1] = sample;
+        }
+    }
+    Ok(LoopBuffer {
+        samples,
+        channels: 2,
+        rate: sample_rate,
+    })
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AudioOutputDevice {
     pub id: String,
@@ -1118,8 +1155,11 @@ pub struct Player {
     first_channel: u16,
     output_meter: Arc<OutputMeter>,
     sink: Option<Sink>,
+    metronome_sink: Option<Sink>,
+    metronome_bpm: Option<f32>,
     output_test_sink: Option<Sink>,
     output_test_resume_playback: bool,
+    output_test_resume_metronome: bool,
     track: Option<Loaded>,
     /// Channel back to the engine loop, so background workers (decode,
     /// WSOLA) can post completions to be applied on the audio thread.
@@ -1143,8 +1183,11 @@ impl Player {
             first_channel: selection.first_channel,
             output_meter,
             sink: None,
+            metronome_sink: None,
+            metronome_bpm: None,
             output_test_sink: None,
             output_test_resume_playback: false,
+            output_test_resume_metronome: false,
             track: None,
             tx,
             pitch_seq: 0,
@@ -1157,6 +1200,10 @@ impl Player {
         }
         let was_playing = self
             .sink
+            .as_ref()
+            .is_some_and(|sink| !sink.is_paused() && !sink.empty());
+        let metronome_was_playing = self
+            .metronome_sink
             .as_ref()
             .is_some_and(|sink| !sink.is_paused() && !sink.empty());
         let had_sink = self.sink.is_some();
@@ -1201,8 +1248,29 @@ impl Player {
         } else {
             None
         };
+        let new_metronome_sink = if let Some(bpm) = self.metronome_bpm {
+            let buffer = Arc::new(metronome_buffer(output.sample_rate, bpm)?);
+            let source = LoopRegion::new(
+                buffer.clone(),
+                0,
+                0,
+                buffer.frames(),
+                true,
+                Arc::new(AtomicUsize::new(0)),
+            );
+            Some(routed_sink(
+                &output.mixer,
+                output.sample_rate,
+                source,
+                0.5,
+                1.0,
+            )?)
+        } else {
+            None
+        };
 
         self.sink = new_sink;
+        self.metronome_sink = new_metronome_sink;
         self._output_stream = output.stream;
         self.output_device_name = output.device_name;
         self.output_mixer = output.mixer;
@@ -1218,6 +1286,42 @@ impl Player {
                 sink.play();
             }
         }
+        if metronome_was_playing {
+            if let Some(sink) = &self.metronome_sink {
+                sink.play();
+            }
+        }
+        Ok(())
+    }
+
+    fn set_metronome(&mut self, enabled: bool, bpm: f32) -> Result<(), String> {
+        if self.output_test_sink.is_some() {
+            return Err("wait for the audio output test to finish".to_string());
+        }
+        if !enabled {
+            self.metronome_sink = None;
+            self.metronome_bpm = None;
+            return Ok(());
+        }
+        let buffer = Arc::new(metronome_buffer(self.output_sample_rate, bpm)?);
+        let source = LoopRegion::new(
+            buffer.clone(),
+            0,
+            0,
+            buffer.frames(),
+            true,
+            Arc::new(AtomicUsize::new(0)),
+        );
+        let sink = routed_sink(
+            &self.output_mixer,
+            self.output_sample_rate,
+            source,
+            0.5,
+            1.0,
+        )?;
+        sink.play();
+        self.metronome_sink = Some(sink);
+        self.metronome_bpm = Some(bpm);
         Ok(())
     }
 
@@ -1261,6 +1365,15 @@ impl Player {
                 current.pause();
             }
         }
+        let metronome_was_playing = self
+            .metronome_sink
+            .as_ref()
+            .is_some_and(|current| !current.is_paused() && !current.empty());
+        if metronome_was_playing {
+            if let Some(metronome) = &self.metronome_sink {
+                metronome.pause();
+            }
+        }
         if let Some(track) = self.track.as_mut() {
             track.resume_frame = track.cursor.load(Ordering::Relaxed);
         }
@@ -1268,6 +1381,7 @@ impl Player {
         // after saving its exact frame, then recreate it when the test ends.
         self.sink = None;
         self.output_test_resume_playback = was_playing;
+        self.output_test_resume_metronome = metronome_was_playing;
         sink.play();
         self.output_test_sink = Some(sink);
         crate::audio_log::write(&format!(
@@ -1280,12 +1394,18 @@ impl Player {
     fn finish_output_test(&mut self) {
         self.output_test_sink = None;
         let resume = std::mem::replace(&mut self.output_test_resume_playback, false);
+        let resume_metronome = std::mem::replace(&mut self.output_test_resume_metronome, false);
         let (left_peak_pct, right_peak_pct) = self.output_meter.take_percentages();
         crate::audio_log::write(&format!(
             "output_test_finished left_peak_pct={left_peak_pct:.2} right_peak_pct={right_peak_pct:.2} resume_playback={resume}"
         ));
         if resume {
             let _ = self.play();
+        }
+        if resume_metronome {
+            if let Some(sink) = &self.metronome_sink {
+                sink.play();
+            }
         }
     }
 
@@ -1993,6 +2113,11 @@ pub(crate) enum EngineCmd {
         volume_pct: f32,
         reply: Reply,
     },
+    SetMetronome {
+        enabled: bool,
+        bpm: f32,
+        reply: Reply,
+    },
     SetSpeed {
         speed_pct: f32,
         reply: Reply,
@@ -2126,6 +2251,13 @@ impl Engine {
                 }
                 EngineCmd::SetVolume { volume_pct, reply } => {
                     let _ = reply.send(self.cmd_volume(volume_pct));
+                }
+                EngineCmd::SetMetronome {
+                    enabled,
+                    bpm,
+                    reply,
+                } => {
+                    let _ = reply.send(self.cmd_set_metronome(enabled, bpm));
                 }
                 EngineCmd::SetSpeed { speed_pct, reply } => {
                     let _ = reply.send(self.ensure().and_then(|p| p.set_speed(speed_pct)));
@@ -2276,6 +2408,15 @@ impl Engine {
     fn cmd_test_output(&mut self, selection: OutputSelection) -> Result<PlayerStatus, String> {
         self.cmd_set_output(selection)?;
         self.ensure()?.start_output_test()?;
+        Ok(self.status())
+    }
+
+    fn cmd_set_metronome(&mut self, enabled: bool, bpm: f32) -> Result<PlayerStatus, String> {
+        if enabled {
+            self.ensure()?.set_metronome(true, bpm)?;
+        } else if let Some(player) = self.player.as_mut() {
+            player.set_metronome(false, bpm)?;
+        }
         Ok(self.status())
     }
 
@@ -2596,6 +2737,14 @@ impl EngineClient {
 
     pub fn set_volume(&self, volume_pct: f32) -> Result<PlayerStatus, String> {
         self.call(|reply| EngineCmd::SetVolume { volume_pct, reply })
+    }
+
+    pub fn set_metronome(&self, enabled: bool, bpm: f32) -> Result<PlayerStatus, String> {
+        self.call(|reply| EngineCmd::SetMetronome {
+            enabled,
+            bpm,
+            reply,
+        })
     }
 
     pub fn set_speed(&self, speed_pct: f32) -> Result<PlayerStatus, String> {

@@ -1,0 +1,70 @@
+name: Build Windows x64 installer
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to build (for example, v0.6.0)
+        required: true
+        default: v0.6.0
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Check out release source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+          fetch-depth: 0
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 12.9.1
+
+      - name: Install Rust MSVC toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Install NSIS
+        shell: pwsh
+        run: |
+          if (-not (Get-Command makensis.exe -ErrorAction SilentlyContinue)) {
+            choco install nsis --yes --no-progress
+          }
+
+      - name: Build and validate Windows installer
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          $version = (Get-Content -LiteralPath "src-tauri\tauri.conf.json" -Raw | ConvertFrom-Json).version
+          if ("v$version" -ne $env:RELEASE_TAG) {
+            throw "Release tag $($env:RELEASE_TAG) does not match app version $version."
+          }
+          .\scripts\build.ps1
+          if ($LASTEXITCODE -ne 0) { throw "Windows installer build failed." }
+          $installer = "dist\installers\oLooper-$version-windows-x64-setup.exe"
+          if (-not (Test-Path -LiteralPath $installer) -or (Get-Item -LiteralPath $installer).Length -eq 0) {
+            throw "Expected Windows installer was not generated: $installer"
+          }
+
+      - name: Attach installer to the GitHub release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          $version = (Get-Content -LiteralPath "src-tauri\tauri.conf.json" -Raw | ConvertFrom-Json).version
+          gh release upload $env:RELEASE_TAG "dist\installers\oLooper-$version-windows-x64-setup.exe" --clobber

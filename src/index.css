@@ -28,6 +28,12 @@ html, body, #root {
   -webkit-font-smoothing: antialiased;
 }
 
+html.olooper-library-pointer-drag,
+html.olooper-library-pointer-drag * {
+  -webkit-user-select: none !important;
+  user-select: none !important;
+}
+
 /* Scrollbar styling */
 ::-webkit-scrollbar {
   width: 6px;

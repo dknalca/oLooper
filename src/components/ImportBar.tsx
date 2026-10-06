@@ -36,6 +36,7 @@ export default function ImportBar({ onImported }: Props) {
   const [elapsed, setElapsed] = useState(0);
   const [notice, setNotice] = useState<string | null>(null);
   const cancelQueue = useRef(false);
+  const internalTrackDrag = useRef(false);
 
   const startProgress = (detail: string) => setProgress({
     job_id: "pending",
@@ -84,6 +85,26 @@ export default function ImportBar({ onImported }: Props) {
   }, []);
 
   useEffect(() => {
+    let releaseTimer = 0;
+    const trackDragStarted = () => {
+      window.clearTimeout(releaseTimer);
+      internalTrackDrag.current = true;
+      setDragging(false);
+    };
+    const trackDragEnded = () => {
+      window.clearTimeout(releaseTimer);
+      releaseTimer = window.setTimeout(() => { internalTrackDrag.current = false; }, 500);
+    };
+    window.addEventListener("olooper:library-internal-drag-start", trackDragStarted);
+    window.addEventListener("olooper:library-internal-drag-end", trackDragEnded);
+    return () => {
+      window.clearTimeout(releaseTimer);
+      window.removeEventListener("olooper:library-internal-drag-start", trackDragStarted);
+      window.removeEventListener("olooper:library-internal-drag-end", trackDragEnded);
+    };
+  }, []);
+
+  useEffect(() => {
     if (startedAt === null || progress?.done) return;
     const interval = window.setInterval(() => setElapsed(Math.floor((Date.now() - startedAt) / 1000)), 1000);
     return () => window.clearInterval(interval);
@@ -94,6 +115,7 @@ export default function ImportBar({ onImported }: Props) {
     let off: (() => void) | undefined;
     getCurrentWebview()
       .onDragDropEvent((event) => {
+        if (internalTrackDrag.current) return;
         if (event.payload.type === "over") {
           setDragging(true);
         } else if (event.payload.type === "drop") {
@@ -322,9 +344,9 @@ export default function ImportBar({ onImported }: Props) {
         </div>
       )}
 
-      {notice && <div className="fixed right-4 top-14 z-[80] rounded border border-success/40 bg-surface px-4 py-3 text-xs text-success shadow-xl" role="status">{notice}</div>}
+      {notice && <div className="fixed left-1/2 top-12 z-[80] -translate-x-1/2 rounded border border-success/40 bg-surface px-4 py-3 text-xs text-success shadow-xl" role="status">{notice}</div>}
 
-      <div className="flex items-center gap-2 px-4 py-2 bg-surface border-t border-border">
+      <div className="flex h-8 shrink-0 items-center gap-1 border-l border-border pl-2">
         <BrowseBtn
           onClick={() => browseAndImport(importSwfAndWait, [
             { name: "Flash files", extensions: ["swf"] },
@@ -345,22 +367,20 @@ export default function ImportBar({ onImported }: Props) {
           label="Audio"
         />
 
-        <div className="flex-1" />
-
         {progress && !progress.done && (
           <div className="flex items-center gap-2">
-            <span className="text-[10px] text-accent animate-pulse">{progress.stage}</span>
+            <span className="max-w-24 truncate text-[9px] text-accent animate-pulse">{progress.stage}</span>
             {progress.total > 0 && (
               <span className="text-[10px] text-text-secondary">{progress.current}/{progress.total}</span>
             )}
             {busy && (
-              <button onClick={requestCancel} className="text-[10px] text-danger hover:text-danger/80 transition-colors">Cancel</button>
+              <button onClick={requestCancel} className="text-[9px] text-danger hover:text-danger/80 transition-colors">×</button>
             )}
           </div>
         )}
 
         {dragCount !== null && (
-          <span className="text-[10px] text-success">+{dragCount} imported</span>
+          <span className="text-[9px] text-success">+{dragCount}</span>
         )}
         {report && report.added > 0 && (
           <span className="text-[10px] text-text-secondary">
@@ -370,7 +390,7 @@ export default function ImportBar({ onImported }: Props) {
         {error && (
           <div className="flex min-w-0 items-center gap-1" role="alert">
             <span
-              className={`max-w-48 truncate text-[10px] ${error === "already in library" ? "text-text-secondary" : "text-danger"}`}
+              className={`max-w-20 truncate text-[9px] ${error === "already in library" ? "text-text-secondary" : "text-danger"}`}
               title={error}
             >
               {error}
@@ -380,7 +400,7 @@ export default function ImportBar({ onImported }: Props) {
       </div>
 
       {progress && files.length > 0 && (
-        <div className="border-t border-border/50 bg-surface/80 px-4 py-2">
+        <div className="fixed right-3 top-12 z-[80] w-[min(28rem,calc(100vw-1.5rem))] rounded-lg border border-border bg-surface px-4 py-2 shadow-xl">
           <div className="flex items-center justify-between mb-1.5">
             <div className="flex items-center gap-2">
               <span className="text-[10px] text-text-secondary">Importing</span>

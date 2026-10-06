@@ -216,6 +216,24 @@ fn write_audio_tag(path: &Path, tag: &Tag) -> Result<(), String> {
     }
 }
 
+pub(super) fn copy_wav_id3_metadata_to_mp3(
+    source: &Path,
+    destination: &Path,
+) -> Result<(), String> {
+    if !is_wave_file(source)? {
+        return Err("audio conversion metadata source is not a WAV file".to_string());
+    }
+    if destination
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_none_or(|extension| !extension.eq_ignore_ascii_case("mp3"))
+    {
+        return Err("audio conversion metadata target is not an MP3 file".to_string());
+    }
+    let tag = read_audio_tag(source)?.tag;
+    write_audio_tag(destination, &tag)
+}
+
 fn is_wave_file(path: &Path) -> Result<bool, String> {
     let mut file =
         File::open(path).map_err(|error| format!("cannot inspect audio file: {error}"))?;
@@ -1904,6 +1922,66 @@ mod tests {
                 .data,
             original_markers2
         );
+    }
+
+    #[test]
+    fn wav_to_mp3_metadata_copy_keeps_cues_saved_loops_and_bpm() {
+        let root = tempfile::tempdir().unwrap();
+        let wav_path = root.path().join("practice.wav");
+        let mp3_path = root.path().join("practice.mp3");
+        fs::write(&wav_path, wav_with_ramp(8_000)).unwrap();
+
+        let source_metadata = full_metadata();
+        let mut legacy =
+            parse_markers(&build_markers(&source_metadata, 1_000, None).unwrap()).unwrap();
+        legacy.loops[2] = marker_entry(Some(125), Some(875), LOOP_COLOR, 3, true).unwrap();
+        let mut tag = Tag::new();
+        tag.add_frame(EncapsulatedObject {
+            mime_type: "application/octet-stream".to_string(),
+            filename: String::new(),
+            description: MARKERS_DESCRIPTION.to_string(),
+            data: serialize_existing_markers(&legacy),
+        });
+        tag.add_frame(EncapsulatedObject {
+            mime_type: "application/octet-stream".to_string(),
+            filename: String::new(),
+            description: MARKERS2_DESCRIPTION.to_string(),
+            data: build_markers2(&source_metadata, 1_000, None).unwrap(),
+        });
+        tag.set_text("TBPM", "123.5");
+        tag.write_to_path(&wav_path, Version::Id3v23).unwrap();
+
+        let expected = read_audio_file(&wav_path).unwrap().metadata;
+        assert_eq!(
+            expected.loops.iter().find(|saved| saved.slot == 3),
+            Some(&SeratoLoop {
+                slot: 3,
+                label: "Loop 3".to_string(),
+                start_ms: 125,
+                end_ms: 875,
+            })
+        );
+        let source_bytes = fs::read(&wav_path).unwrap();
+        let bytes = source_bytes.clone();
+        let decoded = crate::player::decode_bytes(&bytes).unwrap();
+        let encoded = crate::audio_conversion::wav_pcm_to_mp3_320(&decoded).unwrap();
+        fs::write(&mp3_path, encoded).unwrap();
+        copy_wav_id3_metadata_to_mp3(&wav_path, &mp3_path).unwrap();
+        write_audio_file(&mp3_path, &expected, 1_000).unwrap();
+
+        let converted = read_audio_file(&mp3_path).unwrap().metadata;
+        assert_eq!(converted.cues, expected.cues);
+        assert_eq!(
+            converted.loops.iter().find(|saved| saved.slot == 3),
+            Some(&SeratoLoop {
+                slot: 3,
+                label: "Loop 3".to_string(),
+                start_ms: 125,
+                end_ms: 875,
+            })
+        );
+        assert_eq!(converted.bpm, Some(123.5));
+        assert_eq!(fs::read(&wav_path).unwrap(), source_bytes);
     }
 
     #[test]

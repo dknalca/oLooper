@@ -7,10 +7,12 @@ import ImportBar from "./components/ImportBar";
 import TablistCatalog from "./components/TablistCatalog";
 import MidiSettingsDialog, { MIDI_ACTIONS } from "./components/MidiSettingsDialog";
 import AudioSettingsDialog from "./components/AudioSettingsDialog";
+import StartupIntro from "./components/StartupIntro";
 import useKeyboardShortcuts from "./hooks/useKeyboardShortcuts";
 import {
   libraryRandomTrack,
   libraryList,
+  libraryGroupCover,
   libraryMarkPlayed,
   audioSetOutput,
   listenAppMenuCommand,
@@ -96,11 +98,13 @@ function sameMidiBinding(left: MidiBinding, right: MidiBinding): boolean {
 export default function App() {
   useKeyboardShortcuts();
   const [libraryReady, setLibraryReady] = useState(false);
+  const [startupIntroDone, setStartupIntroDone] = useState(false);
   const [refreshKey, setRefreshKey] = useState(0);
   const [playerStatus, setPlayerStatus] = useState<PlayerStatus | null>(null);
   const [activeTrackId, setActiveTrackId] = useState<number | null>(null);
   const [trackOpenGeneration, setTrackOpenGeneration] = useState(0);
   const [activeTrack, setActiveTrack] = useState<Track | null>(null);
+  const [activeCover, setActiveCover] = useState<string | null>(null);
   const [trackNavigator, setTrackNavigator] = useState<TrackNavigator | null>(null);
   const [libraryView, setLibraryView] = useState<"local" | "tablist">("local");
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
@@ -121,6 +125,7 @@ export default function App() {
   midiLearningActionRef.current = midiLearningAction;
 
   const onLibraryReady = useCallback(() => setLibraryReady(true), []);
+  const finishStartupIntro = useCallback(() => setStartupIntroDone(true), []);
 
   useEffect(() => {
     audioSetOutput(audioSelection)
@@ -145,6 +150,30 @@ export default function App() {
     setPlayerStatus(status);
     setTrackOpenGeneration((generation) => generation + 1);
   }, []);
+
+  useEffect(() => {
+    const updateActiveBpm = (event: Event) => {
+      const { trackId, bpm } = (event as CustomEvent<{ trackId: number; bpm: number }>).detail;
+      if (trackId === activeTrackId) {
+        setActiveTrack((current) => current?.id === trackId ? { ...current, bpm } : current);
+      }
+    };
+    window.addEventListener("olooper:track-bpm", updateActiveBpm);
+    return () => window.removeEventListener("olooper:track-bpm", updateActiveBpm);
+  }, [activeTrackId]);
+
+  useEffect(() => {
+    if (!playerStatus?.loaded || !activeTrack || activeTrack.source_type === "custom") {
+      setActiveCover(null);
+      return;
+    }
+    let cancelled = false;
+    setActiveCover(null);
+    libraryGroupCover(activeTrack.source_hash)
+      .then((cover) => { if (!cancelled) setActiveCover(cover); })
+      .catch(() => { if (!cancelled) setActiveCover(null); });
+    return () => { cancelled = true; };
+  }, [activeTrack?.source_hash, activeTrack?.source_type, playerStatus?.loaded]);
 
   const registerTrackNavigator = useCallback((navigate: TrackNavigator | null) => {
     setTrackNavigator(() => navigate);
@@ -179,6 +208,9 @@ export default function App() {
     setActiveTrack(track);
     setPlayerStatus(playing);
     setTrackOpenGeneration((current) => current + 1);
+    window.dispatchEvent(new CustomEvent("olooper:reveal-library-track", {
+      detail: { trackId: track.id, sourceHash: track.source_hash },
+    }));
   }, [activeTrackId]);
 
   const playFirstLibraryTrack = useCallback(async () => {
@@ -349,17 +381,19 @@ export default function App() {
 
   return (
     <div className="h-screen flex flex-col bg-app text-text overflow-hidden">
-      <TopBar onLibraryReady={onLibraryReady} playing={playerStatus?.playing ?? false} onAudioOptions={() => setAudioOptionsOpen(true)} />
+      <TopBar onLibraryReady={onLibraryReady} playing={playerStatus?.playing ?? false} trackBpm={activeTrack?.bpm ?? null} onAudioOptions={() => setAudioOptionsOpen(true)}>
+        <ImportBar onImported={onImported} />
+      </TopBar>
 
       <main className="flex flex-1 min-h-0 flex-col">
         <div className="h-1/5 min-h-36 shrink-0 p-3">
-          <Waveform refreshKey={refreshKey} status={playerStatus} trackTitle={activeTrack?.title ?? null} loopEditing={loopEditing} onStatusChange={setPlayerStatus} />
+          <Waveform refreshKey={refreshKey} status={playerStatus} trackTitle={activeTrack?.title ?? null} trackCover={activeCover} trackId={activeTrack?.id ?? null} showCover={playerStatus?.loaded === true && activeTrack !== null} loopEditing={loopEditing} onStatusChange={setPlayerStatus} />
         </div>
         <Player
           status={playerStatus}
           trackId={activeTrackId}
           trackOpenGeneration={trackOpenGeneration}
-          canRandom={libraryReady && activeTrackId !== null}
+          canRandom={libraryReady}
           onRandomTrack={playRandomTrack}
           canNavigateTracks={trackNavigator !== null}
           onPreviousTrack={() => trackNavigator?.(-1)}
@@ -369,7 +403,6 @@ export default function App() {
           onStatusChange={setPlayerStatus}
         />
         <section className="flex min-h-0 flex-1 flex-col border-t border-border">
-          <ImportBar onImported={onImported} />
           <div className="flex shrink-0 items-center gap-1 border-b border-border bg-surface px-3 pt-1.5" role="tablist" aria-label="Library views">
             <button
               role="tab"
@@ -486,6 +519,7 @@ export default function App() {
         onOutputTestStarted={refreshPlayerAfterAudioTest}
         onClose={() => setAudioOptionsOpen(false)}
       />
+      {!startupIntroDone && <StartupIntro onComplete={finishStartupIntro} />}
     </div>
   );
 }

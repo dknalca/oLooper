@@ -23,8 +23,10 @@ fn import_unmark_cancelled(job_id: &str) {
 }
 
 pub mod analysis;
+pub mod audio_conversion;
 pub mod audio_log;
 pub mod autoloop;
+pub mod drag_out;
 pub mod import;
 pub mod library;
 pub mod midi;
@@ -453,6 +455,7 @@ pub fn run() {
             player_pause,
             player_stop,
             player_set_volume,
+            player_set_metronome,
             player_set_speed,
             player_set_pitch_lock,
             player_set_loop,
@@ -470,6 +473,17 @@ pub fn run() {
             library_restore,
             library_status,
             library_list,
+            library_drag_track_out,
+            library_convert_wav_to_mp3_320,
+            library_looper_order,
+            library_reorder_loopers,
+            library_playlists,
+            library_create_playlist,
+            library_rename_playlist,
+            library_remove_playlist,
+            library_add_track_to_playlist,
+            library_remove_track_from_playlist,
+            library_reorder_playlist,
             library_random_track,
             library_tablist_import_counts,
             library_update_cue_loop,
@@ -565,6 +579,15 @@ fn player_stop(audio: Audio<'_>) -> Result<player::PlayerStatus, String> {
 #[tauri::command]
 fn player_set_volume(volume_pct: f32, audio: Audio<'_>) -> Result<player::PlayerStatus, String> {
     audio.set_volume(volume_pct)
+}
+
+#[tauri::command]
+fn player_set_metronome(
+    enabled: bool,
+    bpm: f32,
+    audio: Audio<'_>,
+) -> Result<player::PlayerStatus, String> {
+    audio.set_metronome(enabled, bpm)
 }
 
 #[tauri::command]
@@ -765,6 +788,74 @@ fn library_status(db: Db<'_>) -> Result<serde_json::Value, String> {
 fn library_list(db: Db<'_>) -> Result<Vec<library::Track>, String> {
     let g = self::db(&db)?;
     require_lib(&g)?.list_tracks()
+}
+
+#[tauri::command]
+fn library_drag_track_out(id: i64, database: Db<'_>) -> Result<(), String> {
+    let path = require_lib(&db(&database)?)?.managed_audio_path_for_track(id)?;
+    drag_out::start_file_drag_out(&path)
+}
+
+#[tauri::command]
+fn library_convert_wav_to_mp3_320(id: i64, database: Db<'_>) -> Result<library::Track, String> {
+    require_lib(&db(&database)?)?.convert_wav_to_mp3_320(id)
+}
+
+#[tauri::command]
+fn library_looper_order(database: Db<'_>) -> Result<Vec<String>, String> {
+    require_lib(&db(&database)?)?.list_looper_order()
+}
+
+#[tauri::command]
+fn library_reorder_loopers(source_hashes: Vec<String>, database: Db<'_>) -> Result<(), String> {
+    require_lib(&db(&database)?)?.reorder_loopers(&source_hashes)
+}
+
+#[tauri::command]
+fn library_playlists(database: Db<'_>) -> Result<Vec<library::Playlist>, String> {
+    require_lib(&db(&database)?)?.list_playlists()
+}
+
+#[tauri::command]
+fn library_create_playlist(name: String, database: Db<'_>) -> Result<library::Playlist, String> {
+    require_lib(&db(&database)?)?.create_playlist(&name)
+}
+
+#[tauri::command]
+fn library_rename_playlist(id: i64, name: String, database: Db<'_>) -> Result<(), String> {
+    require_lib(&db(&database)?)?.rename_playlist(id, &name)
+}
+
+#[tauri::command]
+fn library_remove_playlist(id: i64, database: Db<'_>) -> Result<bool, String> {
+    require_lib(&db(&database)?)?.remove_playlist(id)
+}
+
+#[tauri::command]
+fn library_add_track_to_playlist(
+    playlist_id: i64,
+    track_id: i64,
+    database: Db<'_>,
+) -> Result<bool, String> {
+    require_lib(&db(&database)?)?.add_track_to_playlist(playlist_id, track_id)
+}
+
+#[tauri::command]
+fn library_remove_track_from_playlist(
+    playlist_id: i64,
+    track_id: i64,
+    database: Db<'_>,
+) -> Result<bool, String> {
+    require_lib(&db(&database)?)?.remove_track_from_playlist(playlist_id, track_id)
+}
+
+#[tauri::command]
+fn library_reorder_playlist(
+    playlist_id: i64,
+    track_ids: Vec<i64>,
+    database: Db<'_>,
+) -> Result<(), String> {
+    require_lib(&db(&database)?)?.reorder_playlist(playlist_id, &track_ids)
 }
 
 #[tauri::command]

@@ -66,6 +66,10 @@ export function playerSetVolume(volumePct: number): Promise<PlayerStatus> {
   return invoke<PlayerStatus>("player_set_volume", { volumePct });
 }
 
+export function playerSetMetronome(enabled: boolean, bpm: number): Promise<PlayerStatus> {
+  return invoke<PlayerStatus>("player_set_metronome", { enabled, bpm });
+}
+
 export function playerSetSpeed(speedPct: number): Promise<PlayerStatus> {
   return invoke<PlayerStatus>("player_set_speed", { speedPct });
 }
@@ -296,6 +300,56 @@ export function libraryRestore(root: string | null): Promise<string | null> {
 
 export function libraryList(): Promise<Track[]> {
   return invoke<Track[]>("library_list");
+}
+
+export function libraryDragTrackOut(id: number): Promise<void> {
+  return invoke<void>("library_drag_track_out", { id });
+}
+
+export function libraryConvertWavToMp3_320(id: number): Promise<Track> {
+  return invoke<Track>("library_convert_wav_to_mp3_320", { id });
+}
+
+export function libraryLooperOrder(): Promise<string[]> {
+  return invoke<string[]>("library_looper_order");
+}
+
+export function libraryReorderLoopers(sourceHashes: string[]): Promise<void> {
+  return invoke<void>("library_reorder_loopers", { sourceHashes });
+}
+
+export interface Playlist {
+  id: number;
+  name: string;
+  track_ids: number[];
+}
+
+export function libraryPlaylists(): Promise<Playlist[]> {
+  return invoke<Playlist[]>("library_playlists");
+}
+
+export function libraryCreatePlaylist(name: string): Promise<Playlist> {
+  return invoke<Playlist>("library_create_playlist", { name });
+}
+
+export function libraryRenamePlaylist(id: number, name: string): Promise<void> {
+  return invoke<void>("library_rename_playlist", { id, name });
+}
+
+export function libraryRemovePlaylist(id: number): Promise<boolean> {
+  return invoke<boolean>("library_remove_playlist", { id });
+}
+
+export function libraryAddTrackToPlaylist(playlistId: number, trackId: number): Promise<boolean> {
+  return invoke<boolean>("library_add_track_to_playlist", { playlistId, trackId });
+}
+
+export function libraryRemoveTrackFromPlaylist(playlistId: number, trackId: number): Promise<boolean> {
+  return invoke<boolean>("library_remove_track_from_playlist", { playlistId, trackId });
+}
+
+export function libraryReorderPlaylist(playlistId: number, trackIds: number[]): Promise<void> {
+  return invoke<void>("library_reorder_playlist", { playlistId, trackIds });
 }
 
 export function libraryRandomTrack(excludeId: number | null): Promise<Track | null> {

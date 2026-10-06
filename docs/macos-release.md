@@ -10,9 +10,20 @@ Silicon arm64):
 
 The release build requires macOS, Xcode, and rustup. The build script installs
 the Rust targets for both architectures and invokes Tauri with
-`--target universal-apple-darwin`. Use `./scripts/build.sh --native` only when a
-single-architecture release build is specifically needed; `--dev` remains a
-native-architecture debug build.
+`--target universal-apple-darwin`. For faster architecture-specific builds and
+testing, build Intel or Apple Silicon separately:
+
+```sh
+./scripts/build.sh --x64       # outputs oLooper-x64.app
+./scripts/package-dmg.sh --x64
+
+./scripts/build.sh --arm64     # outputs oLooper-arm64.app
+./scripts/package-dmg.sh --arm64
+```
+
+The explicit target flags can cross-compile from either Mac architecture.
+`./scripts/build.sh --native` remains a single-architecture build for the host;
+`--dev` remains a native-architecture debug build.
 
 The bundle declares macOS 11.0 (Big Sur) as its minimum and the build sets
 `MACOSX_DEPLOYMENT_TARGET=11.0`. Test the release on macOS 11 before claiming
@@ -21,13 +32,14 @@ runtime compatibility; previous releases were verified on macOS 12.
 The result is `dist/oLooper-<version>-unsigned.dmg`. It is not suitable for
 normal Gatekeeper distribution until signed and notarized.
 
-Verify a built app contains both architectures with:
+Verify a Universal bundle contains both architectures with:
 
 ```sh
 lipo -archs oLooper.app/Contents/MacOS/oLooper
 ```
 
-The output should include both `x86_64` and `arm64`.
+The output should include both `x86_64` and `arm64`. A single-architecture
+bundle contains only the architecture selected by its build flag.
 
 With a Developer ID Application identity installed outside this repository:
 

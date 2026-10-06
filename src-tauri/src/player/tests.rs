@@ -581,3 +581,33 @@ fn frame_remap_scales_across_buffers() {
     assert_eq!(remap_frame(0, 100, 200), 0);
     assert_eq!(remap_frame(7, 0, 200), 0);
 }
+
+#[test]
+fn metronome_buffer_has_four_beats_and_an_accented_downbeat() {
+    let buffer = metronome_buffer(48_000, 120.0).unwrap();
+    assert_eq!(buffer.channels, 2);
+    assert_eq!(buffer.rate, 48_000);
+    assert_eq!(buffer.frames(), 96_000);
+
+    let beat_frames = 24_000;
+    let click_frames = 48_000 * 32 / 1000;
+    let peak = |beat: usize| {
+        buffer.samples[beat * beat_frames * 2..(beat * beat_frames + click_frames) * 2]
+            .iter()
+            .map(|sample| sample.unsigned_abs())
+            .max()
+            .unwrap()
+    };
+    assert!(peak(0) > peak(1) * 3 / 2);
+    assert!(peak(1) > 0);
+    assert!(buffer.samples[click_frames * 2..beat_frames * 2]
+        .iter()
+        .all(|sample| *sample == 0));
+}
+
+#[test]
+fn metronome_rejects_invalid_tempos() {
+    assert!(metronome_buffer(48_000, 0.0).is_err());
+    assert!(metronome_buffer(48_000, 301.0).is_err());
+    assert!(metronome_buffer(0, 120.0).is_err());
+}

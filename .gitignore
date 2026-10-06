@@ -3,6 +3,7 @@ node_modules/
 dist/
 src-tauri/target/
 oLooper.app/
+oLooper-*.app/
 
 # Tauri generated (icons/ IS committed: required at compile time)
 src-tauri/gen/

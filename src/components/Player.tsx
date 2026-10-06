@@ -54,6 +54,7 @@ export default function Player({ status: st, trackId, trackOpenGeneration, canRa
   const [randomInterval, setRandomInterval] = useState<"2" | "5" | "custom">("2");
   const [customMinutes, setCustomMinutes] = useState("10");
   const [randomRemaining, setRandomRemaining] = useState<number | null>(null);
+  const [randomResetGeneration, setRandomResetGeneration] = useState(0);
   const minutes = randomInterval === "custom" ? Number(customMinutes) : Number(randomInterval);
   const validInterval = Number.isFinite(minutes) && minutes >= 1 && minutes <= 1440;
 
@@ -89,7 +90,7 @@ export default function Player({ status: st, trackId, trackOpenGeneration, canRa
       window.clearTimeout(timeout);
       window.clearInterval(ticker);
     };
-  }, [randomEnabled, canRandom, validInterval, minutes, onRandomTrack]);
+  }, [randomEnabled, canRandom, validInterval, minutes, onRandomTrack, randomResetGeneration]);
 
   // CUEs live in the audio file, not the private catalog DB.
   const [cues, setCues] = useState<SeratoCue[]>([]);
@@ -129,6 +130,16 @@ export default function Player({ status: st, trackId, trackOpenGeneration, canRa
       }).catch((e) => setError(String(e))),
     [onStatusChange],
   );
+
+  const playNextRandom = async () => {
+    try {
+      await onRandomTrack();
+      setError(null);
+      if (randomEnabled) setRandomResetGeneration((generation) => generation + 1);
+    } catch (cause) {
+      setError(`Random track: ${String(cause)}`);
+    }
+  };
 
   // Poll native position at 4 Hz while playing, and also while a
   // background job (decode/stretch) is pending so progress and async
@@ -373,6 +384,9 @@ export default function Player({ status: st, trackId, trackOpenGeneration, canRa
               <polygon points="5,2 13,8 5,14" />
               <rect x="2.5" y="2" width="1.5" height="12" />
             </svg>
+          </TransportBtn>
+          <TransportBtn onClick={() => void playNextRandom()} disabled={!canRandom} title="Next random loop">
+            <span className="text-[11px] font-bold">R</span>
           </TransportBtn>
         </div>
 

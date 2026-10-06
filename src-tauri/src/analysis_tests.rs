@@ -24,11 +24,43 @@ fn click_track(bpm: f64, rate: u32) -> LoopBuffer {
     buf_from_mono(s, rate)
 }
 
+/// A four-beat phrase with a strong downbeat and quieter off-beats.
+fn accented_click_track(bpm: f64, rate: u32) -> LoopBuffer {
+    let period = (60.0 * rate as f64 / bpm).round() as usize;
+    let n = rate as usize * 12;
+    let mut samples = vec![0i16; n];
+    let mut beat = 0;
+    let mut i = 0;
+    while i < n {
+        samples[i] = match beat % 4 {
+            0 => i16::MAX,
+            2 => 22_000,
+            _ => 10_000,
+        };
+        beat += 1;
+        i += period;
+    }
+    buf_from_mono(samples, rate)
+}
+
 #[test]
 fn click_120bpm_estimated() {
     let est = estimate(&click_track(120.0, 44100)).expect("no estimate");
     assert!((est.bpm - 120.0).abs() < 1.0, "got {}", est.bpm);
-    assert!(est.confidence > 0.3);
+    assert!(
+        est.confidence < 0.5,
+        "unaccented clicks are tempo-ambiguous: {est:?}"
+    );
+}
+
+#[test]
+fn accented_four_beat_phrase_confidently_estimates_tempo() {
+    let est = estimate(&accented_click_track(120.0, 44100)).expect("no estimate");
+    assert!((est.bpm - 120.0).abs() < 1.0, "got {}", est.bpm);
+    assert!(
+        est.confidence >= 0.5,
+        "distinct accents should resolve tempo: {est:?}"
+    );
 }
 
 #[test]

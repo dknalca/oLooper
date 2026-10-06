@@ -5,7 +5,7 @@
 //! and row writes are transactional. Removing a track deletes its library copy,
 //! but never its original source file.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -19,7 +19,7 @@ use crate::import::swf::Sound;
 mod serato;
 
 /// Current schema version (`PRAGMA user_version`).
-const SCHEMA_VERSION: i32 = 6;
+const SCHEMA_VERSION: i32 = 8;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Track {
@@ -57,6 +57,15 @@ pub struct Track {
     pub favorite: bool,
     pub tags: String,
     pub last_played_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Playlist {
+    pub id: i64,
+    pub name: String,
+    /// Track IDs in user-defined playback order. Playlist membership never
+    /// changes a track's owning group or copies its audio file.
+    pub track_ids: Vec<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -151,6 +160,37 @@ pub fn sanitize_name(raw: &str) -> String {
     } else {
         s
     }
+}
+
+fn playlist_name(raw: &str) -> Result<String, String> {
+    if raw.trim().is_empty() {
+        return Err("playlist name cannot be empty".to_string());
+    }
+    Ok(sanitize_name(raw))
+}
+
+fn compact_playlist_positions(
+    tx: &rusqlite::Transaction<'_>,
+    playlist_id: i64,
+) -> Result<(), String> {
+    let mut statement = tx
+        .prepare("SELECT track_id FROM playlist_tracks WHERE playlist_id=?1 ORDER BY position")
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map([playlist_id], |row| row.get::<_, i64>(0))
+        .map_err(|error| error.to_string())?;
+    let track_ids = rows
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    drop(statement);
+    for (position, track_id) in track_ids.iter().enumerate() {
+        tx.execute(
+            "UPDATE playlist_tracks SET position=?1 WHERE playlist_id=?2 AND track_id=?3",
+            rusqlite::params![position as i64, playlist_id, track_id],
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    Ok(())
 }
 
 fn is_windows_reserved_name(name: &str) -> bool {
@@ -314,8 +354,302 @@ impl Library {
             .map_err(|e| e.to_string())
     }
 
+    pub fn list_playlists(&self) -> Result<Vec<Playlist>, String> {
+        let mut statement = self
+            .conn
+            .prepare(
+                "SELECT playlists.id,playlists.name,playlist_tracks.track_id \
+                 FROM playlists LEFT JOIN playlist_tracks \
+                   ON playlist_tracks.playlist_id=playlists.id \
+                 ORDER BY playlists.id,playlist_tracks.position",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                ))
+            })
+            .map_err(|error| error.to_string())?;
+        let mut playlists = BTreeMap::<i64, Playlist>::new();
+        for row in rows {
+            let (id, name, track_id) = row.map_err(|error| error.to_string())?;
+            let playlist = playlists.entry(id).or_insert_with(|| Playlist {
+                id,
+                name,
+                track_ids: Vec::new(),
+            });
+            if let Some(track_id) = track_id {
+                playlist.track_ids.push(track_id);
+            }
+        }
+        Ok(playlists.into_values().collect())
+    }
+
+    pub fn list_looper_order(&self) -> Result<Vec<String>, String> {
+        let mut group_statement = self
+            .conn
+            .prepare("SELECT source_hash,MIN(id) FROM tracks GROUP BY source_hash")
+            .map_err(|error| error.to_string())?;
+        let group_rows = group_statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .map_err(|error| error.to_string())?;
+        let mut groups = group_rows
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+
+        let mut order_statement = self
+            .conn
+            .prepare("SELECT source_hash,position FROM looper_order")
+            .map_err(|error| error.to_string())?;
+        let order_rows = order_statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .map_err(|error| error.to_string())?;
+        let positions = order_rows
+            .collect::<Result<BTreeMap<_, _>, _>>()
+            .map_err(|error| error.to_string())?;
+        groups.sort_by_key(
+            |(source_hash, first_track_id)| match positions.get(source_hash) {
+                Some(position) => (0u8, *position, *first_track_id),
+                None => (1u8, *first_track_id, *first_track_id),
+            },
+        );
+        Ok(groups
+            .into_iter()
+            .map(|(source_hash, _)| source_hash)
+            .collect())
+    }
+
+    pub fn reorder_loopers(&self, source_hashes: &[String]) -> Result<(), String> {
+        let unique: HashSet<_> = source_hashes.iter().cloned().collect();
+        if unique.len() != source_hashes.len() {
+            return Err("looper order contains duplicate groups".to_string());
+        }
+        let current: HashSet<_> = self.list_looper_order()?.into_iter().collect();
+        let requested: HashSet<_> = source_hashes.iter().cloned().collect();
+        if current != requested {
+            return Err("looper order must contain exactly the current groups".to_string());
+        }
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|error| error.to_string())?;
+        tx.execute("DELETE FROM looper_order", [])
+            .map_err(|error| error.to_string())?;
+        {
+            let mut insert = tx
+                .prepare("INSERT INTO looper_order(source_hash,position) VALUES (?1,?2)")
+                .map_err(|error| error.to_string())?;
+            for (position, source_hash) in source_hashes.iter().enumerate() {
+                insert
+                    .execute(rusqlite::params![source_hash, position as i64])
+                    .map_err(|error| error.to_string())?;
+            }
+        }
+        tx.commit().map_err(|error| error.to_string())
+    }
+
+    pub fn create_playlist(&self, name: &str) -> Result<Playlist, String> {
+        let name = playlist_name(name)?;
+        let now = now_secs();
+        self.conn
+            .execute(
+                "INSERT INTO playlists(name,created_at,updated_at) VALUES (?1,?2,?2)",
+                rusqlite::params![name, now],
+            )
+            .map_err(|error| format!("cannot create playlist: {error}"))?;
+        Ok(Playlist {
+            id: self.conn.last_insert_rowid(),
+            name,
+            track_ids: Vec::new(),
+        })
+    }
+
+    pub fn rename_playlist(&self, id: i64, name: &str) -> Result<(), String> {
+        let name = playlist_name(name)?;
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE playlists SET name=?1,updated_at=?2 WHERE id=?3",
+                rusqlite::params![name, now_secs(), id],
+            )
+            .map_err(|error| format!("cannot rename playlist: {error}"))?;
+        if changed == 0 {
+            return Err(format!("playlist {id} not found"));
+        }
+        Ok(())
+    }
+
+    pub fn remove_playlist(&self, id: i64) -> Result<bool, String> {
+        self.conn
+            .execute("DELETE FROM playlists WHERE id=?1", [id])
+            .map(|changed| changed == 1)
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn add_track_to_playlist(&self, playlist_id: i64, track_id: i64) -> Result<bool, String> {
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|error| error.to_string())?;
+        let playlist_exists: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM playlists WHERE id=?1)",
+                [playlist_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if !playlist_exists {
+            return Err(format!("playlist {playlist_id} not found"));
+        }
+        let track_exists: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM tracks WHERE id=?1)",
+                [track_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if !track_exists {
+            return Err(format!("track {track_id} not found"));
+        }
+        let position: i64 = tx
+            .query_row(
+                "SELECT COALESCE(MAX(position)+1,0) FROM playlist_tracks WHERE playlist_id=?1",
+                [playlist_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        let changed = tx
+            .execute(
+                "INSERT OR IGNORE INTO playlist_tracks(playlist_id,track_id,position) \
+                 VALUES (?1,?2,?3)",
+                rusqlite::params![playlist_id, track_id, position],
+            )
+            .map_err(|error| error.to_string())?;
+        if changed == 1 {
+            tx.execute(
+                "UPDATE playlists SET updated_at=?1 WHERE id=?2",
+                rusqlite::params![now_secs(), playlist_id],
+            )
+            .map_err(|error| error.to_string())?;
+        }
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(changed == 1)
+    }
+
+    pub fn remove_track_from_playlist(
+        &self,
+        playlist_id: i64,
+        track_id: i64,
+    ) -> Result<bool, String> {
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|error| error.to_string())?;
+        let changed = tx
+            .execute(
+                "DELETE FROM playlist_tracks WHERE playlist_id=?1 AND track_id=?2",
+                rusqlite::params![playlist_id, track_id],
+            )
+            .map_err(|error| error.to_string())?;
+        if changed == 1 {
+            compact_playlist_positions(&tx, playlist_id)?;
+            tx.execute(
+                "UPDATE playlists SET updated_at=?1 WHERE id=?2",
+                rusqlite::params![now_secs(), playlist_id],
+            )
+            .map_err(|error| error.to_string())?;
+        }
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(changed == 1)
+    }
+
+    pub fn reorder_playlist(&self, playlist_id: i64, track_ids: &[i64]) -> Result<(), String> {
+        let unique: HashSet<_> = track_ids.iter().copied().collect();
+        if unique.len() != track_ids.len() {
+            return Err("playlist order contains duplicate tracks".to_string());
+        }
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|error| error.to_string())?;
+        let playlist_exists: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM playlists WHERE id=?1)",
+                [playlist_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if !playlist_exists {
+            return Err(format!("playlist {playlist_id} not found"));
+        }
+        let mut statement = tx
+            .prepare("SELECT track_id FROM playlist_tracks WHERE playlist_id=?1")
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map([playlist_id], |row| row.get::<_, i64>(0))
+            .map_err(|error| error.to_string())?;
+        let current = rows
+            .collect::<Result<HashSet<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        drop(statement);
+        if current.len() != unique.len() || current != unique {
+            return Err("playlist order must contain exactly its current tracks".to_string());
+        }
+        tx.execute(
+            "DELETE FROM playlist_tracks WHERE playlist_id=?1",
+            [playlist_id],
+        )
+        .map_err(|error| error.to_string())?;
+        {
+            let mut insert = tx
+                .prepare(
+                    "INSERT INTO playlist_tracks(playlist_id,track_id,position) \
+                     VALUES (?1,?2,?3)",
+                )
+                .map_err(|error| error.to_string())?;
+            for (position, track_id) in track_ids.iter().enumerate() {
+                insert
+                    .execute(rusqlite::params![playlist_id, track_id, position as i64])
+                    .map_err(|error| error.to_string())?;
+            }
+        }
+        tx.execute(
+            "UPDATE playlists SET updated_at=?1 WHERE id=?2",
+            rusqlite::params![now_secs(), playlist_id],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.commit().map_err(|error| error.to_string())
+    }
+
     pub fn get_track(&self, id: i64) -> Result<Option<Track>, String> {
         Ok(self.list_tracks()?.into_iter().find(|t| t.id == id))
+    }
+
+    pub fn managed_audio_path_for_track(&self, id: i64) -> Result<PathBuf, String> {
+        let track = self
+            .get_track(id)?
+            .ok_or_else(|| format!("track {id} not found"))?;
+        let path = Path::new(&track.file_path)
+            .canonicalize()
+            .map_err(|error| format!("cannot resolve track audio: {error}"))?;
+        let root = self
+            .root
+            .canonicalize()
+            .map_err(|error| format!("cannot resolve library root: {error}"))?;
+        if !path.starts_with(&root) {
+            return Err("track audio is outside the managed library".to_string());
+        }
+        if !path.is_file() {
+            return Err("track audio is not a regular file".to_string());
+        }
+        Ok(path)
     }
 
     pub fn tablist_import_counts(&self) -> Result<Vec<TablistImportCount>, String> {
@@ -647,6 +981,170 @@ impl Library {
             exported += 1;
         }
         Ok(exported)
+    }
+
+    pub fn convert_wav_to_mp3_320(&self, id: i64) -> Result<Track, String> {
+        const MAX_SOURCE_BYTES: u64 = 512 * 1024 * 1024;
+        let track = self
+            .get_track(id)?
+            .ok_or_else(|| format!("track {id} not found"))?;
+        let stored_path = PathBuf::from(&track.file_path);
+        let stored_metadata = std::fs::symlink_metadata(&stored_path)
+            .map_err(|error| format!("cannot inspect WAV: {error}"))?;
+        if stored_metadata.file_type().is_symlink() {
+            return Err("cannot convert a symlinked WAV library entry".to_string());
+        }
+        let source_path = self.managed_audio_path_for_track(id)?;
+        if !source_path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("wav"))
+        {
+            return Err("only WAV library audio can be converted to MP3".to_string());
+        }
+        let source_size = std::fs::metadata(&source_path)
+            .map_err(|error| format!("cannot inspect WAV: {error}"))?
+            .len();
+        if source_size == 0 || source_size > MAX_SOURCE_BYTES {
+            return Err("WAV is empty or exceeds the 512 MiB conversion limit".to_string());
+        }
+        let source_bytes =
+            std::fs::read(&source_path).map_err(|error| format!("cannot read WAV: {error}"))?;
+        let source_buffer = crate::player::decode_bytes(&source_bytes)?;
+        if source_buffer.duration_ms() > crate::player::MAX_DURATION_MS {
+            return Err("WAV exceeds the 15 minute conversion limit".to_string());
+        }
+        let mut metadata = serato::read_audio_file(&source_path)?.metadata;
+        metadata.bpm = track.bpm.or(metadata.bpm);
+        ensure_default_serato_cue(&mut metadata);
+        let mp3_bytes = crate::audio_conversion::wav_pcm_to_mp3_320(&source_buffer)?;
+
+        let parent = source_path
+            .parent()
+            .ok_or_else(|| "WAV has no parent directory".to_string())?;
+        let stem = source_path
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .map(sanitize_name)
+            .unwrap_or_else(|| "loop".to_string());
+        let mut destination = parent.join(format!("{stem}.mp3"));
+        for suffix in 2..=10_000 {
+            if !destination.exists() {
+                break;
+            }
+            destination = parent.join(format!("{stem} ({suffix}).mp3"));
+        }
+        if destination.exists() {
+            return Err(format!("too many MP3 files named '{stem}' in this looper"));
+        }
+        let destination = self.atomic_write(&destination, &mp3_bytes)?;
+
+        let conversion_result = (|| -> Result<crate::player::LoopBuffer, String> {
+            // Copy all WAV ID3 frames first, so saved Serato loops and unrelated
+            // markers are present for the normal MP3 marker writer to preserve.
+            serato::copy_wav_id3_metadata_to_mp3(&source_path, &destination)?;
+            serato::write_audio_file(
+                &destination,
+                &metadata,
+                track.duration_ms.max(source_buffer.duration_ms() as i64),
+            )?;
+            let bytes = std::fs::read(&destination)
+                .map_err(|error| format!("cannot verify converted MP3: {error}"))?;
+            let converted = crate::player::decode_bytes(&bytes)
+                .map_err(|error| format!("converted MP3 failed validation: {error}"))?;
+            if converted.frames() == 0 || converted.channels > 2 {
+                return Err("converted MP3 has an unsupported audio layout".to_string());
+            }
+            let roundtrip = serato::read_audio_file(&destination)?.metadata;
+            if roundtrip.cues != metadata.cues || roundtrip.loops != metadata.loops {
+                return Err(
+                    "converted MP3 did not preserve Serato CUEs and saved loops".to_string()
+                );
+            }
+            Ok(converted)
+        })();
+        let converted = match conversion_result {
+            Ok(buffer) => buffer,
+            Err(error) => {
+                let _ = std::fs::remove_file(&destination);
+                return Err(error);
+            }
+        };
+
+        let duration_ms = match i64::try_from(converted.duration_ms()) {
+            Ok(duration) => duration,
+            Err(_) => {
+                let _ = std::fs::remove_file(&destination);
+                return Err("converted MP3 duration is out of range".to_string());
+            }
+        };
+        if duration_ms <= 0 {
+            let _ = std::fs::remove_file(&destination);
+            return Err("converted MP3 has no playable duration".to_string());
+        }
+        let loop_start_ms = track.loop_start_ms.clamp(0, duration_ms - 1);
+        let loop_end_ms = track.loop_end_ms.clamp(loop_start_ms + 1, duration_ms);
+        let total_frames = converted.frames() as i64;
+        let loop_start_frame = (loop_start_ms as u128 * converted.rate as u128 / 1000)
+            .min(total_frames.saturating_sub(1) as u128) as i64;
+        let loop_end_frame = (loop_end_ms as u128 * converted.rate as u128 / 1000)
+            .clamp((loop_start_frame + 1) as u128, total_frames as u128)
+            as i64;
+        let destination_string = match destination.to_str() {
+            Some(path) => path.to_string(),
+            None => {
+                let _ = std::fs::remove_file(&destination);
+                return Err("non-UTF8 MP3 path".to_string());
+            }
+        };
+
+        let quarantined = match self.quarantine_files(std::slice::from_ref(&source_path)) {
+            Ok(Some(files)) => files,
+            Ok(None) => {
+                let _ = std::fs::remove_file(&destination);
+                return Err("source WAV disappeared during conversion".to_string());
+            }
+            Err(error) => {
+                let _ = std::fs::remove_file(&destination);
+                return Err(error);
+            }
+        };
+        let update = self.conn.execute(
+            "UPDATE tracks SET file_path=?1,codec='mp3',sample_rate=?2,channels=?3,\
+             duration_ms=?4,total_frames=?5,loop_start_ms=?6,loop_end_ms=?7,\
+             loop_start_frame=?8,loop_end_frame=?9,updated_at=?10 \
+             WHERE id=?11 AND file_path=?12",
+            rusqlite::params![
+                destination_string,
+                converted.rate as i64,
+                converted.channels as i64,
+                duration_ms,
+                total_frames,
+                loop_start_ms,
+                loop_end_ms,
+                loop_start_frame,
+                loop_end_frame,
+                now_secs(),
+                id,
+                track.file_path
+            ],
+        );
+        let changed = match update {
+            Ok(changed) => changed,
+            Err(error) => {
+                self.restore_quarantined(&quarantined)?;
+                let _ = std::fs::remove_file(&destination);
+                return Err(format!("cannot update converted track: {error}"));
+            }
+        };
+        if changed != 1 {
+            self.restore_quarantined(&quarantined)?;
+            let _ = std::fs::remove_file(&destination);
+            return Err(format!("track {id} changed during conversion"));
+        }
+        self.purge_quarantined(quarantined)?;
+        self.get_track(id)?
+            .ok_or_else(|| format!("converted track {id} vanished"))
     }
 
     fn group_tracks(&self, source_hash: &str) -> Result<Vec<Track>, String> {
@@ -2024,6 +2522,37 @@ fn migrate(conn: &Connection) -> Result<(), String> {
             "UPDATE tracks SET total_frames = duration_ms * sample_rate / 1000 WHERE total_frames = 0;",
         )
         .map_err(|e| format!("migration 5→6 backfill failed: {e}"))?;
+    }
+    if v < 7 {
+        conn.execute_batch(
+            "BEGIN;
+             CREATE TABLE playlists(
+               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               name TEXT NOT NULL COLLATE NOCASE UNIQUE,
+               created_at INTEGER NOT NULL,
+               updated_at INTEGER NOT NULL);
+             CREATE TABLE playlist_tracks(
+               playlist_id INTEGER NOT NULL REFERENCES playlists(id) ON DELETE CASCADE,
+               track_id INTEGER NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
+               position INTEGER NOT NULL CHECK(position >= 0),
+               PRIMARY KEY(playlist_id,track_id),
+               UNIQUE(playlist_id,position));
+             CREATE INDEX idx_playlist_tracks_track ON playlist_tracks(track_id);
+             PRAGMA user_version = 7;
+             COMMIT;",
+        )
+        .map_err(|e| format!("migration 6→7 failed: {e}"))?;
+    }
+    if v < 8 {
+        conn.execute_batch(
+            "BEGIN;
+             CREATE TABLE looper_order(
+               source_hash TEXT PRIMARY KEY,
+               position INTEGER NOT NULL UNIQUE CHECK(position >= 0));
+             PRAGMA user_version = 8;
+             COMMIT;",
+        )
+        .map_err(|e| format!("migration 7→8 failed: {e}"))?;
     }
     Ok(())
 }
