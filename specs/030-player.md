@@ -30,8 +30,8 @@ Waveform rendering and library integration are separate specs.
 7. Keyboard shortcuts (spec 060): Space (play/pause), S (stop), arrows (seek),
    and L (loop toggle). Previous/next transport buttons move through the
    tracks shown in the selected library view. Loop enablement, AUTO detection,
-   and manual boundaries are in the collapsible Loop controls panel. PITCH LOCK
-   remains hidden.
+   and manual boundaries are in the collapsible Loop controls panel. The
+   PITCH LOCK toggle is visible beside the playback speed control.
 8. The player has four persistent CUEs. CUE 1 is fixed at the start of the track;
    CUEs 2–4 can be saved, recalled, and cleared. They are read from the audio
    file when the track opens; CUE positions are drawn on the waveform. Manual

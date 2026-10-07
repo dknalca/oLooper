@@ -4,6 +4,7 @@
 
 - Ask for the import mode each time SWF/EXE files are selected or dropped:
   extract their audio or play directly from the managed source copy.
+- Restore the **PITCH LOCK** toggle beside the pitch/speed control.
 - Confirm looper removal in an in-app dialog that lists the managed SWF/EXE,
   extracted/downloaded audio, and cover files that may be removed.
 - Delete managed container copies and extracted audio when removing the final
