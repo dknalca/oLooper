@@ -6,7 +6,7 @@
 
 use std::collections::{BTreeSet, VecDeque};
 use std::io::Cursor;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -65,13 +65,16 @@ pub enum LoopSource {
 /// or reopened while looping: wrap-around is an index reset.
 pub struct LoopRegion {
     buf: Arc<LoopBuffer>,
-    /// Sample index into `buf.samples`.
-    idx: usize,
+    /// Fractional frame position in `buf`. This is advanced in the source
+    /// domain so output-mixer resampling cannot cancel the pitch change.
+    position: f64,
+    output_channel: usize,
     start_frame: usize,
     end_frame: usize,
     enabled: bool,
     /// Current frame, mirrored for UI polling.
     cursor: Arc<AtomicUsize>,
+    speed_control: Arc<AtomicU32>,
 }
 
 impl LoopRegion {
@@ -83,18 +86,24 @@ impl LoopRegion {
         enabled: bool,
         cursor: Arc<AtomicUsize>,
     ) -> Self {
-        let ch = buf.channels.max(1) as usize;
         let from = from_frame.clamp(start_frame.min(end_frame), end_frame.max(start_frame));
         let s = Self {
             buf,
-            idx: from * ch,
+            position: from as f64,
+            output_channel: 0,
             start_frame,
             end_frame,
             enabled,
             cursor,
+            speed_control: Arc::new(AtomicU32::new(1.0f32.to_bits())),
         };
         s.cursor.store(from, Ordering::Relaxed);
         s
+    }
+
+    fn with_speed_control(mut self, speed_control: Arc<AtomicU32>) -> Self {
+        self.speed_control = speed_control;
+        self
     }
 }
 
@@ -103,21 +112,48 @@ impl Iterator for LoopRegion {
 
     fn next(&mut self) -> Option<i16> {
         let ch = self.buf.channels.max(1) as usize;
-        let mut frame = self.idx / ch;
+        if self.end_frame <= self.start_frame {
+            return None;
+        }
+        let mut frame = self.position.floor() as usize;
         if self.enabled {
             if frame >= self.end_frame {
-                frame = self.start_frame;
-                self.idx = frame * ch;
+                let length = (self.end_frame - self.start_frame) as f64;
+                self.position = self.start_frame as f64
+                    + (self.position - self.start_frame as f64).rem_euclid(length);
+                frame = self.position.floor() as usize;
             }
         } else if frame >= self.end_frame {
             return None;
         }
-        let s = *self.buf.samples.get(self.idx)?;
-        if self.idx % ch == 0 {
+        let next_frame = if frame + 1 < self.end_frame {
+            frame + 1
+        } else if self.enabled {
+            self.start_frame
+        } else {
+            frame
+        };
+        let fraction = (self.position - frame as f64) as f32;
+        let sample_index = frame * ch + self.output_channel;
+        let next_index = next_frame * ch + self.output_channel;
+        let first = *self.buf.samples.get(sample_index)? as f32;
+        let second = *self.buf.samples.get(next_index)? as f32;
+        let sample = (first + (second - first) * fraction).round() as i16;
+        if self.output_channel == 0 {
             self.cursor.store(frame, Ordering::Relaxed);
         }
-        self.idx += 1;
-        Some(s)
+        self.output_channel += 1;
+        if self.output_channel == ch {
+            self.output_channel = 0;
+            let speed = f32::from_bits(self.speed_control.load(Ordering::Relaxed));
+            let speed = if (0.5..=2.0).contains(&speed) {
+                speed as f64
+            } else {
+                1.0
+            };
+            self.position += speed;
+        }
+        Some(sample)
     }
 }
 
@@ -264,11 +300,15 @@ fn routed_sink(
     if source_rate == 0 || output_rate == 0 {
         return Err("source and output sample rates must be nonzero".to_string());
     }
+    source
+        .speed_control
+        .store(speed.to_bits(), Ordering::Relaxed);
     let (sink, queue) = Sink::new_idle();
     sink.set_volume(volume);
-    // Rodio applies speed to the source before the stereo mixer converts to
-    // the device rate; hardware channel mapping happens afterward in CPAL.
-    sink.set_speed(speed);
+    // Apply pitch-speed in LoopRegion while retaining its nominal sample rate.
+    // Otherwise DynamicMixer's UniformSourceIterator would resample away the
+    // rate change made by Rodio's Sink::set_speed.
+    sink.set_speed(1.0);
     sink.pause();
     // Append before connecting to the stereo mixer so the queue has stable
     // source channel metadata rather than its initial mono silence source.
@@ -279,7 +319,7 @@ fn routed_sink(
         rate: source_rate,
     });
     crate::audio_log::write(&format!(
-        "playback_source channels={source_channels} sample_rate={source_rate} speed={speed:.3} output_mix_channels=2 output_mix_rate={output_rate}"
+        "playback_source channels={source_channels} sample_rate={source_rate} speed={speed:.3} sink_speed=1.000 output_mix_channels=2 output_mix_rate={output_rate}"
     ));
     Ok(sink)
 }
@@ -1128,6 +1168,8 @@ struct Loaded {
     cursor: Arc<AtomicUsize>,
     volume: f32,
     speed: f32,
+    /// Shared with the live source so speed changes take effect immediately.
+    playback_speed: Arc<AtomicU32>,
     pitch_lock: bool,
     /// A WSOLA worker is stretching `original_buf` at `pitch_job_speed`.
     /// Playback continues untouched on the current buffer meanwhile.
@@ -1142,6 +1184,21 @@ struct Loaded {
     /// from the library catalog. Not audio-engine state.
     loop_origin: String,
     loop_quality: f64,
+}
+
+impl Loaded {
+    fn loop_region(
+        &self,
+        buf: Arc<LoopBuffer>,
+        from_frame: usize,
+        start_frame: usize,
+        end_frame: usize,
+        enabled: bool,
+        cursor: Arc<AtomicUsize>,
+    ) -> LoopRegion {
+        LoopRegion::new(buf, from_frame, start_frame, end_frame, enabled, cursor)
+            .with_speed_control(self.playback_speed.clone())
+    }
 }
 
 /// What background readers observe: (path, load generation, decoded audio).
@@ -1408,7 +1465,7 @@ impl Player {
             if let Some(track) = self.track.as_mut() {
                 let from = track.cursor.load(Ordering::Relaxed);
                 track.resume_frame = from;
-                let source = LoopRegion::new(
+                let source = track.loop_region(
                     track.buf.clone(),
                     from,
                     track.start_frame,
@@ -1782,7 +1839,7 @@ impl Player {
             t.enabled,
             t.pitch_lock,
         ));
-        let src = LoopRegion::new(
+        let src = t.loop_region(
             t.buf.clone(),
             t.resume_frame,
             t.start_frame,
@@ -1882,6 +1939,11 @@ impl Player {
             let track = self.track.as_mut().ok_or("nothing loaded")?;
             track.speed = speed;
             track.pitch_error = None;
+            if !track.pitch_lock {
+                track
+                    .playback_speed
+                    .store(speed.to_bits(), Ordering::Relaxed);
+            }
             track.pitch_lock
         };
         crate::audio_log::write(&format!(
@@ -1891,8 +1953,6 @@ impl Player {
             // New speed supersedes any in-flight stretch; current audio
             // keeps playing untouched until the new buffer is ready.
             self.request_stretch();
-        } else if let Some(sink) = &self.sink {
-            sink.set_speed(speed);
         }
         Ok(self.status())
     }
@@ -1965,7 +2025,8 @@ impl Player {
             .as_ref()
             .is_some_and(|sink| !sink.is_paused() && !sink.empty());
         let replacement = if was_playing {
-            let source = LoopRegion::new(buffer.clone(), from, start, end, enabled, cursor.clone());
+            let source =
+                track.loop_region(buffer.clone(), from, start, end, enabled, cursor.clone());
             Some(self.fresh_sink(source, volume, speed)?)
         } else {
             None
@@ -1982,6 +2043,9 @@ impl Player {
         track.start_frame = start;
         track.end_frame = end;
         track.resume_frame = resume;
+        track
+            .playback_speed
+            .store(speed.to_bits(), Ordering::Relaxed);
         Ok(())
     }
 
@@ -2065,7 +2129,7 @@ impl Player {
             t.resume_frame = t.start_frame;
             let volume = t.volume;
             let speed = if t.pitch_lock { 1.0 } else { t.speed };
-            let src = LoopRegion::new(
+            let src = t.loop_region(
                 t.buf.clone(),
                 t.start_frame,
                 t.start_frame,
@@ -2109,7 +2173,7 @@ impl Player {
             t.resume_frame = t.start_frame;
             let volume = t.volume;
             let speed = if t.pitch_lock { 1.0 } else { t.speed };
-            let src = LoopRegion::new(
+            let src = t.loop_region(
                 t.buf.clone(),
                 t.start_frame,
                 t.start_frame,
@@ -2167,7 +2231,7 @@ impl Player {
             let cursor = t.cursor.load(Ordering::Relaxed);
             t.resume_frame = cursor;
             (
-                LoopRegion::new(
+                t.loop_region(
                     t.buf.clone(),
                     cursor,
                     t.start_frame,
@@ -2201,7 +2265,7 @@ impl Player {
             let volume = t.volume;
             let enabled = t.enabled;
             let speed = if t.pitch_lock { 1.0 } else { t.speed };
-            let src = LoopRegion::new(
+            let src = t.loop_region(
                 t.buf.clone(),
                 from,
                 t.start_frame,
@@ -2906,6 +2970,7 @@ impl Engine {
                 cursor: Arc::new(AtomicUsize::new(0)),
                 volume: vol,
                 speed: 1.0,
+                playback_speed: Arc::new(AtomicU32::new(1.0f32.to_bits())),
                 pitch_lock: false,
                 pitch_pending: false,
                 pitch_job: 0,
@@ -3029,7 +3094,7 @@ impl Engine {
                 if was_playing {
                     // Restart on the stretched buffer at locked (1.0x) rate.
                     let src =
-                        LoopRegion::new(new_buf.clone(), from, new_start, new_end, enabled, cursor);
+                        t.loop_region(new_buf.clone(), from, new_start, new_end, enabled, cursor);
                     let sink = match routed_sink(
                         &p.output_mixer,
                         p.output_sample_rate,
@@ -3047,6 +3112,7 @@ impl Engine {
                     sink.play();
                     p.sink = Some(sink);
                 }
+                t.playback_speed.store(1.0f32.to_bits(), Ordering::Relaxed);
                 t.buf = new_buf;
                 t.start_frame = new_start;
                 t.end_frame = new_end;

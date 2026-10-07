@@ -325,6 +325,55 @@ fn loop_region_repeats_exact_boundary_frames() {
 }
 
 #[test]
+fn pitch_speed_changes_the_live_sample_step_without_changing_source_rate() {
+    let speed = Arc::new(AtomicU32::new(1.0f32.to_bits()));
+    let mut source = LoopRegion::new(
+        mono(vec![0, 100, 200, 300, 400, 500, 600, 700]),
+        0,
+        0,
+        8,
+        true,
+        cursor(),
+    )
+    .with_speed_control(speed.clone());
+
+    assert_eq!(source.next(), Some(0));
+    assert_eq!(source.next(), Some(100));
+    speed.store(2.0f32.to_bits(), Ordering::Relaxed);
+    assert_eq!(source.next(), Some(200));
+    assert_eq!(source.next(), Some(400));
+    speed.store(0.5f32.to_bits(), Ordering::Relaxed);
+    assert_eq!(source.next(), Some(600));
+    assert_eq!(source.next(), Some(650));
+    assert_eq!(rodio::Source::sample_rate(&source), 1000);
+}
+
+#[test]
+fn dynamic_output_mixer_preserves_the_live_pitch_speed_change() {
+    fn ramp_after_mixer(speed_factor: f32) -> Vec<f32> {
+        let (controller, mut mixer) = rodio::dynamic_mixer::mixer::<f32>(1, 1000);
+        let speed = Arc::new(AtomicU32::new(speed_factor.to_bits()));
+        let source = LoopRegion::new(
+            mono(vec![0, 1000, 2000, 3000, 4000, 5000, 6000]),
+            0,
+            0,
+            7,
+            false,
+            cursor(),
+        )
+        .with_speed_control(speed);
+        controller.add(source.convert_samples::<f32>());
+        mixer.by_ref().take(3).collect()
+    }
+
+    let normal = ramp_after_mixer(1.0);
+    let faster = ramp_after_mixer(2.0);
+    let normal_step = normal[1] - normal[0];
+    let faster_step = faster[1] - faster[0];
+    assert!((faster_step / normal_step - 2.0).abs() < 0.02);
+}
+
+#[test]
 fn zero_crossing_snap_prefers_nearest_crossing() {
     let buf = LoopBuffer {
         samples: vec![-5, -2, 0, 3, 5, 2, -1, -4],
@@ -615,6 +664,7 @@ fn loaded_for_pitch() -> Loaded {
         cursor: cursor(),
         volume: 0.8,
         speed: 1.2,
+        playback_speed: Arc::new(AtomicU32::new(1.2f32.to_bits())),
         pitch_lock: true,
         pitch_pending: true,
         pitch_job: 3,

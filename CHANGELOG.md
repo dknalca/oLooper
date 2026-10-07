@@ -1,5 +1,12 @@
 # Release notes
 
+## 0.6.4
+
+- Fix the Pitch speed control so tempo and pitch change immediately during
+  playback, before output-mixer sample-rate conversion.
+- Keep Pitch Lock hidden; the **Pitch** label remains beside the 50–200% control.
+- Refresh the README screenshots with the current library, audio-output, and MIDI views.
+
 ## 0.6.3
 
 - Ask for the import mode each time SWF/EXE files are selected or dropped:

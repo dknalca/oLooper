@@ -9,7 +9,6 @@ import {
   playerAutoLoop,
   playerSetLoopEnabled,
   playerSetLoopSnapped,
-  playerSetPitchLock,
   playerSetSpeed,
   playerSetVolume,
   playerStatus,
@@ -445,13 +444,6 @@ export default function Player({ status: st, trackId, audioStorage, trackOpenGen
             <button onClick={() => run(playerSetSpeed(Math.max(50, (st?.speed_pct ?? 100) - 5)))} disabled={!loaded} title="Slower" className="rounded bg-border px-1.5 py-0.5 text-xs text-text-secondary hover:text-text disabled:opacity-30">−</button>
             <span className="w-9 text-center font-mono text-[10px] text-text-secondary">{Math.round(st?.speed_pct ?? 100)}%</span>
             <button onClick={() => run(playerSetSpeed(Math.min(200, (st?.speed_pct ?? 100) + 5)))} disabled={!loaded} title="Faster" className="rounded bg-border px-1.5 py-0.5 text-xs text-text-secondary hover:text-text disabled:opacity-30">+</button>
-            <button
-              onClick={() => run(playerSetPitchLock(!(st?.pitch_lock ?? false)))}
-              disabled={!loaded}
-              aria-pressed={st?.pitch_lock ?? false}
-              title={st?.pitch_lock ? "Disable pitch lock; speed changes pitch" : "Enable pitch lock; preserve pitch while changing speed"}
-              className={`ml-1 rounded px-1.5 py-0.5 text-[9px] font-semibold transition-colors disabled:opacity-30 ${st?.pitch_lock ? "bg-success/20 text-success" : "bg-border text-text-secondary hover:text-text"}`}
-            >{st?.pitch_preparing ? "PREPARING…" : "PITCH LOCK"}</button>
           </div>
 
           <div className="w-px h-5 bg-border" />

@@ -30,14 +30,16 @@ Waveform rendering and library integration are separate specs.
 7. Keyboard shortcuts (spec 060): Space (play/pause), S (stop), arrows (seek),
    and L (loop toggle). Previous/next transport buttons move through the
    tracks shown in the selected library view. Loop enablement, AUTO detection,
-   and manual boundaries are in the collapsible Loop controls panel. The
-   PITCH LOCK toggle is visible beside the playback speed control.
+   and manual boundaries are in the collapsible Loop controls panel. PITCH LOCK
+   remains hidden.
 8. The player has four persistent CUEs. CUE 1 is fixed at the start of the track;
    CUEs 2–4 can be saved, recalled, and cleared. They are read from the audio
    file when the track opens; CUE positions are drawn on the waveform. Manual
    playback loops remain separate and are not saved as Serato loop slots.
 9. `+` and `-` change playback speed in 5% steps from 50% to 200%. This is
    vinyl-style playback, so pitch changes with speed unless pitch lock is on.
+   The rate change is applied live while advancing source frames; output-mixer
+   sample-rate conversion must not cancel its pitch or tempo effect.
 10. Pitch lock is non-blocking: enabling it (or changing speed while locked)
    keeps the current audio playing untouched, publishes `pitch_preparing`,
    and stretches (WSOLA) on a background worker tagged with track
