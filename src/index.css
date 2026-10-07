@@ -1,19 +1,33 @@
-@import "tailwindcss";
-
-@theme {
+:root {
   --color-app: #0a0a0a;
+  --color-app-rgb: 10 10 10;
   --color-surface: #141414;
+  --color-surface-rgb: 20 20 20;
   --color-surface-hover: #1e1e1e;
+  --color-surface-hover-rgb: 30 30 30;
   --color-elevated: #1a1a1a;
+  --color-elevated-rgb: 26 26 26;
   --color-border: #2a2a2a;
+  --color-border-rgb: 42 42 42;
   --color-text: #e8e8e8;
+  --color-text-rgb: 232 232 232;
   --color-text-secondary: #888;
+  --color-text-secondary-rgb: 136 136 136;
   --color-accent: #4aa3ff;
+  --color-accent-rgb: 74 163 255;
   --color-accent-hover: #5bb3ff;
+  --color-accent-hover-rgb: 91 179 255;
   --color-success: #34d399;
+  --color-success-rgb: 52 211 153;
   --color-warning: #fbbf24;
+  --color-warning-rgb: 251 191 36;
   --color-danger: #f87171;
+  --color-danger-rgb: 248 113 113;
 }
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
 
 html, body, #root {
   margin: 0;

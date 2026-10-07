@@ -46,6 +46,9 @@ visible and correctable.
   not pause for confirmation.
 - Manual BPM corrections remain protected from re-analysis and continue syncing
   through the existing supported Serato audio tags.
+- The manual BPM editor includes **Tap tempo**. Four steady quarter-note taps
+  produce a tempo estimate that fills the BPM field; saving records it as a
+  manual BPM so analysis cannot overwrite it.
 
 ## Acceptance criteria
 
@@ -73,7 +76,8 @@ visible and correctable.
 - [ ] BPM confidence distinguishes accented tempo from unresolved half/double-time
   ambiguity; low-confidence estimates are visibly marked and open manual editing.
 - [ ] Manual BPM corrections persist, stay marked manual, and are not overwritten
-  by subsequent analysis.
+  by subsequent analysis. Editing only a title or tags preserves BPM provenance;
+  explicitly entering or tapping the current numeric value confirms it as manual.
 
 ## Non-goals
 

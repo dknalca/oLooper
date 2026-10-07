@@ -20,7 +20,8 @@ import {
   midiConnect,
   midiDisconnect,
   playerAutoLoop,
-  playerLoad,
+  playerLoadTrack,
+  playerUnload,
   playerPause,
   playerPlay,
   playerSetLoopEnabled,
@@ -98,6 +99,7 @@ function sameMidiBinding(left: MidiBinding, right: MidiBinding): boolean {
 export default function App() {
   useKeyboardShortcuts();
   const [libraryReady, setLibraryReady] = useState(false);
+  const [libraryGeneration, setLibraryGeneration] = useState(0);
   const [startupIntroDone, setStartupIntroDone] = useState(false);
   const [refreshKey, setRefreshKey] = useState(0);
   const [playerStatus, setPlayerStatus] = useState<PlayerStatus | null>(null);
@@ -118,13 +120,34 @@ export default function App() {
   const [midiLearningAction, setMidiLearningAction] = useState<MidiAction | null>(null);
   const [midiLearningConflict, setMidiLearningConflict] = useState<MidiAction | null>(null);
   const randomLoadGeneration = useRef(0);
+  const libraryRootRef = useRef<string | null>(null);
   const midiBindingsRef = useRef(midiBindings);
   const midiLearningActionRef = useRef(midiLearningAction);
   const midiActionHandlerRef = useRef<(action: MidiAction) => void>(() => {});
   midiBindingsRef.current = midiBindings;
   midiLearningActionRef.current = midiLearningAction;
 
-  const onLibraryReady = useCallback(() => setLibraryReady(true), []);
+  const onLibraryReady = useCallback((root: string) => {
+    const previousRoot = libraryRootRef.current;
+    const switched = previousRoot !== null && previousRoot !== root;
+    libraryRootRef.current = root;
+    setLibraryReady(true);
+    setRefreshKey((key) => key + 1);
+    if (!switched) return;
+
+    // Track IDs belong to one SQLite catalog. Unload audio before the new
+    // catalog is used, so stale controls cannot address an unrelated row.
+    randomLoadGeneration.current += 1;
+    setActiveTrackId(null);
+    setActiveTrack(null);
+    setActiveCover(null);
+    setTrackOpenGeneration((generation) => generation + 1);
+    setPlayerStatus(null);
+    setLibraryView("local");
+    setLibraryGeneration((generation) => generation + 1);
+    playerUnload()
+      .catch((cause) => setAudioStartupError(`Could not unload the previous library track: ${String(cause)}`));
+  }, []);
   const finishStartupIntro = useCallback(() => setStartupIntroDone(true), []);
 
   useEffect(() => {
@@ -152,10 +175,30 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    const updatePlayerStatus = (event: Event) => {
+      setPlayerStatus((event as CustomEvent<PlayerStatus>).detail);
+    };
+    window.addEventListener("olooper:player-status", updatePlayerStatus);
+    return () => window.removeEventListener("olooper:player-status", updatePlayerStatus);
+  }, []);
+
+  useEffect(() => {
     const updateActiveBpm = (event: Event) => {
-      const { trackId, bpm } = (event as CustomEvent<{ trackId: number; bpm: number }>).detail;
+      const { trackId, bpm, source, confidence } = (event as CustomEvent<{
+        trackId: number;
+        bpm: number;
+        source?: string;
+        confidence?: number | null;
+      }>).detail;
       if (trackId === activeTrackId) {
-        setActiveTrack((current) => current?.id === trackId ? { ...current, bpm } : current);
+        setActiveTrack((current) => current?.id === trackId ? {
+          ...current,
+          bpm,
+          bpm_source: source ?? current.bpm_source,
+          bpm_confidence: confidence !== undefined
+            ? confidence
+            : source === "manual" ? null : current.bpm_confidence,
+        } : current);
       }
     };
     window.addEventListener("olooper:track-bpm", updateActiveBpm);
@@ -189,7 +232,7 @@ export default function App() {
     if (!track) throw new Error("No playable tracks in the library");
     if (generation !== randomLoadGeneration.current) return;
 
-    let status = await playerLoad(track.file_path);
+    let status = await playerLoadTrack(track.id);
     setPlayerStatus(status);
     const deadline = Date.now() + 120_000;
     while (status.loading && Date.now() < deadline) {
@@ -201,7 +244,7 @@ export default function App() {
     if (generation !== randomLoadGeneration.current) return;
     if (status.loading) throw new Error("Random track load timed out");
     if (status.load_error) throw new Error(status.load_error);
-    if (status.path !== track.file_path) return;
+    if (status.path !== track.playback_path) return;
     const playing = await playerPlay();
     if (generation !== randomLoadGeneration.current) return;
     setActiveTrackId(track.id);
@@ -220,7 +263,7 @@ export default function App() {
     const track = firstMidiStartTrack(tracks, localStorage.getItem("olooper.library.sort"));
     if (!track) return;
 
-    let status = await playerLoad(track.file_path);
+    let status = await playerLoadTrack(track.id);
     setPlayerStatus(status);
     const deadline = Date.now() + 120_000;
     while (status.loading && Date.now() < deadline) {
@@ -230,7 +273,7 @@ export default function App() {
       setPlayerStatus(status);
     }
     if (generation !== randomLoadGeneration.current) return;
-    if (status.loading || status.load_error || status.path !== track.file_path) return;
+    if (status.loading || status.load_error || status.path !== track.playback_path) return;
     playerSetDiagnostics(track.loop_origin, track.loop_quality).catch(() => {});
     const playing = await playerPlay();
     if (generation !== randomLoadGeneration.current) return;
@@ -389,9 +432,10 @@ export default function App() {
         <div className="h-1/5 min-h-36 shrink-0 p-3">
           <Waveform refreshKey={refreshKey} status={playerStatus} trackTitle={activeTrack?.title ?? null} trackCover={activeCover} trackId={activeTrack?.id ?? null} showCover={playerStatus?.loaded === true && activeTrack !== null} loopEditing={loopEditing} onStatusChange={setPlayerStatus} />
         </div>
-        <Player
-          status={playerStatus}
-          trackId={activeTrackId}
+              <Player
+                status={playerStatus}
+                trackId={activeTrackId}
+                audioStorage={activeTrack?.audio_storage ?? "extracted"}
           trackOpenGeneration={trackOpenGeneration}
           canRandom={libraryReady}
           onRandomTrack={playRandomTrack}
@@ -425,6 +469,7 @@ export default function App() {
             {libraryView === "local" ? (
               <Sidebar
                 libraryReady={libraryReady}
+                libraryGeneration={libraryGeneration}
                 refreshKey={refreshKey}
                 activeTrackId={activeTrackId}
                 onRegisterTrackNavigation={registerTrackNavigator}

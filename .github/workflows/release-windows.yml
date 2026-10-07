@@ -44,6 +44,16 @@ jobs:
             choco install nsis --yes --no-progress
           }
 
+      - name: Test frontend and Rust
+        shell: pwsh
+        run: |
+          pnpm install --frozen-lockfile
+          if ($LASTEXITCODE -ne 0) { throw "pnpm install failed." }
+          pnpm test
+          if ($LASTEXITCODE -ne 0) { throw "Frontend tests failed." }
+          cargo test --manifest-path src-tauri/Cargo.toml
+          if ($LASTEXITCODE -ne 0) { throw "Rust tests failed." }
+
       - name: Build and validate Windows installer
         shell: pwsh
         env:

@@ -98,7 +98,7 @@ fn wav_id3_tag(path: &Path) -> Tag {
 fn migrate_starts_at_current_schema() {
     let root = tmp_root("migrate");
     let lib = Library::open(&root).unwrap();
-    assert_eq!(lib.schema_version().unwrap(), 8);
+    assert_eq!(lib.schema_version().unwrap(), 9);
     assert!(root.join("Custom Loops").is_dir());
     assert!(root.join("olooper.db").is_file());
     std::fs::remove_dir_all(&root).ok();
@@ -132,13 +132,14 @@ fn migration_v6_adds_empty_playlists_without_changing_tracks() {
     let conn = Connection::open(root.join("olooper.db")).unwrap();
     conn.execute_batch(
         "DROP TABLE playlist_tracks; DROP TABLE playlists; DROP TABLE looper_order; \
+         ALTER TABLE tracks DROP COLUMN audio_storage; \
          PRAGMA user_version=6;",
     )
     .unwrap();
     drop(conn);
 
     let migrated = Library::open(&root).unwrap();
-    assert_eq!(migrated.schema_version().unwrap(), 8);
+    assert_eq!(migrated.schema_version().unwrap(), 9);
     assert!(migrated.list_playlists().unwrap().is_empty());
     assert_eq!(migrated.list_tracks().unwrap()[0].id, track_id);
     std::fs::remove_dir_all(root).ok();
@@ -152,17 +153,39 @@ fn migration_v7_adds_looper_order_and_preserves_existing_groups() {
     drop(lib);
 
     let conn = Connection::open(root.join("olooper.db")).unwrap();
-    conn.execute_batch("DROP TABLE looper_order; PRAGMA user_version=7;")
+    conn.execute_batch(
+        "DROP TABLE looper_order; ALTER TABLE tracks DROP COLUMN audio_storage; PRAGMA user_version=7;",
+    )
         .unwrap();
     drop(conn);
 
     let migrated = Library::open(&root).unwrap();
-    assert_eq!(migrated.schema_version().unwrap(), 8);
+    assert_eq!(migrated.schema_version().unwrap(), 9);
     assert_eq!(
         migrated.list_looper_order().unwrap(),
         vec!["looper-order-first"]
     );
     assert_eq!(migrated.list_tracks().unwrap().len(), 1);
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn migration_v8_defaults_existing_tracks_to_extracted_audio() {
+    let root = tmp_root("audio-storage-migration-v8");
+    let lib = Library::open(&root).unwrap();
+    let track_id = add_test_looper_track(&lib, &root, "Extracted", "storage-migration-source");
+    drop(lib);
+
+    let conn = Connection::open(root.join("olooper.db")).unwrap();
+    conn.execute_batch("ALTER TABLE tracks DROP COLUMN audio_storage; PRAGMA user_version=8;")
+        .unwrap();
+    drop(conn);
+
+    let migrated = Library::open(&root).unwrap();
+    assert_eq!(migrated.schema_version().unwrap(), 9);
+    let track = migrated.get_track(track_id).unwrap().unwrap();
+    assert_eq!(track.audio_storage, "extracted");
+    assert_eq!(track.playback_path, track.file_path);
     std::fs::remove_dir_all(root).ok();
 }
 
@@ -873,6 +896,88 @@ fn edits_persist_across_reopen() {
 }
 
 #[test]
+fn export_copy_never_clobbers_a_destination_created_after_name_selection() {
+    let root = tmp_root("export-noclobber");
+    let source = root.join("source.wav");
+    let destination = root.join("destination.wav");
+    std::fs::write(&source, b"library audio").unwrap();
+    std::fs::write(&destination, b"user file").unwrap();
+
+    let error = copy_file_noclobber(&source, &destination).unwrap_err();
+
+    assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+    assert_eq!(std::fs::read(&destination).unwrap(), b"user file");
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn metadata_only_edits_preserve_analyzed_bpm_and_manual_sync_beats_stale_tags() {
+    let root = tmp_root("manual-bpm-serato-sync");
+    let lib = Library::open(&root).unwrap();
+    let audio = root.join("Custom Loops").join("tempo.wav");
+    let buffer = wav_buf();
+    std::fs::write(&audio, Library::loop_buffer_to_wav(&buffer)).unwrap();
+    let (track_id, added) = lib
+        .add_track(
+            "Original",
+            "Custom Loops",
+            &audio,
+            "custom",
+            "external-source.wav",
+            "manual-bpm-serato-sync",
+            0,
+            None,
+            None,
+            "wav",
+            &buffer,
+            0,
+            0,
+        )
+        .unwrap();
+    assert!(added);
+
+    let mut tagged = SeratoMetadata::default();
+    tagged.bpm = Some(100.0);
+    serato::write_audio_file(&audio, &tagged, buffer.duration_ms() as i64).unwrap();
+    lib.update_bpm(track_id, 100.0, Some(0.2), false).unwrap();
+
+    let titled = lib
+        .update_metadata(track_id, "Renamed", Some(100.0), "practice", false)
+        .unwrap();
+    assert_eq!(titled.bpm_source.as_deref(), Some("analyzed"));
+    assert_eq!(titled.bpm_confidence, Some(0.2));
+
+    let explicitly_confirmed = lib
+        .update_metadata(track_id, "Renamed", Some(100.0), "practice", true)
+        .unwrap();
+    assert_eq!(explicitly_confirmed.bpm, Some(100.0));
+    assert_eq!(explicitly_confirmed.bpm_source.as_deref(), Some("manual"));
+    assert_eq!(explicitly_confirmed.bpm_confidence, None);
+
+    let manual = lib
+        .update_metadata(track_id, "Renamed", Some(120.0), "practice", true)
+        .unwrap();
+    assert_eq!(manual.bpm, Some(120.0));
+    assert_eq!(manual.bpm_source.as_deref(), Some("manual"));
+    assert_eq!(manual.bpm_confidence, None);
+
+    lib.sync_serato_metadata(track_id).unwrap();
+    let from_file = serato::read_audio_file(&audio).unwrap().metadata;
+    assert_eq!(from_file.bpm, Some(120.0));
+    let from_library = lib.get_serato_metadata(track_id).unwrap();
+    assert_eq!(from_library.bpm, Some(120.0));
+    assert_eq!(
+        lib.get_track(track_id)
+            .unwrap()
+            .unwrap()
+            .bpm_source
+            .as_deref(),
+        Some("manual")
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
 fn missing_files_are_flagged() {
     let root = tmp_root("missing");
     let lib = Library::open(&root).unwrap();
@@ -1078,6 +1183,210 @@ fn import_dedups_second_run() {
         .unwrap_err();
     assert_eq!(err, "no sounds could be imported");
     assert_eq!(lib.list_tracks().unwrap().len(), 1);
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn long_sanitized_group_names_keep_distinct_source_audio_separate() {
+    let root = tmp_root("long-source-name-collision");
+    let lib = Library::open(&root).unwrap();
+    let name = "x".repeat(80);
+    let mut sounds = Vec::new();
+    for (hash, sample) in [("source-one", 100i16), ("source-two", -100i16)] {
+        let mut buffer = wav_buf();
+        buffer.samples.fill(sample);
+        let sound = crate::import::swf::Sound {
+            id: 7,
+            format: 0,
+            codec: "wav".to_string(),
+            sample_count: buffer.frames() as u32,
+            seek_samples: 0,
+            trimmed_leading: 0,
+            frames: Library::loop_buffer_to_wav(&buffer),
+        };
+        let report = lib
+            .import_sounds(
+                &name,
+                "swf",
+                &format!("/{hash}.swf"),
+                hash,
+                None,
+                None,
+                &[sound],
+            )
+            .unwrap();
+        assert_eq!(report.added, 1);
+        sounds.push(lib.get_track(report.track_ids[0]).unwrap().unwrap());
+    }
+
+    assert_ne!(
+        Path::new(&sounds[0].file_path).parent(),
+        Path::new(&sounds[1].file_path).parent()
+    );
+    assert_ne!(
+        std::fs::read(&sounds[0].file_path).unwrap(),
+        std::fs::read(&sounds[1].file_path).unwrap()
+    );
+    assert_eq!(lib.list_tracks().unwrap().len(), 2);
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn embedded_import_lists_tracks_and_decodes_from_the_managed_source_without_audio_copies() {
+    fn push_bits(
+        value: u32,
+        width: usize,
+        bytes: &mut Vec<u8>,
+        current: &mut u8,
+        count: &mut usize,
+    ) {
+        for shift in (0..width).rev() {
+            *current = (*current << 1) | ((value >> shift) & 1) as u8;
+            *count += 1;
+            if *count == 8 {
+                bytes.push(*current);
+                *current = 0;
+                *count = 0;
+            }
+        }
+    }
+
+    let root = tmp_root("embedded-source-playback");
+    let lib = Library::open(&root).unwrap();
+    let mut adpcm = Vec::new();
+    let mut current = 0u8;
+    let mut bit_count = 0usize;
+    push_bits(0, 2, &mut adpcm, &mut current, &mut bit_count); // two-bit ADPCM code width
+    push_bits(0, 16, &mut adpcm, &mut current, &mut bit_count); // initial sample
+    push_bits(0, 6, &mut adpcm, &mut current, &mut bit_count); // initial step index
+    push_bits(0, 2, &mut adpcm, &mut current, &mut bit_count); // one delta sample
+    if bit_count != 0 {
+        adpcm.push(current << (8 - bit_count));
+    }
+
+    let mut sound_tag = define_sound_tag(23, crate::import::swf::FORMAT_ADPCM, &adpcm);
+    sound_tag[5..9].copy_from_slice(&2u32.to_le_bytes());
+    let source_bytes = fws_file(10, &sound_tag);
+    let parsed = crate::import::swf::parse(&source_bytes).unwrap();
+    assert_eq!(parsed.sounds.len(), 1);
+    let source_path = root.join("loopersFlash").join("Embedded.swf");
+    std::fs::create_dir_all(source_path.parent().unwrap()).unwrap();
+    std::fs::write(&source_path, &source_bytes).unwrap();
+    let source_path = source_path.to_string_lossy().to_string();
+    let hash = sha256_hex(&source_bytes);
+
+    let report = lib
+        .import_embedded_sounds_with_cover_and_progress(
+            "Embedded",
+            "swf",
+            &source_path,
+            &hash,
+            None,
+            None,
+            &parsed.sounds,
+            None,
+            |_, _, _| Ok(()),
+        )
+        .unwrap();
+
+    assert_eq!(report.added, 1);
+    let track = lib.get_track(report.track_ids[0]).unwrap().unwrap();
+    assert_eq!(track.audio_storage, "embedded");
+    assert_eq!(track.file_path, source_path);
+    assert_eq!(track.playback_path, format!("embedded:{}", track.id));
+    assert!(track.exists);
+    assert!(!root
+        .join(extracted_group_directory_name("Embedded", &hash))
+        .exists());
+
+    let request = lib.playback_request(track.id).unwrap();
+    let decoded = request.decode().unwrap();
+    let expected = prepare_sound(&parsed.sounds[0]).unwrap().buffer;
+    assert_eq!(decoded.samples, expected.samples);
+    assert_eq!(decoded.rate, expected.rate);
+    assert_eq!(decoded.channels, expected.channels);
+
+    let export_directory = root.join("exports");
+    std::fs::create_dir_all(&export_directory).unwrap();
+    assert_eq!(
+        lib.export_tracks(&[track.id], &export_directory).unwrap(),
+        1
+    );
+    let exported = std::fs::read_dir(&export_directory)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    assert_eq!(
+        exported.extension().and_then(|ext| ext.to_str()),
+        Some("wav")
+    );
+    let exported_buffer = crate::player::decode_bytes(&std::fs::read(exported).unwrap()).unwrap();
+    assert_eq!(exported_buffer.samples, expected.samples);
+
+    let metadata = lib.get_serato_metadata(track.id).unwrap();
+    assert_eq!(metadata.cues.len(), 1);
+    assert_eq!(metadata.cues[0].slot, 1);
+    assert_eq!(metadata.cues[0].position_ms, 0);
+    assert!(metadata.loops.is_empty());
+    assert_eq!(
+        lib.set_serato_cue(track.id, 1, Some(0)).unwrap().cues[0].position_ms,
+        0
+    );
+    assert!(lib.set_serato_cue(track.id, 1, Some(10)).is_err());
+    assert!(lib.set_serato_cue(track.id, 2, Some(0)).is_err());
+    assert!(lib.sync_serato_metadata(track.id).is_err());
+    assert_eq!(sha256_hex(&std::fs::read(&source_path).unwrap()), hash);
+    lib.rename_looper(&hash, "Renamed embedded").unwrap();
+    assert_eq!(
+        lib.get_track(track.id).unwrap().unwrap().file_path,
+        source_path
+    );
+    assert!(lib.remove_track(track.id).unwrap());
+    assert!(Path::new(&source_path).is_file());
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn cancelling_before_catalog_insert_removes_the_staged_audio_file() {
+    let root = tmp_root("cancel-before-track-insert");
+    let lib = Library::open(&root).unwrap();
+    let buffer = wav_buf();
+    let sound = crate::import::swf::Sound {
+        id: 3,
+        format: 0,
+        codec: "wav".to_string(),
+        sample_count: buffer.frames() as u32,
+        seek_samples: 0,
+        trimmed_leading: 0,
+        frames: Library::loop_buffer_to_wav(&buffer),
+    };
+    let (_, error) = lib
+        .import_sounds_with_progress(
+            "Cancelable",
+            "swf",
+            "/source/cancel.swf",
+            "cancel-before-insert",
+            None,
+            None,
+            &[sound],
+            |stage, _, _| {
+                if stage == "inserting in library" {
+                    Err("cancelled".to_string())
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .unwrap_err();
+    assert_eq!(error, "cancelled");
+    assert!(lib.list_tracks().unwrap().is_empty());
+    let staged_group = root.join(extracted_group_directory_name(
+        "Cancelable",
+        "cancel-before-insert",
+    ));
+    assert!(std::fs::read_dir(staged_group).unwrap().next().is_none());
     std::fs::remove_dir_all(&root).ok();
 }
 

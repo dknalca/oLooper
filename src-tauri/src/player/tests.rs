@@ -484,6 +484,84 @@ fn engine_reports_empty_without_touching_hardware() {
     assert!(client.play().is_err());
 }
 
+#[test]
+fn output_recovery_reopens_disconnected_and_changed_default_devices() {
+    let default = OutputSelection::default();
+    assert!(!output_reopen_needed(
+        &default,
+        "Studio monitors",
+        Some("Studio monitors"),
+        true,
+    ));
+    assert!(output_reopen_needed(
+        &default,
+        "Studio monitors",
+        Some("USB headphones"),
+        true,
+    ));
+    assert!(output_reopen_needed(
+        &default,
+        "",
+        Some("USB headphones"),
+        true,
+    ));
+
+    let explicit = OutputSelection {
+        device_name: Some("Studio monitors".to_string()),
+        ..OutputSelection::default()
+    };
+    assert!(!output_reopen_needed(
+        &explicit,
+        "Studio monitors",
+        Some("USB headphones"),
+        true,
+    ));
+    assert!(output_reopen_needed(
+        &explicit,
+        "Studio monitors",
+        None,
+        false,
+    ));
+}
+
+#[test]
+fn library_unload_clears_audio_snapshot_and_invalidates_pending_decode() {
+    let loaded_buffer = Arc::new(std::sync::RwLock::new(Some((
+        "old-library/track.wav".to_string(),
+        2,
+        mono(vec![1, 2, 3]),
+    ))));
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let mut engine = Engine::new(loaded_buffer.clone(), tx);
+    engine.generation = 2;
+    engine.pending_load = Some(PendingLoad {
+        generation: 2,
+        path: "old-library/pending.wav".to_string(),
+        request: AudioLoadRequest::file(
+            "old-library/pending.wav".to_string(),
+            "old-library/pending.wav".to_string(),
+        ),
+        identity: None,
+    });
+    engine.decode_running = true;
+    engine.last_load_error = Some("stale error".to_string());
+
+    engine.cmd_unload().unwrap();
+
+    assert_eq!(engine.generation, 3);
+    assert!(engine.pending_load.is_none());
+    assert!(engine.last_load_error.is_none());
+    assert!(loaded_buffer.read().unwrap().is_none());
+    assert!(!load_ready_current(
+        &engine.pending_load,
+        2,
+        "old-library/pending.wav"
+    ));
+    // Keep the worker gate set until the old decode completion arrives; a new
+    // request waits behind it instead of allowing unbounded parallel decodes.
+    assert!(engine.decode_running);
+}
+
 fn nanos() -> u128 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -549,12 +627,18 @@ fn loaded_for_pitch() -> Loaded {
 }
 
 #[test]
-fn pitch_completion_applies_only_when_nothing_moved() {
+fn pitch_completion_discards_stale_state_and_restarts_for_new_speed() {
     let t = loaded_for_pitch();
     assert!(pitch_job_current(&t, 7, 3, 1.2));
     assert!(!pitch_job_current(&t, 8, 3, 1.2)); // track changed
     assert!(!pitch_job_current(&t, 7, 2, 1.2)); // older job
     assert!(!pitch_job_current(&t, 7, 3, 1.3)); // speed changed
+    assert!(!pitch_job_needs_replacement(&t, 1.2));
+    let mut newer_speed = loaded_for_pitch();
+    newer_speed.speed = 1.3;
+    newer_speed.pitch_requested_speed = 1.3;
+    assert!(pitch_job_current(&newer_speed, 7, 3, 1.2));
+    assert!(pitch_job_needs_replacement(&newer_speed, 1.2));
     let mut unlocked = loaded_for_pitch();
     unlocked.pitch_lock = false;
     assert!(!pitch_job_current(&unlocked, 7, 3, 1.2)); // lock disabled
@@ -568,11 +652,53 @@ fn load_completion_applies_only_to_latest_request() {
     let pending = Some(PendingLoad {
         generation: 2,
         path: "/b.wav".to_string(),
+        request: AudioLoadRequest::file("/b.wav".to_string(), "/b.wav".to_string()),
+        identity: None,
     });
     assert!(load_ready_current(&pending, 2, "/b.wav"));
     assert!(!load_ready_current(&pending, 1, "/b.wav")); // superseded decode
     assert!(!load_ready_current(&pending, 2, "/a.wav")); // other path
     assert!(!load_ready_current(&None, 2, "/b.wav")); // nothing pending
+}
+
+#[test]
+fn decoded_cache_identity_detects_replaced_files() {
+    let original = FileIdentity {
+        size: 120,
+        modified: Some(std::time::SystemTime::UNIX_EPOCH),
+    };
+    let replacement = FileIdentity {
+        size: 120,
+        modified: Some(std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1)),
+    };
+    assert_ne!(original, replacement);
+    assert_ne!(
+        original,
+        FileIdentity {
+            size: 121,
+            modified: original.modified,
+        }
+    );
+    let entry = DecodedCacheEntry {
+        path: "library/loop.wav".to_string(),
+        identity: original.clone(),
+        buffer: mono(vec![0, 1]),
+    };
+    assert!(decoded_cache_entry_matches(
+        &entry,
+        "library/loop.wav",
+        &original
+    ));
+    assert!(!decoded_cache_entry_matches(
+        &entry,
+        "library/loop.wav",
+        &replacement
+    ));
+    assert!(!decoded_cache_entry_matches(
+        &entry,
+        "library/renamed.wav",
+        &original
+    ));
 }
 
 #[test]

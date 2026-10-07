@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import {
   cancelImport,
   importTablistAndWait,
+  newImportJobId,
   libraryTablistImportCounts,
   listenImportProgress,
   tablistSearch,
@@ -130,7 +131,7 @@ export default function TablistCatalog({ libraryReady, refreshKey, onImported }:
       return;
     }
     setContextMenu(null);
-    const jobId = crypto.randomUUID();
+    const jobId = newImportJobId();
     activeJobId.current = jobId;
     setActiveLooper(looper.path);
     setProgress(null);

@@ -44,10 +44,19 @@ export interface PlayerStatus {
   /** Digital peak sent to the selected left/right output channels (%). */
   output_left_level_pct: number;
   output_right_level_pct: number;
+  output_error: string | null;
 }
 
 export function playerLoad(path: string): Promise<PlayerStatus> {
   return invoke<PlayerStatus>("player_load", { path });
+}
+
+export function playerLoadTrack(trackId: number): Promise<PlayerStatus> {
+  return invoke<PlayerStatus>("player_load_library_track", { id: trackId });
+}
+
+export function playerUnload(): Promise<PlayerStatus> {
+  return invoke<PlayerStatus>("player_unload");
 }
 
 export function playerPlay(): Promise<PlayerStatus> {
@@ -229,7 +238,9 @@ export interface Track {
   title: string;
   looper_name: string;
   file_path: string;
+  playback_path: string;
   exists: boolean;
+  audio_storage: "extracted" | "embedded";
   source_type: string;
   source_path: string;
   source_hash: string;
@@ -282,9 +293,19 @@ export interface ImportProgress {
   custom_report: CustomReport[] | null;
 }
 
-function importJobId(): string {
-  return crypto.randomUUID();
+let importJobSequence = 0;
+
+export function newImportJobId(): string {
+  const bytes = new Uint8Array(16);
+  if (globalThis.crypto?.getRandomValues) {
+    globalThis.crypto.getRandomValues(bytes);
+    return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+  }
+  importJobSequence += 1;
+  return `job-${Date.now().toString(36)}-${importJobSequence.toString(36)}-${Math.random().toString(36).slice(2)}`;
 }
+
+const importJobId = newImportJobId;
 
 export function libraryDefaultRoot(): Promise<string> {
   return invoke<string>("library_default_root");
@@ -356,8 +377,8 @@ export function libraryRandomTrack(excludeId: number | null): Promise<Track | nu
   return invoke<Track | null>("library_random_track", { excludeId });
 }
 
-export function importSwf(path: string, jobId = importJobId()): Promise<string> {
-  return invoke<string>("import_swf", { path, jobId });
+export function importSwf(path: string, jobId = importJobId(), extractAudio = true): Promise<string> {
+  return invoke<string>("import_swf", { path, jobId, extractAudio });
 }
 
 /** Register before enqueueing to avoid missing a fast worker completion. */
@@ -411,43 +432,51 @@ function waitForImportDone(jobId: string, timeoutMs = 30 * 60 * 1000): {
  * The listener is registered before the IPC call to avoid a race where the
  * worker finishes before `waitForImportDone` starts listening.
  */
-export async function importSwfAndWait(path: string, jobId = importJobId()): Promise<ImportReport> {
+export async function importSwfAndWait(
+  path: string,
+  jobId = importJobId(),
+  extractAudio = true,
+): Promise<ImportReport> {
   const waiter = waitForImportDone(jobId);
   await waiter.ready;
   let done: ImportProgress;
   try {
-    await importSwf(path, jobId);
+    await importSwf(path, jobId, extractAudio);
     done = await waiter.done;
   } catch (error) {
     waiter.cancel();
     throw error;
   }
-  if (done.report) return done.report;
   if (done.error) throw new Error(done.error);
+  if (done.report) return done.report;
   throw new Error("import finished without a report");
 }
 
-export function importExe(path: string, jobId = importJobId()): Promise<string> {
-  return invoke<string>("import_exe", { path, jobId });
+export function importExe(path: string, jobId = importJobId(), extractAudio = true): Promise<string> {
+  return invoke<string>("import_exe", { path, jobId, extractAudio });
 }
 
 /**
  * Enqueue an EXE import on the background worker and await its final report.
  * Keeps the `Promise<ImportReport>` shape so existing call sites don't change.
  */
-export async function importExeAndWait(path: string, jobId = importJobId()): Promise<ImportReport> {
+export async function importExeAndWait(
+  path: string,
+  jobId = importJobId(),
+  extractAudio = true,
+): Promise<ImportReport> {
   const waiter = waitForImportDone(jobId);
   await waiter.ready;
   let done: ImportProgress;
   try {
-    await importExe(path, jobId);
+    await importExe(path, jobId, extractAudio);
     done = await waiter.done;
   } catch (error) {
     waiter.cancel();
     throw error;
   }
-  if (done.report) return done.report;
   if (done.error) throw new Error(done.error);
+  if (done.report) return done.report;
   throw new Error("import finished without a report");
 }
 
@@ -591,8 +620,8 @@ export async function importCustomAndWait(paths: string[], jobId = importJobId()
     waiter.cancel();
     throw error;
   }
-  if (done.custom_report) return done.custom_report;
   if (done.error) throw new Error(done.error);
+  if (done.custom_report) return done.custom_report;
   throw new Error("import finished without a report");
 }
 
@@ -620,8 +649,8 @@ export async function importTablistAndWait(
     waiter.cancel();
     throw error;
   }
-  if (done.custom_report) return done.custom_report;
   if (done.error) throw new Error(done.error);
+  if (done.custom_report) return done.custom_report;
   throw new Error("Tablist import finished without a report");
 }
 
@@ -690,8 +719,14 @@ export function librarySetFavorite(trackId: number, favorite: boolean): Promise<
   return invoke<Track>("library_set_favorite", { id: trackId, favorite });
 }
 
-export function libraryUpdateMetadata(trackId: number, title: string, bpm: number | null, tags: string): Promise<Track> {
-  return invoke<Track>("library_update_metadata", { id: trackId, title, bpm, tags });
+export function libraryUpdateMetadata(
+  trackId: number,
+  title: string,
+  bpm: number | null,
+  tags: string,
+  confirmManualBpm: boolean,
+): Promise<Track> {
+  return invoke<Track>("library_update_metadata", { id: trackId, title, bpm, tags, confirmManualBpm });
 }
 
 export function libraryMarkPlayed(trackId: number): Promise<void> {

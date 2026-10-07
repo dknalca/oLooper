@@ -28,6 +28,9 @@ The explicit target flags can cross-compile from either Mac architecture.
 The bundle declares macOS 11.0 (Big Sur) as its minimum and the build sets
 `MACOSX_DEPLOYMENT_TARGET=11.0`. Test the release on macOS 11 before claiming
 runtime compatibility; previous releases were verified on macOS 12.
+The frontend uses Tailwind CSS 3 to avoid Tailwind 4's Safari 16.4 CSS baseline,
+and import job IDs use `crypto.getRandomValues` with a fallback. Big Sur's
+WebKit 14.1 remains the minimum runtime target to verify on-device.
 
 The result is `dist/oLooper-<version>-unsigned.dmg`. It is not suitable for
 normal Gatekeeper distribution until signed and notarized.

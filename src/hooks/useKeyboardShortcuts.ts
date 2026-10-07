@@ -1,10 +1,12 @@
 import { useEffect, useRef } from "react";
 import {
+  playerStatus as getPlayerStatus,
   playerPlay,
   playerPause,
   playerStop,
   playerSeek,
   playerSetLoopEnabled,
+  type PlayerStatus,
 } from "../tauri";
 
 // Global player state ref — updated by Player component via exposePlayerState().
@@ -35,17 +37,31 @@ function isTextInput(el: Element | null): boolean {
 }
 
 export default function useKeyboardShortcuts() {
-  const pendingRef = useRef<Promise<unknown>>(Promise.resolve());
+  const pendingRef = useRef<Promise<void>>(Promise.resolve());
 
   // Chain async player calls to avoid races.
-  const chain = (fn: () => Promise<unknown>) => {
-    pendingRef.current = pendingRef.current.then(fn).catch(() => {});
+  const chain = (fn: () => Promise<PlayerStatus>) => {
+    pendingRef.current = pendingRef.current.then(async () => {
+      const status = await fn();
+      exposePlayerState(status);
+      window.dispatchEvent(new CustomEvent<PlayerStatus>("olooper:player-status", { detail: status }));
+    }).catch(async () => {
+      try {
+        const status = await getPlayerStatus();
+        exposePlayerState(status);
+        window.dispatchEvent(new CustomEvent<PlayerStatus>("olooper:player-status", { detail: status }));
+      } catch {
+        // Keep shortcuts responsive even when the audio engine is unavailable.
+      }
+    });
   };
 
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
       // Skip when typing in inputs.
       if (isTextInput(document.activeElement)) return;
+      // Dialog controls own Space/Enter; tapping tempo must not toggle playback.
+      if (document.activeElement?.closest('[role="dialog"]')) return;
       // Skip other modified shortcuts (allow Cmd+C, Cmd+V, etc.).
       if (e.metaKey || e.ctrlKey || e.altKey) return;
 
@@ -62,8 +78,10 @@ export default function useKeyboardShortcuts() {
         case "Space": {
           e.preventDefault();
           if (isPlaying) {
+            isPlaying = false;
             chain(() => playerPause());
           } else if (isLoaded) {
+            isPlaying = true;
             chain(() => playerPlay());
           }
           break;

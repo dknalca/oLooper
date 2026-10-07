@@ -554,6 +554,32 @@ fn choose_output_config(
         })
 }
 
+#[derive(Clone)]
+struct OutputErrorReporter {
+    tx: std::sync::mpsc::Sender<EngineCmd>,
+    generation: u64,
+    device_name: String,
+    reported: Arc<AtomicBool>,
+}
+
+impl OutputErrorReporter {
+    fn report(&self, error: cpal::StreamError) {
+        if self.reported.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        let error = error.to_string();
+        crate::audio_log::write(&format!(
+            "audio_stream_error device={:?} error={error}",
+            self.device_name
+        ));
+        let _ = self.tx.send(EngineCmd::OutputFailed {
+            generation: self.generation,
+            device_name: self.device_name.clone(),
+            error,
+        });
+    }
+}
+
 fn build_typed_output_stream<T>(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
@@ -561,6 +587,7 @@ fn build_typed_output_stream<T>(
     output_channels: u16,
     first_channel: u16,
     output_meter: Arc<OutputMeter>,
+    error_reporter: OutputErrorReporter,
 ) -> Result<cpal::Stream, String>
 where
     T: cpal::SizedSample + FromSample<f32>,
@@ -577,9 +604,7 @@ where
                     &output_meter,
                 );
             },
-            |error| {
-                crate::audio_log::write(&format!("audio_stream_error error={error}"));
-            },
+            move |error| error_reporter.report(error),
             None,
         )
         .map_err(|error| format!("cannot open requested audio format: {error}"))
@@ -593,6 +618,7 @@ fn build_output_stream(
     output_channels: u16,
     first_channel: u16,
     output_meter: Arc<OutputMeter>,
+    error_reporter: OutputErrorReporter,
 ) -> Result<cpal::Stream, String> {
     match format {
         SampleFormat::F32 => build_typed_output_stream::<f32>(
@@ -602,6 +628,7 @@ fn build_output_stream(
             output_channels,
             first_channel,
             output_meter,
+            error_reporter.clone(),
         ),
         SampleFormat::F64 => build_typed_output_stream::<f64>(
             device,
@@ -610,6 +637,7 @@ fn build_output_stream(
             output_channels,
             first_channel,
             output_meter,
+            error_reporter.clone(),
         ),
         SampleFormat::I8 => build_typed_output_stream::<i8>(
             device,
@@ -618,6 +646,7 @@ fn build_output_stream(
             output_channels,
             first_channel,
             output_meter,
+            error_reporter.clone(),
         ),
         SampleFormat::I16 => build_typed_output_stream::<i16>(
             device,
@@ -626,6 +655,7 @@ fn build_output_stream(
             output_channels,
             first_channel,
             output_meter,
+            error_reporter.clone(),
         ),
         SampleFormat::I32 => build_typed_output_stream::<i32>(
             device,
@@ -634,6 +664,7 @@ fn build_output_stream(
             output_channels,
             first_channel,
             output_meter,
+            error_reporter.clone(),
         ),
         SampleFormat::I64 => build_typed_output_stream::<i64>(
             device,
@@ -642,6 +673,7 @@ fn build_output_stream(
             output_channels,
             first_channel,
             output_meter,
+            error_reporter.clone(),
         ),
         SampleFormat::U8 => build_typed_output_stream::<u8>(
             device,
@@ -650,6 +682,7 @@ fn build_output_stream(
             output_channels,
             first_channel,
             output_meter,
+            error_reporter.clone(),
         ),
         SampleFormat::U16 => build_typed_output_stream::<u16>(
             device,
@@ -658,6 +691,7 @@ fn build_output_stream(
             output_channels,
             first_channel,
             output_meter,
+            error_reporter.clone(),
         ),
         SampleFormat::U32 => build_typed_output_stream::<u32>(
             device,
@@ -666,6 +700,7 @@ fn build_output_stream(
             output_channels,
             first_channel,
             output_meter,
+            error_reporter.clone(),
         ),
         SampleFormat::U64 => build_typed_output_stream::<u64>(
             device,
@@ -674,6 +709,7 @@ fn build_output_stream(
             output_channels,
             first_channel,
             output_meter,
+            error_reporter,
         ),
         format => Err(format!("unsupported audio sample format: {format:?}")),
     }
@@ -802,6 +838,8 @@ fn select_output_config(selection: &OutputSelection) -> Result<SelectedOutputCon
 fn open_output(
     selection: &OutputSelection,
     output_meter: Arc<OutputMeter>,
+    tx: std::sync::mpsc::Sender<EngineCmd>,
+    generation: u64,
 ) -> Result<OutputRuntime, String> {
     let SelectedOutputConfig { device, config } = select_output_config(selection)?;
     let channels = config.channels();
@@ -827,6 +865,12 @@ fn open_output(
         channels,
         selection.first_channel,
         output_meter,
+        OutputErrorReporter {
+            tx,
+            generation,
+            device_name: name.clone(),
+            reported: Arc::new(AtomicBool::new(false)),
+        },
     )
     .map_err(|error| {
         crate::audio_log::write(&format!(
@@ -1121,7 +1165,25 @@ fn pitch_job_current(track: &Loaded, track_generation: u64, job: u64, speed: f32
         && track.generation == track_generation
         && track.pitch_job == job
         && track.pitch_job_speed == speed
-        && (track.speed - speed).abs() <= f32::EPSILON
+}
+
+fn output_reopen_needed(
+    selection: &OutputSelection,
+    opened_device: &str,
+    system_default_device: Option<&str>,
+    target_available: bool,
+) -> bool {
+    !target_available
+        || opened_device.is_empty()
+        || (selection.device_name.is_none()
+            && system_default_device.is_some_and(|default| {
+                should_reopen_default_output(selection, opened_device, default)
+            }))
+}
+
+fn pitch_job_needs_replacement(track: &Loaded, completed_speed: f32) -> bool {
+    (track.pitch_requested_speed - completed_speed).abs() > f32::EPSILON
+        || (track.speed - completed_speed).abs() > f32::EPSILON
 }
 
 /// A load completion applies only if it is still the latest request.
@@ -1140,15 +1202,122 @@ fn remap_frame(frame: usize, old_total: usize, new_total: usize) -> usize {
     ((frame as u128 * new_total as u128) / old_total as u128) as usize
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct FileIdentity {
+    size: u64,
+    modified: Option<std::time::SystemTime>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct AudioLoadRequest {
+    key: String,
+    source: AudioLoadSource,
+}
+
+#[derive(Clone, Debug)]
+enum AudioLoadSource {
+    File {
+        path: String,
+    },
+    EmbeddedSound {
+        path: String,
+        source_type: String,
+        sound_id: u16,
+        source_hash: String,
+    },
+}
+
+impl AudioLoadRequest {
+    pub(crate) fn file(key: String, path: String) -> Self {
+        Self {
+            key,
+            source: AudioLoadSource::File { path },
+        }
+    }
+
+    pub(crate) fn embedded_sound(
+        key: String,
+        path: String,
+        source_type: String,
+        sound_id: u16,
+        source_hash: String,
+    ) -> Self {
+        Self {
+            key,
+            source: AudioLoadSource::EmbeddedSound {
+                path,
+                source_type,
+                sound_id,
+                source_hash,
+            },
+        }
+    }
+
+    fn key(&self) -> &str {
+        &self.key
+    }
+
+    fn identity_path(&self) -> &str {
+        match &self.source {
+            AudioLoadSource::File { path } | AudioLoadSource::EmbeddedSound { path, .. } => path,
+        }
+    }
+
+    pub(crate) fn decode(&self) -> Result<LoopBuffer, String> {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match &self.source {
+            AudioLoadSource::File { path } => read_and_decode(path),
+            AudioLoadSource::EmbeddedSound {
+                path,
+                source_type,
+                sound_id,
+                source_hash,
+            } => crate::library::decode_embedded_sound_file(
+                path,
+                source_type,
+                *sound_id,
+                source_hash,
+            ),
+        }))
+        .map_err(|_| "cannot decode audio source: decoder failed".to_string())?
+    }
+}
+
+fn file_identity(path: &str) -> Option<FileIdentity> {
+    let metadata = std::fs::metadata(path).ok()?;
+    Some(FileIdentity {
+        size: metadata.len(),
+        modified: metadata.modified().ok(),
+    })
+}
+
 #[derive(Clone)]
 struct PendingLoad {
     generation: u64,
     path: String,
+    request: AudioLoadRequest,
+    identity: Option<FileIdentity>,
+}
+
+#[derive(Clone)]
+struct DecodedCacheEntry {
+    path: String,
+    identity: FileIdentity,
+    buffer: Arc<LoopBuffer>,
+}
+
+fn decoded_cache_entry_matches(
+    entry: &DecodedCacheEntry,
+    path: &str,
+    identity: &FileIdentity,
+) -> bool {
+    entry.path == path && entry.identity == *identity
 }
 
 pub struct Player {
-    _output_stream: cpal::Stream,
+    _output_stream: Option<cpal::Stream>,
+    stream_generation: u64,
     output_device_name: String,
+    output_error: Option<String>,
     output_mixer: Arc<DynamicMixerController<f32>>,
     output_channels: u16,
     output_sample_rate: u32,
@@ -1173,10 +1342,18 @@ impl Player {
         selection: &OutputSelection,
     ) -> Result<Self, String> {
         let output_meter = Arc::new(OutputMeter::default());
-        let output = open_output(selection, output_meter.clone())?;
+        let stream_generation = 1;
+        let output = open_output(
+            selection,
+            output_meter.clone(),
+            tx.clone(),
+            stream_generation,
+        )?;
         Ok(Self {
-            _output_stream: output.stream,
+            _output_stream: Some(output.stream),
+            stream_generation,
             output_device_name: output.device_name,
+            output_error: None,
             output_mixer: output.mixer,
             output_channels: output.channels,
             output_sample_rate: output.sample_rate,
@@ -1202,10 +1379,7 @@ impl Player {
             .sink
             .as_ref()
             .is_some_and(|sink| !sink.is_paused() && !sink.empty());
-        let metronome_was_playing = self
-            .metronome_sink
-            .as_ref()
-            .is_some_and(|sink| !sink.is_paused() && !sink.empty());
+        let metronome_was_playing = self.metronome_bpm.is_some();
         let had_sink = self.sink.is_some();
         if was_playing {
             if let Some(sink) = &self.sink {
@@ -1215,10 +1389,21 @@ impl Player {
                 track.resume_frame = track.cursor.load(Ordering::Relaxed);
             }
         }
+        if metronome_was_playing {
+            if let Some(sink) = &self.metronome_sink {
+                sink.pause();
+            }
+        }
         // Stop the old route before attempting to open the new one. If the new
         // device rejects its stream configuration, playback remains safely
         // paused instead of continuing through the previously selected output.
-        let output = open_output(selection, self.output_meter.clone())?;
+        let stream_generation = self.stream_generation.wrapping_add(1);
+        let output = open_output(
+            selection,
+            self.output_meter.clone(),
+            self.tx.clone(),
+            stream_generation,
+        )?;
         let new_sink = if had_sink {
             if let Some(track) = self.track.as_mut() {
                 let from = track.cursor.load(Ordering::Relaxed);
@@ -1271,8 +1456,10 @@ impl Player {
 
         self.sink = new_sink;
         self.metronome_sink = new_metronome_sink;
-        self._output_stream = output.stream;
+        self._output_stream = Some(output.stream);
+        self.stream_generation = stream_generation;
         self.output_device_name = output.device_name;
+        self.output_error = None;
         self.output_mixer = output.mixer;
         self.output_channels = output.channels;
         self.output_sample_rate = output.sample_rate;
@@ -1637,6 +1824,41 @@ impl Player {
         Ok(self.status())
     }
 
+    fn unload(&mut self) {
+        self.pitch_seq = self.pitch_seq.wrapping_add(1);
+        self.output_test_resume_playback = false;
+        self.output_test_resume_metronome = false;
+        self.output_test_sink = None;
+        self.sink = None;
+        self.track = None;
+        self.output_meter.reset();
+    }
+
+    fn handle_stream_failure(&mut self, generation: u64, device_name: &str, error: &str) -> bool {
+        if self.stream_generation != generation || self.output_device_name != device_name {
+            return false;
+        }
+        if let Some(track) = self.track.as_mut() {
+            if self
+                .sink
+                .as_ref()
+                .is_some_and(|sink| !sink.is_paused() && !sink.empty())
+            {
+                track.resume_frame = track.cursor.load(Ordering::Relaxed);
+            }
+        }
+        self.sink = None;
+        self.metronome_sink = None;
+        self.output_test_sink = None;
+        self.output_test_resume_playback = false;
+        self.output_test_resume_metronome = false;
+        self._output_stream = None;
+        self.output_device_name.clear();
+        self.output_error = Some(format!("Audio output disconnected: {error}"));
+        self.output_meter.reset();
+        true
+    }
+
     pub fn set_volume(&mut self, volume_pct: f32) -> Result<PlayerStatus, String> {
         if !(0.0..=100.0).contains(&volume_pct) {
             return Err("volume must be 0–100".to_string());
@@ -1677,36 +1899,36 @@ impl Player {
 
     pub fn set_pitch_lock(&mut self, enabled: bool) -> Result<PlayerStatus, String> {
         if !enabled {
-            // Cancel: invalidate any in-flight job, restore the original
-            // buffer, keep playback position.
-            let seq = self.pitch_seq + 1;
+            let (original, speed) = self
+                .track
+                .as_ref()
+                .map(|track| (track.original_buf.clone(), track.speed))
+                .ok_or("nothing loaded")?;
+            self.replace_active_buffer(original, speed)?;
+            let seq = self.pitch_seq.wrapping_add(1);
             self.pitch_seq = seq;
             let track = self.track.as_mut().ok_or("nothing loaded")?;
             track.pitch_lock = false;
             track.pitch_pending = false;
             track.pitch_job = seq;
             track.pitch_error = None;
-            track.buf = track.original_buf.clone();
-            let speed = track.speed;
             crate::audio_log::write(&format!(
                 "pitch_lock_changed enabled=false speed={speed:.3}"
             ));
-            if let Some(sink) = &self.sink {
-                sink.set_speed(speed);
-            }
             return Ok(self.status());
+        }
+        let speed = self.track.as_ref().ok_or("nothing loaded")?.speed;
+        if (speed - 1.0).abs() <= f32::EPSILON {
+            let original = self.track.as_ref().unwrap().original_buf.clone();
+            self.replace_active_buffer(original, 1.0)?;
         }
         let needs_stretch = {
             let track = self.track.as_mut().ok_or("nothing loaded")?;
             track.pitch_lock = true;
             track.pitch_error = None;
-            if (track.speed - 1.0).abs() <= f32::EPSILON {
+            if (speed - 1.0).abs() <= f32::EPSILON {
                 // No stretch needed at 100%: apply immediately, no worker.
                 track.pitch_pending = false;
-                track.buf = track.original_buf.clone();
-                if let Some(sink) = &self.sink {
-                    sink.set_speed(1.0);
-                }
                 false
             } else {
                 true
@@ -1720,6 +1942,47 @@ impl Player {
             self.request_stretch();
         }
         Ok(self.status())
+    }
+
+    /// Switch the live source buffer while preserving its proportional play
+    /// position and loop bounds. A paused sink must be dropped too: resuming it
+    /// would continue reading from the old buffer.
+    fn replace_active_buffer(&mut self, buffer: Arc<LoopBuffer>, speed: f32) -> Result<(), String> {
+        let Some(track) = self.track.as_ref() else {
+            return Err("nothing loaded".to_string());
+        };
+        let old_frames = track.buf.frames().max(1);
+        let new_frames = buffer.frames().max(1);
+        let start = remap_frame(track.start_frame, old_frames, new_frames);
+        let end = remap_frame(track.end_frame, old_frames, new_frames)
+            .max(1)
+            .min(new_frames);
+        let from = remap_frame(track.cursor.load(Ordering::Relaxed), old_frames, new_frames);
+        let resume = remap_frame(track.resume_frame, old_frames, new_frames);
+        let (enabled, volume, cursor) = (track.enabled, track.volume, track.cursor.clone());
+        let was_playing = self
+            .sink
+            .as_ref()
+            .is_some_and(|sink| !sink.is_paused() && !sink.empty());
+        let replacement = if was_playing {
+            let source = LoopRegion::new(buffer.clone(), from, start, end, enabled, cursor.clone());
+            Some(self.fresh_sink(source, volume, speed)?)
+        } else {
+            None
+        };
+
+        self.sink = None;
+        if let Some(sink) = replacement {
+            sink.play();
+            self.sink = Some(sink);
+        }
+        cursor.store(from, Ordering::Relaxed);
+        let track = self.track.as_mut().ok_or("nothing loaded")?;
+        track.buf = buffer;
+        track.start_frame = start;
+        track.end_frame = end;
+        track.resume_frame = resume;
+        Ok(())
     }
 
     /// Queue a WSOLA stretch of the original buffer at the current speed.
@@ -1959,6 +2222,7 @@ impl Player {
             None => PlayerStatus {
                 output_left_level_pct,
                 output_right_level_pct,
+                output_error: self.output_error.clone(),
                 ..PlayerStatus::empty()
             },
             Some(t) => {
@@ -1991,6 +2255,7 @@ impl Player {
                     loop_quality: t.loop_quality,
                     output_left_level_pct,
                     output_right_level_pct,
+                    output_error: self.output_error.clone(),
                 }
             }
         }
@@ -2027,6 +2292,7 @@ pub struct PlayerStatus {
     /// Digital peak sent to each routed channel since the last status read.
     pub output_left_level_pct: f32,
     pub output_right_level_pct: f32,
+    pub output_error: Option<String>,
 }
 
 impl PlayerStatus {
@@ -2055,6 +2321,7 @@ impl PlayerStatus {
             loop_quality: 1.0,
             output_left_level_pct: 0.0,
             output_right_level_pct: 0.0,
+            output_error: None,
         }
     }
 }
@@ -2068,7 +2335,7 @@ impl PlayerStatus {
 pub struct Engine {
     player: Option<Player>,
     output_selection: OutputSelection,
-    last_default_output_failure: Option<String>,
+    last_default_output_failure: Option<(String, std::time::Instant)>,
     /// Cloned into background workers so completions re-enter this loop.
     tx: std::sync::mpsc::Sender<EngineCmd>,
     pending_volume: f32,
@@ -2081,7 +2348,7 @@ pub struct Engine {
     /// replace `pending_load`; only the newest one starts next.
     decode_running: bool,
     last_load_error: Option<String>,
-    decoded_cache: VecDeque<(String, Arc<LoopBuffer>)>,
+    decoded_cache: VecDeque<DecodedCacheEntry>,
     decoded_cache_bytes: usize,
 }
 
@@ -2091,14 +2358,21 @@ type Reply = std::sync::mpsc::Sender<Result<PlayerStatus, String>>;
 /// `pub(crate)` constructors; never sent across the Tauri boundary.
 pub(crate) enum EngineCmd {
     Load {
-        path: String,
+        request: AudioLoadRequest,
         reply: Reply,
     },
     /// Posted by the decode worker. Applied only if still the latest load.
     LoadReady {
         generation: u64,
         path: String,
+        request: AudioLoadRequest,
+        identity: Option<FileIdentity>,
         result: Result<LoopBuffer, String>,
+    },
+    OutputFailed {
+        generation: u64,
+        device_name: String,
+        error: String,
     },
     Play {
         reply: Reply,
@@ -2107,6 +2381,9 @@ pub(crate) enum EngineCmd {
         reply: Reply,
     },
     Stop {
+        reply: Reply,
+    },
+    Unload {
         reply: Reply,
     },
     SetVolume {
@@ -2214,11 +2491,17 @@ impl Engine {
     }
 
     fn run(mut self, rx: std::sync::mpsc::Receiver<EngineCmd>) {
+        let mut next_default_output_check =
+            std::time::Instant::now() + std::time::Duration::from_secs(1);
         loop {
-            let cmd = match rx.recv_timeout(std::time::Duration::from_secs(1)) {
+            let wait =
+                next_default_output_check.saturating_duration_since(std::time::Instant::now());
+            let cmd = match rx.recv_timeout(wait) {
                 Ok(cmd) => cmd,
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                     self.follow_system_default_output();
+                    next_default_output_check =
+                        std::time::Instant::now() + std::time::Duration::from_secs(1);
                     continue;
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
@@ -2229,16 +2512,23 @@ impl Engine {
                 EngineCmd::LoadReady {
                     generation,
                     path,
+                    request,
+                    identity,
                     result,
-                } => self.cmd_load_ready(generation, path, result),
+                } => self.cmd_load_ready(generation, path, request, identity, result),
+                EngineCmd::OutputFailed {
+                    generation,
+                    device_name,
+                    error,
+                } => self.cmd_output_failed(generation, &device_name, &error),
                 EngineCmd::PitchReady {
                     track_generation,
                     job,
                     speed,
                     result,
                 } => self.cmd_pitch_ready(track_generation, job, speed, result),
-                EngineCmd::Load { path, reply } => {
-                    let _ = reply.send(self.cmd_load(path));
+                EngineCmd::Load { request, reply } => {
+                    let _ = reply.send(self.cmd_load_request(request));
                 }
                 EngineCmd::Play { reply } => {
                     let _ = reply.send(self.ensure().and_then(|p| p.play()));
@@ -2248,6 +2538,10 @@ impl Engine {
                 }
                 EngineCmd::Stop { reply } => {
                     let _ = reply.send(self.ensure().and_then(|p| p.stop()));
+                }
+                EngineCmd::Unload { reply } => {
+                    let result = self.cmd_unload();
+                    let _ = reply.send(result.map(|()| self.status()));
                 }
                 EngineCmd::SetVolume { volume_pct, reply } => {
                     let _ = reply.send(self.cmd_volume(volume_pct));
@@ -2318,41 +2612,75 @@ impl Engine {
                     let _ = reply.send(Ok(self.status()));
                 }
             }
+            if std::time::Instant::now() >= next_default_output_check {
+                self.follow_system_default_output();
+                next_default_output_check =
+                    std::time::Instant::now() + std::time::Duration::from_secs(1);
+            }
         }
     }
 
     fn follow_system_default_output(&mut self) {
-        if self.output_selection.device_name.is_some() {
-            return;
-        }
         let Some(player) = self.player.as_ref() else {
             return;
         };
         if player.output_test_sink.is_some() {
             return;
         }
-        let Some(default_name) = cpal::default_host()
+        let default_name = cpal::default_host()
             .default_output_device()
-            .and_then(|device| device.name().ok())
-        else {
+            .and_then(|device| device.name().ok());
+        let target_name = self
+            .output_selection
+            .device_name
+            .clone()
+            .or_else(|| default_name.clone());
+        let Some(target_name) = target_name else {
             return;
         };
-        if !should_reopen_default_output(
+        let target_present = cpal::default_host().output_devices().ok().map(|devices| {
+            devices
+                .filter_map(|device| device.name().ok())
+                .any(|name| name == target_name)
+        });
+        if target_present == Some(false) && player.output_device_name == target_name {
+            let generation = player.stream_generation;
+            if let Some(player) = self.player.as_mut() {
+                player.handle_stream_failure(generation, &target_name, "device is unavailable");
+            }
+        }
+        let Some(player) = self.player.as_ref() else {
+            return;
+        };
+        let needs_reopen = output_reopen_needed(
             &self.output_selection,
             &player.output_device_name,
-            &default_name,
-        ) {
-            if self.last_default_output_failure.as_deref() != Some(default_name.as_str()) {
+            default_name.as_deref(),
+            target_present.unwrap_or(true),
+        );
+        if !needs_reopen {
+            if self
+                .last_default_output_failure
+                .as_ref()
+                .is_some_and(|(failed_name, _)| failed_name != &target_name)
+            {
                 self.last_default_output_failure = None;
             }
             return;
         }
-        if self.last_default_output_failure.as_deref() == Some(default_name.as_str()) {
+        if self
+            .last_default_output_failure
+            .as_ref()
+            .is_some_and(|(failed_name, failed_at)| {
+                failed_name == &target_name
+                    && failed_at.elapsed() < std::time::Duration::from_secs(5)
+            })
+        {
             return;
         }
 
         crate::audio_log::write(&format!(
-            "system_default_output_changed old={:?} new={default_name:?}",
+            "audio_output_recovery_attempt old={:?} target={target_name:?}",
             player.output_device_name
         ));
         let result = self
@@ -2364,15 +2692,26 @@ impl Engine {
             Ok(()) => {
                 self.last_default_output_failure = None;
                 crate::audio_log::write(&format!(
-                    "system_default_output_applied device={default_name:?}"
+                    "audio_output_recovery_applied device={target_name:?}"
                 ));
             }
             Err(error) => {
-                self.last_default_output_failure = Some(default_name.clone());
+                self.last_default_output_failure =
+                    Some((target_name.clone(), std::time::Instant::now()));
                 crate::audio_log::write(&format!(
-                    "system_default_output_failed device={default_name:?} error={error}"
+                    "audio_output_recovery_failed device={target_name:?} error={error}"
                 ));
             }
+        }
+    }
+
+    fn cmd_output_failed(&mut self, generation: u64, device_name: &str, error: &str) {
+        let failed = self
+            .player
+            .as_mut()
+            .is_some_and(|player| player.handle_stream_failure(generation, device_name, error));
+        if failed {
+            self.last_default_output_failure = None;
         }
     }
 
@@ -2420,31 +2759,60 @@ impl Engine {
         Ok(self.status())
     }
 
+    fn cmd_unload(&mut self) -> Result<(), String> {
+        self.generation = self.generation.wrapping_add(1);
+        self.pending_load = None;
+        self.last_load_error = None;
+        *self
+            .loaded_buffer
+            .write()
+            .map_err(|error| format!("cannot clear loaded track: {error}"))? = None;
+        if let Some(player) = self.player.as_mut() {
+            player.unload();
+        }
+        Ok(())
+    }
+
     /// Start a background decode and return a loading status instantly.
     /// Previous audio keeps playing until a valid buffer arrives.
-    fn cmd_load(&mut self, path: String) -> Result<PlayerStatus, String> {
+    fn cmd_load_request(&mut self, request: AudioLoadRequest) -> Result<PlayerStatus, String> {
+        let path = request.key().to_string();
         self.generation += 1;
         let generation = self.generation;
-        if let Some(index) = self
+        // Any previous decode belongs to an older request, including when the
+        // latest request is satisfied immediately from the decoded cache.
+        self.pending_load = None;
+        self.last_load_error = None;
+        let mut identity = file_identity(request.identity_path());
+        self.decoded_cache
+            .retain(|entry| entry.path != path || Some(entry.identity.clone()) == identity);
+        self.decoded_cache_bytes = self
             .decoded_cache
             .iter()
-            .position(|(cached, _)| cached == &path)
-        {
-            let (_, buffer) = self
+            .map(|entry| entry.buffer.memory_bytes())
+            .sum();
+        if let Some(index) = identity.as_ref().and_then(|identity| {
+            self.decoded_cache
+                .iter()
+                .position(|entry| decoded_cache_entry_matches(entry, &path, identity))
+        }) {
+            let entry = self
                 .decoded_cache
                 .remove(index)
                 .expect("cache index exists");
+            let buffer = entry.buffer;
             self.decoded_cache_bytes = self
                 .decoded_cache_bytes
                 .saturating_sub(buffer.memory_bytes());
-            self.apply_loaded(path, generation, buffer);
+            self.apply_loaded(path, generation, identity.take(), buffer);
             return Ok(self.status());
         }
         self.pending_load = Some(PendingLoad {
             generation,
             path: path.clone(),
+            request,
+            identity: identity.clone(),
         });
-        self.last_load_error = None;
         if self.decode_running {
             return Ok(self.status());
         }
@@ -2461,10 +2829,12 @@ impl Engine {
         if std::thread::Builder::new()
             .name("olooper-decode".to_string())
             .spawn(move || {
-                let result = read_and_decode(&pending.path);
+                let result = pending.request.decode();
                 let _ = tx.send(EngineCmd::LoadReady {
                     generation: pending.generation,
                     path: pending.path,
+                    request: pending.request,
+                    identity: pending.identity,
                     result,
                 });
             })
@@ -2482,6 +2852,8 @@ impl Engine {
         &mut self,
         generation: u64,
         path: String,
+        request: AudioLoadRequest,
+        identity: Option<FileIdentity>,
         result: Result<LoopBuffer, String>,
     ) {
         self.decode_running = false;
@@ -2492,6 +2864,11 @@ impl Engine {
             return;
         }
         self.pending_load = None;
+        if file_identity(request.identity_path()) != identity {
+            self.last_load_error =
+                Some("audio file changed while it was loading; load it again".to_string());
+            return;
+        }
         let buf = match result {
             Err(e) => {
                 crate::audio_log::write(&format!("audio_decode_failed error={e}"));
@@ -2500,10 +2877,16 @@ impl Engine {
             }
             Ok(buf) => buf,
         };
-        self.apply_loaded(path, generation, Arc::new(buf));
+        self.apply_loaded(path, generation, identity, Arc::new(buf));
     }
 
-    fn apply_loaded(&mut self, path: String, generation: u64, buf: Arc<LoopBuffer>) {
+    fn apply_loaded(
+        &mut self,
+        path: String,
+        generation: u64,
+        identity: Option<FileIdentity>,
+        buf: Arc<LoopBuffer>,
+    ) {
         let vol = self.pending_volume;
         let applied: Result<(String, u64, Arc<LoopBuffer>), String> = (|| {
             let p = self.ensure()?;
@@ -2544,7 +2927,9 @@ impl Engine {
                     snapshot.2.rate,
                     snapshot.2.duration_ms(),
                 ));
-                self.cache_decoded(snapshot.0.clone(), snapshot.2.clone());
+                if let Some(identity) = identity {
+                    self.cache_decoded(snapshot.0.clone(), identity, snapshot.2.clone());
+                }
                 let path = snapshot.0.clone();
                 let published = std::time::Instant::now();
                 if self
@@ -2564,12 +2949,12 @@ impl Engine {
         }
     }
 
-    fn cache_decoded(&mut self, path: String, buffer: Arc<LoopBuffer>) {
-        self.decoded_cache.retain(|(cached, _)| cached != &path);
+    fn cache_decoded(&mut self, path: String, identity: FileIdentity, buffer: Arc<LoopBuffer>) {
+        self.decoded_cache.retain(|entry| entry.path != path);
         self.decoded_cache_bytes = self
             .decoded_cache
             .iter()
-            .map(|(_, cached)| cached.memory_bytes())
+            .map(|entry| entry.buffer.memory_bytes())
             .sum();
         let bytes = buffer.memory_bytes();
         if bytes > DECODE_CACHE_MAX_BYTES {
@@ -2578,15 +2963,19 @@ impl Engine {
         while self.decoded_cache.len() >= DECODE_CACHE_MAX_TRACKS
             || self.decoded_cache_bytes.saturating_add(bytes) > DECODE_CACHE_MAX_BYTES
         {
-            let Some((_, evicted)) = self.decoded_cache.pop_front() else {
+            let Some(evicted) = self.decoded_cache.pop_front() else {
                 break;
             };
             self.decoded_cache_bytes = self
                 .decoded_cache_bytes
-                .saturating_sub(evicted.memory_bytes());
+                .saturating_sub(evicted.buffer.memory_bytes());
         }
         self.decoded_cache_bytes += bytes;
-        self.decoded_cache.push_back((path, buffer));
+        self.decoded_cache.push_back(DecodedCacheEntry {
+            path,
+            identity,
+            buffer,
+        });
     }
 
     /// Swap in a stretched buffer only if track, speed, lock, and job all
@@ -2607,7 +2996,7 @@ impl Engine {
         if !pitch_job_current(t, track_generation, job, speed) {
             return; // superseded → discard
         }
-        if (t.pitch_requested_speed - speed).abs() > f32::EPSILON {
+        if pitch_job_needs_replacement(t, speed) {
             // The running job is obsolete, but it was the only permitted
             // worker. Start exactly one replacement for the newest request.
             t.pitch_pending = false;
@@ -2708,7 +3097,15 @@ impl EngineClient {
         self.tx
             .send(mk(tx))
             .map_err(|_| "audio engine stopped".to_string())?;
-        rx.recv().map_err(|_| "audio engine stopped".to_string())?
+        rx.recv_timeout(std::time::Duration::from_secs(30))
+            .map_err(|error| match error {
+                std::sync::mpsc::RecvTimeoutError::Timeout => {
+                    "audio engine did not respond within 30 seconds".to_string()
+                }
+                std::sync::mpsc::RecvTimeoutError::Disconnected => {
+                    "audio engine stopped".to_string()
+                }
+            })?
     }
 
     pub fn set_output(&self, selection: OutputSelection) -> Result<PlayerStatus, String> {
@@ -2720,7 +3117,12 @@ impl EngineClient {
     }
 
     pub fn load(&self, path: String) -> Result<PlayerStatus, String> {
-        self.call(|reply| EngineCmd::Load { path, reply })
+        let request = AudioLoadRequest::file(path.clone(), path);
+        self.load_request(request)
+    }
+
+    pub(crate) fn load_request(&self, request: AudioLoadRequest) -> Result<PlayerStatus, String> {
+        self.call(|reply| EngineCmd::Load { request, reply })
     }
 
     pub fn play(&self) -> Result<PlayerStatus, String> {
@@ -2733,6 +3135,10 @@ impl EngineClient {
 
     pub fn stop(&self) -> Result<PlayerStatus, String> {
         self.call(|reply| EngineCmd::Stop { reply })
+    }
+
+    pub fn unload(&self) -> Result<PlayerStatus, String> {
+        self.call(|reply| EngineCmd::Unload { reply })
     }
 
     pub fn set_volume(&self, volume_pct: f32) -> Result<PlayerStatus, String> {

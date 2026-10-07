@@ -408,6 +408,8 @@ fn check_supported_path(path: &Path) -> Result<MarkerContainer, String> {
 /// Read CUEs from the audio file every time a track is opened. Serato loops are
 /// parsed only so marker updates can preserve them; oLooper does not edit them.
 pub(super) fn read_audio_file(path: &Path) -> Result<ReadAudioMetadata, String> {
+    #[cfg(target_os = "windows")]
+    recover_replacement(path)?;
     let container = check_supported_path(path)?;
     match container {
         MarkerContainer::Id3 => read_id3_audio_file(path),
@@ -1706,6 +1708,43 @@ fn build_markers_mp4(id3_data: &[u8]) -> Result<Vec<u8>, String> {
     Ok(output)
 }
 
+fn recover_replacement(destination: &Path) -> Result<(), String> {
+    if destination.exists() {
+        return Ok(());
+    }
+    let parent = destination
+        .parent()
+        .ok_or_else(|| "Serato audio path has no parent directory".to_string())?;
+    let stem = destination
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .ok_or_else(|| "Serato audio path has no valid file name".to_string())?;
+    let prefix = format!("{stem}.serato-backup-");
+    let mut backups = fs::read_dir(parent)
+        .map_err(|error| format!("cannot inspect Serato recovery backups: {error}"))?
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry.file_name().to_string_lossy().starts_with(&prefix)
+                && entry.file_type().is_ok_and(|kind| kind.is_file())
+        })
+        .collect::<Vec<_>>();
+    backups.sort_by_key(|entry| {
+        entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
+    });
+    let Some(backup) = backups.pop() else {
+        return Ok(());
+    };
+    fs::rename(backup.path(), destination).map_err(|error| {
+        format!(
+            "cannot restore Serato audio backup {}: {error}",
+            backup.path().display()
+        )
+    })
+}
+
 fn replace_file(temporary: &Path, destination: &Path) -> Result<(), String> {
     #[cfg(not(target_os = "windows"))]
     {
@@ -1714,6 +1753,7 @@ fn replace_file(temporary: &Path, destination: &Path) -> Result<(), String> {
     }
     #[cfg(target_os = "windows")]
     {
+        recover_replacement(destination)?;
         let backup = destination.with_extension(format!(
             "serato-backup-{}-{}",
             std::process::id(),
@@ -1722,10 +1762,15 @@ fn replace_file(temporary: &Path, destination: &Path) -> Result<(), String> {
         fs::rename(destination, &backup)
             .map_err(|error| format!("cannot stage library audio for Serato metadata: {error}"))?;
         if let Err(error) = fs::rename(temporary, destination) {
-            let _ = fs::rename(&backup, destination);
-            return Err(format!(
-                "cannot replace library audio with Serato metadata: {error}"
-            ));
+            return match fs::rename(&backup, destination) {
+                Ok(()) => Err(format!(
+                    "cannot replace library audio with Serato metadata: {error}"
+                )),
+                Err(restore_error) => Err(format!(
+                    "cannot replace library audio with Serato metadata: {error}; backup recovery failed at {}: {restore_error}",
+                    backup.display()
+                )),
+            };
         }
         fs::remove_file(backup)
             .map_err(|error| format!("Serato metadata synced but backup cleanup failed: {error}"))
@@ -1765,6 +1810,24 @@ mod tests {
             offset = end + (length % 2);
         }
         panic!("WAV has no data chunk");
+    }
+
+    #[test]
+    fn replacement_recovery_restores_backup_when_destination_is_missing() {
+        let directory = std::env::temp_dir().join(format!(
+            "olooper-serato-recovery-{}",
+            TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let destination = directory.join("loop.wav");
+        let backup = directory.join("loop.serato-backup-test-1");
+        fs::write(&backup, b"original audio").unwrap();
+
+        recover_replacement(&destination).unwrap();
+
+        assert_eq!(fs::read(&destination).unwrap(), b"original audio");
+        assert!(!backup.exists());
+        fs::remove_dir_all(directory).unwrap();
     }
 
     fn wav_id3_chunk_ids(bytes: &[u8]) -> Vec<[u8; 4]> {

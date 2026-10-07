@@ -19,7 +19,7 @@ use crate::import::swf::Sound;
 mod serato;
 
 /// Current schema version (`PRAGMA user_version`).
-const SCHEMA_VERSION: i32 = 8;
+const SCHEMA_VERSION: i32 = 9;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Track {
@@ -27,8 +27,12 @@ pub struct Track {
     pub title: String,
     pub looper_name: String,
     pub file_path: String,
+    /// Virtual engine key for source-backed audio; otherwise equals file_path.
+    pub playback_path: String,
     /// False when the file was moved/deleted outside the app.
     pub exists: bool,
+    /// `extracted` audio file or `embedded` sound decoded from the managed source.
+    pub audio_storage: String,
     pub source_type: String,
     pub source_path: String,
     pub source_hash: String,
@@ -132,6 +136,34 @@ pub fn sha256_hex(data: &[u8]) -> String {
     format!("{:x}", Sha256::digest(data))
 }
 
+fn copy_file_noclobber(source: &Path, destination: &Path) -> std::io::Result<()> {
+    let parent = destination
+        .parent()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "missing parent"))?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    let mut input = std::fs::File::open(source)?;
+    std::io::copy(&mut input, temporary.as_file_mut())?;
+    temporary.as_file().sync_all()?;
+    temporary
+        .persist_noclobber(destination)
+        .map(|_| ())
+        .map_err(|error| error.error)
+}
+
+fn write_bytes_noclobber(bytes: &[u8], destination: &Path) -> std::io::Result<()> {
+    let parent = destination
+        .parent()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "missing parent"))?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    use std::io::Write;
+    temporary.write_all(bytes)?;
+    temporary.as_file().sync_all()?;
+    temporary
+        .persist_noclobber(destination)
+        .map(|_| ())
+        .map_err(|error| error.error)
+}
+
 /// Strip path separators, `..`, control chars; cap length. Never empty.
 pub fn sanitize_name(raw: &str) -> String {
     let mut s: String = raw
@@ -160,6 +192,12 @@ pub fn sanitize_name(raw: &str) -> String {
     } else {
         s
     }
+}
+
+fn extracted_group_directory_name(looper: &str, source_hash: &str) -> String {
+    let label: String = sanitize_name(looper).chars().take(56).collect();
+    let identity = sha256_hex(source_hash.as_bytes());
+    format!("{label}-{}", &identity[..16])
 }
 
 fn playlist_name(raw: &str) -> Result<String, String> {
@@ -306,19 +344,27 @@ impl Library {
                  source_sound_id,codec,sample_rate,channels,duration_ms,seek_samples,trimmed_leading,\
                  bpm,bpm_confidence,bpm_source,primary_cue_ms,loop_start_ms,\
                    loop_end_ms,loop_enabled,loop_start_frame,loop_end_frame,loop_origin,\
-                   loop_quality,loop_needs_review,total_frames,imported_at,updated_at,favorite,tags,last_played_at \
+                 loop_quality,loop_needs_review,total_frames,imported_at,updated_at,favorite,tags,last_played_at,audio_storage \
                  FROM tracks ORDER BY id",
             )
             .map_err(|e| e.to_string())?;
         let rows = stmt
             .query_map([], |r| {
                 let file_path: String = r.get(3)?;
+                let id: i64 = r.get(0)?;
+                let audio_storage: String = r.get(32)?;
                 Ok(Track {
-                    id: r.get(0)?,
+                    id,
                     title: r.get(1)?,
                     looper_name: r.get(2)?,
                     file_path: file_path.clone(),
+                    playback_path: if audio_storage == "embedded" {
+                        format!("embedded:{id}")
+                    } else {
+                        file_path.clone()
+                    },
                     exists: Path::new(&file_path).is_file(),
+                    audio_storage: audio_storage.clone(),
                     source_type: r.get(4)?,
                     source_path: r.get(5)?,
                     source_hash: r.get(6)?,
@@ -632,10 +678,56 @@ impl Library {
         Ok(self.list_tracks()?.into_iter().find(|t| t.id == id))
     }
 
+    pub(crate) fn playback_request(
+        &self,
+        id: i64,
+    ) -> Result<crate::player::AudioLoadRequest, String> {
+        let track = self
+            .get_track(id)?
+            .ok_or_else(|| format!("track {id} not found"))?;
+        let path = self.managed_source_path_for_track(&track)?;
+        if track.audio_storage == "embedded" {
+            if !matches!(track.source_type.as_str(), "swf" | "exe") {
+                return Err("embedded audio must belong to an SWF/EXE source".to_string());
+            }
+            let sound_id = u16::try_from(track.source_sound_id)
+                .map_err(|_| "embedded sound ID is invalid".to_string())?;
+            Ok(crate::player::AudioLoadRequest::embedded_sound(
+                track.playback_path,
+                path.to_string_lossy().to_string(),
+                track.source_type,
+                sound_id,
+                track.source_hash,
+            ))
+        } else {
+            Ok(crate::player::AudioLoadRequest::file(
+                track.playback_path,
+                path.to_string_lossy().to_string(),
+            ))
+        }
+    }
+
+    fn managed_source_path_for_track(&self, track: &Track) -> Result<PathBuf, String> {
+        let path = Path::new(&track.file_path)
+            .canonicalize()
+            .map_err(|error| format!("cannot resolve track source: {error}"))?;
+        let root = self
+            .root
+            .canonicalize()
+            .map_err(|error| format!("cannot resolve library root: {error}"))?;
+        if !path.starts_with(root) || !path.is_file() {
+            return Err("track source is not a regular file in the managed library".to_string());
+        }
+        Ok(path)
+    }
+
     pub fn managed_audio_path_for_track(&self, id: i64) -> Result<PathBuf, String> {
         let track = self
             .get_track(id)?
             .ok_or_else(|| format!("track {id} not found"))?;
+        if track.audio_storage != "extracted" {
+            return Err("source-backed audio has no managed audio file".to_string());
+        }
         let path = Path::new(&track.file_path)
             .canonicalize()
             .map_err(|error| format!("cannot resolve track audio: {error}"))?;
@@ -714,6 +806,45 @@ impl Library {
         seek_samples: i64,
         trimmed_leading: i64,
     ) -> Result<(i64, bool), String> {
+        self.add_track_with_storage(
+            title,
+            looper_name,
+            file_path,
+            source_type,
+            source_path,
+            source_hash,
+            source_sound_id,
+            exe_offset,
+            exe_length,
+            codec,
+            buf,
+            seek_samples,
+            trimmed_leading,
+            "extracted",
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn add_track_with_storage(
+        &self,
+        title: &str,
+        looper_name: &str,
+        file_path: &Path,
+        source_type: &str,
+        source_path: &str,
+        source_hash: &str,
+        source_sound_id: i64,
+        exe_offset: Option<i64>,
+        exe_length: Option<i64>,
+        codec: &str,
+        buf: &crate::player::LoopBuffer,
+        seek_samples: i64,
+        trimmed_leading: i64,
+        audio_storage: &str,
+    ) -> Result<(i64, bool), String> {
+        if !matches!(audio_storage, "extracted" | "embedded") {
+            return Err("unknown audio storage mode".to_string());
+        }
         let now = now_secs();
         let duration = buf.duration_ms() as i64;
         let total_frames = buf.frames() as i64;
@@ -726,9 +857,9 @@ impl Library {
                  seek_samples,trimmed_leading,\
                  primary_cue_ms,loop_start_ms,loop_end_ms,loop_enabled,\
                  loop_start_frame,loop_end_frame,loop_origin,loop_quality,loop_needs_review,total_frames,\
-                 imported_at,updated_at) \
+                  imported_at,updated_at,audio_storage) \
                    VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,\
-                   0,0,?13,1,0,?16,'manual',1.0,0,?16,?17,?17) \
+                    0,0,?13,1,0,?16,'manual',1.0,0,?16,?17,?17,?18) \
                  ON CONFLICT(source_hash,source_sound_id) DO NOTHING",
                 rusqlite::params![
                     title,
@@ -748,6 +879,7 @@ impl Library {
                     trimmed_leading,
                     total_frames,
                     now,
+                    audio_storage,
                 ],
             )
             .map_err(|e| e.to_string())?;
@@ -852,9 +984,21 @@ impl Library {
             .map_err(|error| error.to_string())?;
         let last_group_track = remaining == 0 && track.source_type != "custom";
         let file_path = PathBuf::from(&track.file_path);
-        let mut candidates = vec![file_path.clone()];
+        let embedded = track.audio_storage == "embedded";
+        let embedded_directory = if last_group_track && embedded {
+            Some(self.group_cover_directory(&track.source_hash)?)
+        } else {
+            None
+        };
+        let mut candidates = if embedded {
+            Vec::new()
+        } else {
+            vec![file_path.clone()]
+        };
         if last_group_track {
-            if let Some(directory) = file_path.parent() {
+            if let Some(directory) = &embedded_directory {
+                candidates.push(directory.join("cover.jpg"));
+            } else if let Some(directory) = file_path.parent() {
                 candidates.push(directory.join("cover.jpg"));
             }
         }
@@ -878,7 +1022,9 @@ impl Library {
             self.purge_quarantined(quarantined)?;
         }
         if last_group_track {
-            if let Some(directory) = file_path.parent() {
+            if let Some(directory) = embedded_directory {
+                let _ = std::fs::remove_dir(directory);
+            } else if let Some(directory) = file_path.parent() {
                 let _ = std::fs::remove_dir(directory);
             }
         }
@@ -906,6 +1052,7 @@ impl Library {
         title: &str,
         bpm: Option<f64>,
         tags: &str,
+        confirm_manual_bpm: bool,
     ) -> Result<Track, String> {
         let title = sanitize_name(title);
         if let Some(bpm) = bpm {
@@ -919,7 +1066,23 @@ impl Library {
             .filter(|tag| tag != "untitled")
             .collect::<Vec<_>>()
             .join(", ");
-        let changed = self.conn.execute("UPDATE tracks SET title=?1,bpm=?2,bpm_source=CASE WHEN ?2 IS NULL THEN bpm_source ELSE 'manual' END,tags=?3,updated_at=?4 WHERE id=?5", rusqlite::params![title, bpm, tags, now_secs(), id]).map_err(|e| e.to_string())?;
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE tracks SET title=?1,bpm=?2,\
+             bpm_source=CASE WHEN ?5 THEN 'manual' ELSE bpm_source END,\
+             bpm_confidence=CASE WHEN ?5 THEN NULL ELSE bpm_confidence END,\
+             tags=?3,updated_at=?4 WHERE id=?6",
+                rusqlite::params![
+                    title,
+                    bpm,
+                    tags,
+                    now_secs(),
+                    confirm_manual_bpm && bpm.is_some(),
+                    id
+                ],
+            )
+            .map_err(|e| e.to_string())?;
         if changed == 0 {
             return Err(format!("track {id} not found"));
         }
@@ -957,28 +1120,63 @@ impl Library {
             let track = self
                 .get_track(*id)?
                 .ok_or_else(|| format!("track {id} not found"))?;
-            let source = Path::new(&track.file_path);
-            if !source.is_file() {
-                return Err(format!("audio for '{}' is missing", track.title));
-            }
-            let extension = source
-                .extension()
-                .and_then(|value| value.to_str())
-                .unwrap_or("wav");
-            let stem = sanitize_name(&track.title);
-            let mut target = destination.join(format!("{stem}.{extension}"));
-            for suffix in 2..=10_000 {
-                if !target.exists() {
-                    break;
+            let (source, embedded_wav, extension) = if track.audio_storage == "embedded" {
+                let source_path = self.managed_source_path_for_track(&track)?;
+                let buffer = decode_embedded_sound_file(
+                    &source_path.to_string_lossy(),
+                    &track.source_type,
+                    u16::try_from(track.source_sound_id)
+                        .map_err(|_| "embedded sound ID is invalid".to_string())?,
+                    &track.source_hash,
+                )?;
+                (
+                    None,
+                    Some(Self::loop_buffer_to_wav(&buffer)),
+                    "wav".to_string(),
+                )
+            } else {
+                let source = self.managed_audio_path_for_track(*id)?;
+                if !source.is_file() {
+                    return Err(format!("audio for '{}' is missing", track.title));
                 }
-                target = destination.join(format!("{stem} ({suffix}).{extension}"));
+                let extension = source
+                    .extension()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or("wav")
+                    .to_string();
+                (Some(source), None, extension)
+            };
+            let stem = sanitize_name(&track.title);
+            let mut suffix = 1usize;
+            loop {
+                let name = if suffix == 1 {
+                    format!("{stem}.{extension}")
+                } else {
+                    format!("{stem} ({suffix}).{extension}")
+                };
+                let target = destination.join(name);
+                let result = if let Some(bytes) = embedded_wav.as_deref() {
+                    write_bytes_noclobber(bytes, &target)
+                } else {
+                    copy_file_noclobber(
+                        source.as_deref().expect("extracted source exists"),
+                        &target,
+                    )
+                };
+                match result {
+                    Ok(()) => {
+                        exported += 1;
+                        break;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                        suffix += 1;
+                        if suffix > 10_000 {
+                            return Err(format!("too many files named '{stem}' in export folder"));
+                        }
+                    }
+                    Err(error) => return Err(format!("cannot export '{}': {error}", track.title)),
+                }
             }
-            if target.exists() {
-                return Err(format!("too many files named '{stem}' in export folder"));
-            }
-            std::fs::copy(source, &target)
-                .map_err(|e| format!("cannot export '{}': {e}", track.title))?;
-            exported += 1;
         }
         Ok(exported)
     }
@@ -1161,14 +1359,14 @@ impl Library {
 
     pub fn group_directory(&self, source_hash: &str) -> Result<PathBuf, String> {
         let track = self.group_tracks(source_hash)?.into_iter().next().unwrap();
-        let dir = PathBuf::from(track.file_path)
-            .parent()
-            .ok_or("track has no parent directory")?
-            .to_path_buf();
         let root = self
             .root
             .canonicalize()
             .map_err(|e| format!("cannot resolve library root: {e}"))?;
+        let dir = PathBuf::from(track.file_path)
+            .parent()
+            .ok_or("track has no parent directory")?
+            .to_path_buf();
         let canonical = dir
             .canonicalize()
             .map_err(|e| format!("looper folder is missing: {e}"))?;
@@ -1178,11 +1376,29 @@ impl Library {
         Ok(canonical)
     }
 
+    fn group_cover_directory(&self, source_hash: &str) -> Result<PathBuf, String> {
+        let track = self.group_tracks(source_hash)?.into_iter().next().unwrap();
+        if track.audio_storage != "embedded" {
+            return self.group_directory(source_hash);
+        }
+        let root = self
+            .root
+            .canonicalize()
+            .map_err(|error| format!("cannot resolve library root: {error}"))?;
+        let directory = root
+            .join(".olooper-cache")
+            .join("looper-covers")
+            .join(sha256_hex(source_hash.as_bytes()));
+        std::fs::create_dir_all(&directory)
+            .map_err(|error| format!("cannot create source-backed cover folder: {error}"))?;
+        Ok(directory)
+    }
+
     /// Save one normalized looper cover beside its extracted audio files.
     /// Existing covers are kept so re-imports do not replace a user's choice.
     pub fn save_group_cover(&self, source_hash: &str, bytes: &[u8]) -> Result<bool, String> {
         let normalized = normalize_cover(bytes)?;
-        let directory = self.group_directory(source_hash)?;
+        let directory = self.group_cover_directory(source_hash)?;
         let destination = directory.join("cover.jpg");
         if destination.exists() {
             return Ok(false);
@@ -1194,7 +1410,7 @@ impl Library {
     /// Return a small local cover as a data URL for the webview UI.
     pub fn group_cover_data_url(&self, source_hash: &str) -> Result<Option<String>, String> {
         const MAX_STORED_COVER_BYTES: u64 = 2 * 1024 * 1024;
-        let directory = self.group_directory(source_hash)?;
+        let directory = self.group_cover_directory(source_hash)?;
         let path = directory.join("cover.jpg");
         if !path.is_file() {
             return Ok(None);
@@ -1311,6 +1527,17 @@ impl Library {
             return Err("custom loops cannot be renamed as a group".to_string());
         }
         let new_name = sanitize_name(new_name);
+        if tracks[0].audio_storage == "embedded" {
+            let old_name = &tracks[0].looper_name;
+            self.conn
+                .execute(
+                    "UPDATE tracks SET looper_name=?1,title=REPLACE(title,?2,?1),updated_at=?3 \
+                     WHERE source_hash=?4",
+                    rusqlite::params![new_name, old_name, now_secs(), source_hash],
+                )
+                .map_err(|error| error.to_string())?;
+            return Ok(());
+        }
         // Validate through the canonical path, but keep the stored lexical path
         // for the filesystem rename and SQL prefix update. On macOS `/var` may
         // canonicalize to `/private/var`, while file_path rows retain `/var`.
@@ -1358,13 +1585,25 @@ impl Library {
         if tracks[0].source_type == "custom" {
             return Err("custom audio tracks cannot be removed as a looper group".to_string());
         }
-        let mut candidates: Vec<PathBuf> = tracks
-            .iter()
-            .map(|track| PathBuf::from(&track.file_path))
-            .collect();
-        for track in &tracks {
-            if let Some(parent) = Path::new(&track.file_path).parent() {
-                candidates.push(parent.join("cover.jpg"));
+        let embedded = tracks[0].audio_storage == "embedded";
+        let embedded_directory = if embedded {
+            Some(self.group_cover_directory(source_hash)?)
+        } else {
+            None
+        };
+        let mut candidates: Vec<PathBuf> = if embedded {
+            vec![embedded_directory.as_ref().unwrap().join("cover.jpg")]
+        } else {
+            tracks
+                .iter()
+                .map(|track| PathBuf::from(&track.file_path))
+                .collect()
+        };
+        if !embedded {
+            for track in &tracks {
+                if let Some(parent) = Path::new(&track.file_path).parent() {
+                    candidates.push(parent.join("cover.jpg"));
+                }
             }
         }
         let quarantined = self.quarantine_files(&candidates)?;
@@ -1388,6 +1627,11 @@ impl Library {
         }
         if let Some(quarantined) = quarantined {
             self.purge_quarantined(quarantined)?;
+        }
+        if embedded {
+            if let Some(directory) = embedded_directory {
+                let _ = std::fs::remove_dir(directory);
+            }
         }
         Ok(n)
     }
@@ -1424,6 +1668,9 @@ impl Library {
         let track = self
             .get_track(track_id)?
             .ok_or_else(|| format!("track {track_id} not found"))?;
+        if track.audio_storage != "extracted" {
+            return Err("source-backed audio has no Serato audio file".to_string());
+        }
         let path = self.confine(Path::new(&track.file_path))?;
         let canonical_path = path
             .canonicalize()
@@ -1441,6 +1688,20 @@ impl Library {
     /// Read markers from the audio file on every track open. For pre-file-tag
     /// libraries, migrate old SQLite slots to the file once, then discard them.
     pub fn get_serato_metadata(&self, track_id: i64) -> Result<SeratoMetadata, String> {
+        let track = self
+            .get_track(track_id)?
+            .ok_or_else(|| format!("track {track_id} not found"))?;
+        if track.audio_storage == "embedded" {
+            return Ok(SeratoMetadata {
+                cues: vec![SeratoCue {
+                    slot: 1,
+                    label: cue_label_for_slot(1),
+                    position_ms: 0,
+                }],
+                loops: Vec::new(),
+                bpm: track.bpm,
+            });
+        }
         let (track, path) = self.audio_path_for_track(track_id)?;
         let mut read = serato::read_audio_file(&path)?;
         let legacy_slots = self.get_legacy_loop_slots(track_id)?;
@@ -1532,6 +1793,15 @@ impl Library {
         if !(1..=4).contains(&slot) {
             return Err("CUE slot must be between 1 and 4".to_string());
         }
+        let track = self
+            .get_track(track_id)?
+            .ok_or_else(|| format!("track {track_id} not found"))?;
+        if track.audio_storage == "embedded" {
+            if slot != 1 || position_ms.is_some_and(|position| position != 0) {
+                return Err("source-backed audio only has the fixed CUE 1 at the start".to_string());
+            }
+            return self.get_serato_metadata(track_id);
+        }
         let mut metadata = self.get_serato_metadata(track_id)?;
         metadata.cues.retain(|cue| cue.slot != slot);
         let position_ms = if slot == 1 { Some(0) } else { position_ms };
@@ -1554,13 +1824,30 @@ impl Library {
     }
 
     pub fn sync_serato_metadata(&self, track_id: i64) -> Result<(), String> {
-        let metadata = self.get_serato_metadata(track_id)?;
-        let (_, path) = self.audio_path_for_track(track_id)?;
-        let duration = self
+        let track = self
             .get_track(track_id)?
-            .ok_or_else(|| format!("track {track_id} not found"))?
-            .duration_ms;
-        serato::write_audio_file(&path, &metadata, duration)
+            .ok_or_else(|| format!("track {track_id} not found"))?;
+        if track.audio_storage != "extracted" {
+            return Err("source-backed audio does not support Serato tag syncing".to_string());
+        }
+        let (track, path) = self.audio_path_for_track(track_id)?;
+        let mut metadata = serato::read_audio_file(&path)?.metadata;
+        metadata
+            .cues
+            .retain(|cue| (0..=track.duration_ms).contains(&cue.position_ms));
+        metadata.loops.retain(|saved| {
+            saved.start_ms >= 0
+                && saved.end_ms > saved.start_ms
+                && saved.end_ms <= track.duration_ms
+                && saved.end_ms <= 0x00ff_ffff
+        });
+        ensure_default_serato_cue(&mut metadata);
+        if track.bpm_source.as_deref() == Some("manual") {
+            metadata.bpm = track.bpm;
+        } else if metadata.bpm.is_none() {
+            metadata.bpm = track.bpm;
+        }
+        serato::write_audio_file(&path, &metadata, track.duration_ms)
     }
 
     /// Ensure `path` resolves inside the library root (after canonicalize).
@@ -1598,7 +1885,7 @@ impl Library {
         if back != frames {
             return Err("verify failed: bytes differ".to_string());
         }
-        tmp.persist(&dest)
+        tmp.persist_noclobber(&dest)
             .map_err(|e| format!("rename failed: {e}"))?;
         Ok(dest)
     }
@@ -1731,6 +2018,67 @@ impl Library {
         exe_length: Option<i64>,
         sounds: &[Sound],
         cover_image: Option<&[u8]>,
+        progress: F,
+    ) -> Result<ImportReport, (ImportReport, String)>
+    where
+        F: FnMut(&str, usize, usize) -> Result<(), String>,
+    {
+        self.import_sounds_with_cover_and_progress_mode(
+            looper,
+            source_type,
+            source_path,
+            source_hash,
+            exe_offset,
+            exe_length,
+            sounds,
+            cover_image,
+            true,
+            progress,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn import_embedded_sounds_with_cover_and_progress<F>(
+        &self,
+        looper: &str,
+        source_type: &str,
+        source_path: &str,
+        source_hash: &str,
+        exe_offset: Option<i64>,
+        exe_length: Option<i64>,
+        sounds: &[Sound],
+        cover_image: Option<&[u8]>,
+        progress: F,
+    ) -> Result<ImportReport, (ImportReport, String)>
+    where
+        F: FnMut(&str, usize, usize) -> Result<(), String>,
+    {
+        self.import_sounds_with_cover_and_progress_mode(
+            looper,
+            source_type,
+            source_path,
+            source_hash,
+            exe_offset,
+            exe_length,
+            sounds,
+            cover_image,
+            false,
+            progress,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn import_sounds_with_cover_and_progress_mode<F>(
+        &self,
+        looper: &str,
+        source_type: &str,
+        source_path: &str,
+        source_hash: &str,
+        exe_offset: Option<i64>,
+        exe_length: Option<i64>,
+        sounds: &[Sound],
+        cover_image: Option<&[u8]>,
+        extract_audio: bool,
         mut progress: F,
     ) -> Result<ImportReport, (ImportReport, String)>
     where
@@ -1750,7 +2098,76 @@ impl Library {
         }
         let (artist_tag, album_tag) = looper_audio_tags(looper);
         let looper = sanitize_name(looper);
-        let dir = self.root.join(&looper);
+        let known_group_path: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT file_path FROM tracks WHERE source_hash=?1 LIMIT 1",
+                [source_hash],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| {
+                (
+                    ImportReport {
+                        looper: looper.clone(),
+                        added: 0,
+                        already_there: 0,
+                        failed: vec![],
+                        track_ids: vec![],
+                    },
+                    error.to_string(),
+                )
+            })?;
+        let existing_group = known_group_path.is_some();
+        let dir = if !extract_audio {
+            self.root.clone()
+        } else if let Some(path) = known_group_path {
+            PathBuf::from(path)
+                .parent()
+                .ok_or_else(|| {
+                    (
+                        ImportReport {
+                            looper: looper.clone(),
+                            added: 0,
+                            already_there: 0,
+                            failed: vec![],
+                            track_ids: vec![],
+                        },
+                        "existing group track has no parent directory".to_string(),
+                    )
+                })?
+                .to_path_buf()
+        } else {
+            self.root
+                .join(extracted_group_directory_name(&looper, source_hash))
+        };
+        if !existing_group {
+            std::fs::create_dir_all(&dir).map_err(|error| {
+                (
+                    ImportReport {
+                        looper: looper.clone(),
+                        added: 0,
+                        already_there: 0,
+                        failed: vec![],
+                        track_ids: vec![],
+                    },
+                    format!("cannot create looper dir: {error}"),
+                )
+            })?;
+        }
+        self.confine(&dir.join(".olooper-import-probe"))
+            .map_err(|error| {
+                (
+                    ImportReport {
+                        looper: looper.clone(),
+                        added: 0,
+                        already_there: 0,
+                        failed: vec![],
+                        track_ids: vec![],
+                    },
+                    error,
+                )
+            })?;
         std::fs::create_dir_all(&dir).map_err(|e| {
             let partial = ImportReport {
                 looper: looper.clone(),
@@ -1907,37 +2324,46 @@ impl Library {
                         error,
                     )
                 })?;
-                let dest = dir.join(format!("{:02}_{}.{}", index + 1, sound.id, item.file_codec));
-                let final_path = self
-                    .atomic_write(&dest, &item.file_bytes)
-                    .map_err(|error| {
-                        (
-                            make_partial(
-                                &looper,
-                                added,
-                                already_there,
-                                failed.clone(),
-                                track_ids.clone(),
-                            ),
-                            error,
-                        )
-                    })?;
-                if let Err(reason) = serato::write_extracted_audio_tags(
-                    &final_path,
-                    artist_tag.as_deref(),
-                    &album_tag,
-                    cover_image,
-                ) {
-                    let _ = std::fs::remove_file(&final_path);
-                    failed.push(FailedSound {
-                        id: sound.id as i64,
-                        reason,
-                    });
-                    continue;
+                let final_path = if extract_audio {
+                    let dest =
+                        dir.join(format!("{:02}_{}.{}", index + 1, sound.id, item.file_codec));
+                    self.atomic_write(&dest, &item.file_bytes)
+                        .map_err(|error| {
+                            (
+                                make_partial(
+                                    &looper,
+                                    added,
+                                    already_there,
+                                    failed.clone(),
+                                    track_ids.clone(),
+                                ),
+                                error,
+                            )
+                        })?
+                } else {
+                    PathBuf::from(source_path)
+                };
+                if extract_audio {
+                    if let Err(reason) = serato::write_extracted_audio_tags(
+                        &final_path,
+                        artist_tag.as_deref(),
+                        &album_tag,
+                        cover_image,
+                    ) {
+                        let _ = std::fs::remove_file(&final_path);
+                        failed.push(FailedSound {
+                            id: sound.id as i64,
+                            reason,
+                        });
+                        continue;
+                    }
                 }
                 let title = format!("{:02} · {}", index + 1, looper);
-                progress("inserting in library", current, total).map_err(|error| {
-                    (
+                if let Err(error) = progress("inserting in library", current, total) {
+                    if extract_audio {
+                        let _ = std::fs::remove_file(&final_path);
+                    }
+                    return Err((
                         make_partial(
                             &looper,
                             added,
@@ -1946,9 +2372,14 @@ impl Library {
                             track_ids.clone(),
                         ),
                         error,
-                    )
-                })?;
-                match self.add_track(
+                    ));
+                }
+                let audio_storage = if extract_audio {
+                    "extracted"
+                } else {
+                    "embedded"
+                };
+                match self.add_track_with_storage(
                     &title,
                     &looper,
                     &final_path,
@@ -1962,6 +2393,7 @@ impl Library {
                     &item.buffer,
                     0,
                     0,
+                    audio_storage,
                 ) {
                     Ok((id, true)) => {
                         if let Some(estimate) = item.estimate {
@@ -1983,12 +2415,16 @@ impl Library {
                         track_ids.push(id);
                     }
                     Ok((id, false)) => {
-                        let _ = std::fs::remove_file(&final_path);
+                        if extract_audio {
+                            let _ = std::fs::remove_file(&final_path);
+                        }
                         already_there += 1;
                         track_ids.push(id);
                     }
                     Err(error) => {
-                        let _ = std::fs::remove_file(&final_path);
+                        if extract_audio {
+                            let _ = std::fs::remove_file(&final_path);
+                        }
                         return Err((
                             make_partial(&looper, added, already_there, failed, track_ids),
                             error,
@@ -1998,7 +2434,9 @@ impl Library {
             }
         }
         if added == 0 && already_there == 0 {
-            let _ = std::fs::remove_dir(&dir); // don't leave empty dirs
+            if extract_audio {
+                let _ = std::fs::remove_dir(&dir); // don't leave empty audio dirs
+            }
             return Err((
                 make_partial(&looper, 0, 0, failed, track_ids),
                 "no sounds could be imported".to_string(),
@@ -2340,6 +2778,41 @@ struct PreparedSound {
     estimate: Option<crate::analysis::BpmEstimate>,
 }
 
+pub(crate) fn decode_embedded_sound_file(
+    path: &str,
+    source_type: &str,
+    sound_id: u16,
+    expected_hash: &str,
+) -> Result<crate::player::LoopBuffer, String> {
+    const MAX_SOURCE_BYTES: u64 = 512 * 1024 * 1024;
+    let metadata =
+        std::fs::metadata(path).map_err(|error| format!("cannot open source: {error}"))?;
+    if metadata.len() > MAX_SOURCE_BYTES {
+        return Err("source exceeds the 512 MiB limit".to_string());
+    }
+    let data = std::fs::read(path).map_err(|error| format!("cannot read source: {error}"))?;
+    if sha256_hex(&data) != expected_hash {
+        return Err("the copied SWF/EXE source changed after import".to_string());
+    }
+    let swf_data = match source_type {
+        "swf" => data.as_slice(),
+        "exe" => {
+            let found = crate::import::exe::locate(&data)
+                .map_err(|error| crate::import::exe::user_message(&error))?;
+            &data[found.offset..found.offset + found.length]
+        }
+        _ => return Err("unsupported source-backed audio type".to_string()),
+    };
+    let parsed = crate::import::swf::parse(swf_data)
+        .map_err(|error| crate::import::swf::user_message(&error))?;
+    let sound = parsed
+        .sounds
+        .iter()
+        .find(|sound| sound.id == sound_id)
+        .ok_or_else(|| format!("embedded sound {sound_id} was not found in the source"))?;
+    prepare_sound(sound).map(|prepared| prepared.buffer)
+}
+
 fn prepare_sound(sound: &Sound) -> Result<PreparedSound, String> {
     let buffer = crate::player::decode_bytes(&sound.frames)?;
     let (buffer, file_bytes, file_codec) =
@@ -2553,6 +3026,16 @@ fn migrate(conn: &Connection) -> Result<(), String> {
              COMMIT;",
         )
         .map_err(|e| format!("migration 7→8 failed: {e}"))?;
+    }
+    if v < 9 {
+        conn.execute_batch(
+            "BEGIN;
+             ALTER TABLE tracks ADD COLUMN audio_storage TEXT NOT NULL DEFAULT 'extracted'
+               CHECK(audio_storage IN ('extracted','embedded'));
+             PRAGMA user_version = 9;
+             COMMIT;",
+        )
+        .map_err(|e| format!("migration 8→9 failed: {e}"))?;
     }
     Ok(())
 }

@@ -35,6 +35,14 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Test frontend and Rust
+        shell: bash
+        run: |
+          set -euo pipefail
+          pnpm install --frozen-lockfile
+          pnpm test
+          cargo test --manifest-path src-tauri/Cargo.toml
+
       - name: Build Universal 2 app and DMG
         shell: bash
         env:

@@ -152,6 +152,7 @@ fn emit_import_done(
     detail: impl Into<String>,
     report: Option<library::ImportReport>,
     custom_report: Option<Vec<library::CustomReport>>,
+    error: Option<String>,
 ) {
     let _ = app.emit(
         "olooper:import-progress",
@@ -162,7 +163,7 @@ fn emit_import_done(
             total,
             detail: detail.into(),
             done: true,
-            error: None,
+            error,
             report,
             custom_report,
         },
@@ -448,6 +449,8 @@ pub fn run() {
             inspect_swf,
             inspect_exe,
             player_load,
+            player_load_library_track,
+            player_unload,
             audio_output_devices,
             audio_set_output,
             audio_test_output,
@@ -522,6 +525,24 @@ type Audio<'a> = tauri::State<'a, player::EngineClient>;
 #[tauri::command]
 fn player_load(path: String, audio: Audio<'_>) -> Result<player::PlayerStatus, String> {
     audio.load(path)
+}
+
+#[tauri::command]
+fn player_load_library_track(
+    id: i64,
+    audio: Audio<'_>,
+    database: Db<'_>,
+) -> Result<player::PlayerStatus, String> {
+    let request = {
+        let guard = db(&database)?;
+        require_lib(&guard)?.playback_request(id)?
+    };
+    audio.load_request(request)
+}
+
+#[tauri::command]
+fn player_unload(audio: Audio<'_>) -> Result<player::PlayerStatus, String> {
+    audio.unload()
 }
 
 #[tauri::command]
@@ -704,6 +725,21 @@ fn require_lib<'a>(
         .ok_or_else(|| "library not initialized".to_string())
 }
 
+fn library_root(database: &Db<'_>) -> Result<std::path::PathBuf, String> {
+    let guard = db(database)?;
+    Ok(require_lib(&guard)?.root.clone())
+}
+
+async fn run_library_blocking<T, F>(root: std::path::PathBuf, operation: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce(library::Library) -> Result<T, String> + Send + 'static,
+{
+    tauri::async_runtime::spawn_blocking(move || operation(library::Library::open(&root)?))
+        .await
+        .map_err(|error| format!("library worker failed: {error}"))?
+}
+
 #[tauri::command]
 fn library_default_root(app: tauri::AppHandle) -> Result<String, String> {
     let documents_dir = app
@@ -831,8 +867,14 @@ fn library_drag_track_out(id: i64, database: Db<'_>) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn library_convert_wav_to_mp3_320(id: i64, database: Db<'_>) -> Result<library::Track, String> {
-    require_lib(&db(&database)?)?.convert_wav_to_mp3_320(id)
+async fn library_convert_wav_to_mp3_320(
+    id: i64,
+    database: Db<'_>,
+) -> Result<library::Track, String> {
+    run_library_blocking(library_root(&database)?, move |library| {
+        library.convert_wav_to_mp3_320(id)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -945,14 +987,18 @@ fn library_set_favorite(id: i64, favorite: bool, db: Db<'_>) -> Result<library::
 }
 
 #[tauri::command]
-fn library_update_metadata(
+async fn library_update_metadata(
     id: i64,
     title: String,
     bpm: Option<f64>,
     tags: String,
+    confirm_manual_bpm: bool,
     database: Db<'_>,
 ) -> Result<library::Track, String> {
-    require_lib(&db(&database)?)?.update_metadata(id, &title, bpm, &tags)
+    run_library_blocking(library_root(&database)?, move |library| {
+        library.update_metadata(id, &title, bpm, &tags, confirm_manual_bpm)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -961,12 +1007,15 @@ fn library_mark_played(id: i64, database: Db<'_>) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn library_export_tracks(
+async fn library_export_tracks(
     ids: Vec<i64>,
     destination: String,
     database: Db<'_>,
 ) -> Result<usize, String> {
-    require_lib(&db(&database)?)?.export_tracks(&ids, std::path::Path::new(&destination))
+    run_library_blocking(library_root(&database)?, move |library| {
+        library.export_tracks(&ids, std::path::Path::new(&destination))
+    })
+    .await
 }
 
 #[tauri::command]
@@ -997,29 +1046,35 @@ fn library_group_cover(source_hash: String, db: Db<'_>) -> Result<Option<String>
 }
 
 #[tauri::command]
-fn library_get_serato_metadata(
+async fn library_get_serato_metadata(
     track_id: i64,
     db: Db<'_>,
 ) -> Result<library::SeratoMetadata, String> {
-    let g = self::db(&db)?;
-    require_lib(&g)?.get_serato_metadata(track_id)
+    run_library_blocking(library_root(&db)?, move |library| {
+        library.get_serato_metadata(track_id)
+    })
+    .await
 }
 
 #[tauri::command]
-fn library_set_serato_cue(
+async fn library_set_serato_cue(
     track_id: i64,
     slot: i64,
     position_ms: Option<i64>,
     db: Db<'_>,
 ) -> Result<library::SeratoMetadata, String> {
-    let g = self::db(&db)?;
-    require_lib(&g)?.set_serato_cue(track_id, slot, position_ms)
+    run_library_blocking(library_root(&db)?, move |library| {
+        library.set_serato_cue(track_id, slot, position_ms)
+    })
+    .await
 }
 
 #[tauri::command]
-fn library_sync_serato_metadata(track_id: i64, db: Db<'_>) -> Result<(), String> {
-    let g = self::db(&db)?;
-    require_lib(&g)?.sync_serato_metadata(track_id)
+async fn library_sync_serato_metadata(track_id: i64, db: Db<'_>) -> Result<(), String> {
+    run_library_blocking(library_root(&db)?, move |library| {
+        library.sync_serato_metadata(track_id)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -1109,6 +1164,7 @@ enum ImportKind {
 struct ImportJob {
     root: std::path::PathBuf,
     kind: ImportKind,
+    extract_audio: bool,
     paths: Vec<String>,
     cover_path: Option<String>,
     job_id: String,
@@ -1198,32 +1254,47 @@ fn run_container_job(app: &tauri::AppHandle, job: &ImportJob, exe: bool) {
         }
     };
     let source_hash = library::sha256_hex(&data);
-    let report = lib.import_sounds_with_cover_and_progress(
-        &looper_name(&copied_path),
-        source_type,
-        &copied_path,
-        &source_hash,
-        exe_offset,
-        exe_length,
-        &sounds.sounds,
-        sounds.cover_image.as_deref(),
-        |stage, current, total| {
-            if import_cancelled(&job.job_id) {
-                return Err("import cancelled".to_string());
-            }
-            emit_import_progress(
-                app,
-                &job.job_id,
-                stage,
-                current,
-                total,
-                &copied_path,
-                false,
-                None,
-            );
-            Ok(())
-        },
-    );
+    let mut report_progress = |stage: &str, current: usize, total: usize| {
+        if import_cancelled(&job.job_id) {
+            return Err("import cancelled".to_string());
+        }
+        emit_import_progress(
+            app,
+            &job.job_id,
+            stage,
+            current,
+            total,
+            &copied_path,
+            false,
+            None,
+        );
+        Ok(())
+    };
+    let report = if job.extract_audio {
+        lib.import_sounds_with_cover_and_progress(
+            &looper_name(&copied_path),
+            source_type,
+            &copied_path,
+            &source_hash,
+            exe_offset,
+            exe_length,
+            &sounds.sounds,
+            sounds.cover_image.as_deref(),
+            &mut report_progress,
+        )
+    } else {
+        lib.import_embedded_sounds_with_cover_and_progress(
+            &looper_name(&copied_path),
+            source_type,
+            &copied_path,
+            &source_hash,
+            exe_offset,
+            exe_length,
+            &sounds.sounds,
+            sounds.cover_image.as_deref(),
+            &mut report_progress,
+        )
+    };
     let imported_tracks = match &report {
         Ok(report) => report.added + report.already_there,
         Err((partial, _)) => partial.added + partial.already_there,
@@ -1245,6 +1316,7 @@ fn run_container_job(app: &tauri::AppHandle, job: &ImportJob, exe: bool) {
                 &copied_path,
                 Some(report),
                 None,
+                None,
             );
         }
         Err((partial, error)) => {
@@ -1260,6 +1332,7 @@ fn run_container_job(app: &tauri::AppHandle, job: &ImportJob, exe: bool) {
                 ),
                 Some(partial),
                 None,
+                Some(error),
             );
         }
     }
@@ -1299,10 +1372,11 @@ fn run_custom_job(app: &tauri::AppHandle, job: &ImportJob) {
         }
     };
     let mut reports = Vec::with_capacity(total);
+    let mut cancellation = None;
     for (i, path) in job.paths.iter().enumerate() {
         if import_cancelled(&job.job_id) {
-            fail("import cancelled".to_string());
-            return;
+            cancellation = Some("import cancelled".to_string());
+            break;
         }
         emit_import_progress(
             app,
@@ -1331,11 +1405,12 @@ fn run_custom_job(app: &tauri::AppHandle, job: &ImportJob) {
     emit_import_done(
         app,
         &job.job_id,
-        total,
+        reports.len(),
         total,
         format!("{added} of {total} audio file(s) imported"),
         None,
         Some(reports),
+        cancellation,
     );
 }
 
@@ -1385,10 +1460,11 @@ fn run_tablist_job(app: &tauri::AppHandle, job: &ImportJob) {
     });
     let total = page.tracks.len();
     let mut reports = Vec::with_capacity(total);
+    let mut cancellation = None;
     for (index, track) in page.tracks.iter().enumerate() {
         if import_cancelled(&job.job_id) {
-            fail("import cancelled".to_string());
-            return;
+            cancellation = Some("import cancelled".to_string());
+            break;
         }
         emit_import_progress(
             app,
@@ -1447,11 +1523,12 @@ fn run_tablist_job(app: &tauri::AppHandle, job: &ImportJob) {
     emit_import_done(
         app,
         &job.job_id,
-        total,
+        reports.len(),
         total,
         format!("{added} of {total} Tablist track(s) imported"),
         None,
         Some(reports),
+        cancellation,
     );
 }
 
@@ -1459,6 +1536,7 @@ fn run_tablist_job(app: &tauri::AppHandle, job: &ImportJob) {
 fn import_swf(
     path: String,
     job_id: String,
+    extract_audio: bool,
     queue: tauri::State<'_, ImportQueue>,
     db: Db<'_>,
 ) -> Result<String, String> {
@@ -1472,6 +1550,7 @@ fn import_swf(
         .send(ImportJob {
             root,
             kind: ImportKind::Swf,
+            extract_audio,
             paths: vec![path],
             cover_path: None,
             job_id: job_id.clone(),
@@ -1484,6 +1563,7 @@ fn import_swf(
 fn import_exe(
     path: String,
     job_id: String,
+    extract_audio: bool,
     queue: tauri::State<'_, ImportQueue>,
     db: Db<'_>,
 ) -> Result<String, String> {
@@ -1497,6 +1577,7 @@ fn import_exe(
         .send(ImportJob {
             root,
             kind: ImportKind::Exe,
+            extract_audio,
             paths: vec![path],
             cover_path: None,
             job_id: job_id.clone(),
@@ -1525,6 +1606,7 @@ fn import_custom(
         .send(ImportJob {
             root,
             kind: ImportKind::Custom,
+            extract_audio: true,
             paths,
             cover_path: None,
             job_id: job_id.clone(),
@@ -1551,6 +1633,7 @@ fn import_tablist(
         .send(ImportJob {
             root,
             kind: ImportKind::Tablist,
+            extract_audio: true,
             paths: vec![url],
             cover_path,
             job_id: job_id.clone(),

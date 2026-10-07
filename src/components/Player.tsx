@@ -31,6 +31,7 @@ const CUE_SLOTS = Array.from({ length: 4 }, (_, index) => index + 1);
 interface Props {
   status: PlayerStatus | null;
   trackId: number | null;
+  audioStorage: "extracted" | "embedded";
   trackOpenGeneration: number;
   canRandom: boolean;
   onRandomTrack: () => Promise<void>;
@@ -42,7 +43,7 @@ interface Props {
   onStatusChange: (status: PlayerStatus) => void;
 }
 
-export default function Player({ status: st, trackId, trackOpenGeneration, canRandom, onRandomTrack, canNavigateTracks, onPreviousTrack, onNextTrack, loopEditing, onToggleLoopEditing, onStatusChange }: Props) {
+export default function Player({ status: st, trackId, audioStorage, trackOpenGeneration, canRandom, onRandomTrack, canNavigateTracks, onPreviousTrack, onNextTrack, loopEditing, onToggleLoopEditing, onStatusChange }: Props) {
   const [error, setError] = useState<string | null>(null);
   const scrubRef = useRef<HTMLDivElement>(null);
   const loopStartRef = useRef<HTMLInputElement>(null);
@@ -122,11 +123,15 @@ export default function Player({ status: st, trackId, trackOpenGeneration, canRa
     window.dispatchEvent(new CustomEvent<SeratoCue[]>("olooper:cues", { detail: cues }));
   }, [cues]);
 
+  useEffect(() => {
+    setError(st?.output_error ? `Audio output: ${st.output_error}` : null);
+  }, [st?.output_error]);
+
   const run = useCallback(
     (p: Promise<PlayerStatus>) =>
       p.then((s) => {
         onStatusChange(s);
-        setError(null);
+        setError(s.output_error ? `Audio output: ${s.output_error}` : null);
       }).catch((e) => setError(String(e))),
     [onStatusChange],
   );
@@ -296,6 +301,7 @@ export default function Player({ status: st, trackId, trackOpenGeneration, canRa
     const handleCueShortcut = (event: Event) => {
       const { slot, clear } = (event as CustomEvent<{ slot: number; clear: boolean }>).detail;
       if (!trackId || !st?.loaded || !Number.isInteger(slot) || slot < 1 || slot > 4) return;
+      if (audioStorage === "embedded" && slot !== 1) return;
       if (slot === 1) {
         loadCue(1);
       } else if (clear) {
@@ -310,7 +316,7 @@ export default function Player({ status: st, trackId, trackOpenGeneration, canRa
     };
     window.addEventListener("olooper:cue-shortcut", handleCueShortcut);
     return () => window.removeEventListener("olooper:cue-shortcut", handleCueShortcut);
-  }, [trackId, st?.loaded, metadataTrackId, cues, clearCue, loadCue, saveCue]);
+  }, [audioStorage, trackId, st?.loaded, metadataTrackId, cues, clearCue, loadCue, saveCue]);
 
   const posFrac = st?.loaded && st.duration_ms > 0 ? st.position_ms / st.duration_ms : 0;
   const loaded = st?.loaded ?? false;
@@ -451,8 +457,8 @@ export default function Player({ status: st, trackId, trackOpenGeneration, canRa
                     <span key={slot} className="flex items-center">
                       <button
                         onClick={() => cue ? loadCue(slot) : saveCue(slot)}
-                        disabled={!ready}
-                        title={slot === 1 ? "CUE 1 is fixed at the start of the track" : cue ? `Jump to CUE ${slot}` : `Save CUE ${slot} at the current position`}
+                        disabled={!ready || (audioStorage === "embedded" && slot !== 1)}
+                        title={slot === 1 ? "CUE 1 is fixed at the start of the track" : audioStorage === "embedded" ? "Source-backed audio only has CUE 1" : cue ? `Jump to CUE ${slot}` : `Save CUE ${slot} at the current position`}
                         className={`w-6 h-6 rounded text-[10px] font-bold transition-colors disabled:opacity-40 ${
                           activeCueSlot === slot
                             ? "bg-accent text-app"
@@ -465,12 +471,12 @@ export default function Player({ status: st, trackId, trackOpenGeneration, canRa
                     </span>
                   );
                 })}
-                <button
+                {audioStorage === "extracted" && <button
                   onClick={() => void syncSeratoMetadata(trackId)}
                   disabled={metadataTrackId !== trackId || seratoSyncing}
                   title="Write CUEs and BPM into this audio file"
                   className="ml-1 rounded bg-accent/15 px-2 py-1 text-[9px] font-medium text-accent hover:bg-accent/25 disabled:opacity-40"
-                >{seratoSyncing ? "Sync…" : "Audio tags"}</button>
+                >{seratoSyncing ? "Sync…" : "Audio tags"}</button>}
             </div>
           )}
 

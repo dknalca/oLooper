@@ -4,6 +4,7 @@ import {
   importCustomAndWait,
   cancelImport,
   importExeAndWait,
+  newImportJobId,
   importSwfAndWait,
   listenImportProgress,
   type AppMenuCommand,
@@ -25,6 +26,8 @@ interface ImportFileState {
 }
 
 export default function ImportBar({ onImported }: Props) {
+  const [containerMode, setContainerMode] = useState<"extract" | "embedded">(() =>
+    localStorage.getItem("olooper.import.containerMode") === "embedded" ? "embedded" : "extract");
   const [busy, setBusy] = useState(false);
   const [dragging, setDragging] = useState(false);
   const [report, setReport] = useState<ImportReport | null>(null);
@@ -36,7 +39,36 @@ export default function ImportBar({ onImported }: Props) {
   const [elapsed, setElapsed] = useState(0);
   const [notice, setNotice] = useState<string | null>(null);
   const cancelQueue = useRef(false);
+  const busyRef = useRef(false);
+  const activeJobIdRef = useRef<string | null>(null);
+  const activePathRef = useRef<string | null>(null);
   const internalTrackDrag = useRef(false);
+
+  useEffect(() => {
+    localStorage.setItem("olooper.import.containerMode", containerMode);
+  }, [containerMode]);
+
+  const setImportBusy = (value: boolean) => {
+    busyRef.current = value;
+    setBusy(value);
+  };
+
+  const runOwnedJob = async <T,>(path: string, run: (jobId: string) => Promise<T>): Promise<T> => {
+    const jobId = newImportJobId();
+    activeJobIdRef.current = jobId;
+    activePathRef.current = path;
+    setFiles((current) => current.map((file) => file.path === path
+      ? { ...file, stage: "Preparing", done: false, error: null }
+      : file));
+    try {
+      return await run(jobId);
+    } finally {
+      if (activeJobIdRef.current === jobId) {
+        activeJobIdRef.current = null;
+        activePathRef.current = null;
+      }
+    }
+  };
 
   const startProgress = (detail: string) => setProgress({
     job_id: "pending",
@@ -60,7 +92,8 @@ export default function ImportBar({ onImported }: Props) {
 
   const requestCancel = () => {
     cancelQueue.current = true;
-    if (progress?.job_id && progress.job_id !== "pending") cancelImport(progress.job_id).catch((e) => setError(String(e)));
+    const activeJobId = activeJobIdRef.current;
+    if (activeJobId) cancelImport(activeJobId).catch((e) => setError(String(e)));
     setFiles((current) => current.map((file) => file.stage === "Queued" ? { ...file, stage: "Cancelled", done: true } : file));
   };
 
@@ -76,8 +109,10 @@ export default function ImportBar({ onImported }: Props) {
   useEffect(() => {
     let off: (() => void) | undefined;
     listenImportProgress((next) => {
+      if (activeJobIdRef.current !== next.job_id) return;
       setProgress(next);
-      setFiles((current) => current.map((file) => fileName(file.path) === fileName(next.detail)
+      const activePath = activePathRef.current;
+      setFiles((current) => current.map((file) => file.path === next.detail || file.path === activePath
         ? { ...file, stage: next.stage, done: next.done, error: next.error }
         : file));
     }).then((unlisten) => { off = unlisten; }).catch((e) => setError(`Import progress unavailable: ${String(e)}`));
@@ -122,7 +157,11 @@ export default function ImportBar({ onImported }: Props) {
           setDragging(false);
           const paths = event.payload.paths;
           if (paths.length === 0) return;
-          setBusy(true);
+          if (busyRef.current) {
+            setError("An import is already in progress.");
+            return;
+          }
+          setImportBusy(true);
           beginImport(paths);
           setError(null);
           setReport(null);
@@ -137,30 +176,32 @@ export default function ImportBar({ onImported }: Props) {
               try {
                 const kind = importKindForPath(path);
                 if (kind === "swf") {
-                  const r = await importSwfAndWait(path);
+                  const r = await runOwnedJob(path, (jobId) => importSwfAndWait(path, jobId, containerMode === "extract"));
                   totalAdded += r.added;
                   totalExisting += r.already_there;
                 } else if (kind === "exe") {
-                  const r = await importExeAndWait(path);
+                  const r = await runOwnedJob(path, (jobId) => importExeAndWait(path, jobId, containerMode === "extract"));
                   totalAdded += r.added;
                   totalExisting += r.already_there;
                 } else {
-                  const rs = await importCustomAndWait([path]);
+                  const rs = await runOwnedJob(path, (jobId) => importCustomAndWait([path], jobId));
                   totalAdded += rs.filter((r) => r.added).length;
                   totalExisting += rs.filter((r) => r.error === "already in library").length;
                   const bad = rs.filter((r) => !r.added && r.error !== "already in library");
                   if (bad.length > 0) { totalFailed++; firstError ??= bad[0].error ?? "import failed"; }
                 }
               } catch (reason) {
-                totalFailed++;
-                firstError ??= String(reason);
+                if (!cancelQueue.current) {
+                  totalFailed++;
+                  firstError ??= String(reason);
+                }
               }
             }
             if (totalFailed > 0) {
               setError(`${totalFailed} file(s) failed: ${firstError}`);
               finishProgress(firstError);
             } else {
-              finishProgress();
+              finishProgress(cancelQueue.current ? "import cancelled" : null);
             }
             if (totalExisting > 0) showNotice(`${totalExisting} existing track${totalExisting === 1 ? "" : "s"} already in library`);
             if (totalAdded > 0) {
@@ -168,7 +209,7 @@ export default function ImportBar({ onImported }: Props) {
               setTimeout(() => setDragCount(null), 3000);
             }
             onImported();
-            setBusy(false);
+            setImportBusy(false);
           })();
         } else {
           setDragging(false);
@@ -177,15 +218,26 @@ export default function ImportBar({ onImported }: Props) {
       .then((f) => { off = f; })
       .catch((e) => setError(`Drag and drop unavailable: ${String(e)}`));
     return () => off?.();
-  }, [onImported]);
+  }, [containerMode, onImported]);
 
   const browseAndImport = async (
-    importFn: (p: string) => Promise<ImportReport>,
+    importFn: (p: string, jobId: string) => Promise<ImportReport>,
     filters: { name: string; extensions: string[] }[],
   ) => {
-    const files = await pickFiles(filters);
-    if (files.length === 0) return;
-    setBusy(true);
+    if (busyRef.current) return;
+    setImportBusy(true);
+    let files: string[];
+    try {
+      files = await pickFiles(filters);
+    } catch (cause) {
+      setError(String(cause));
+      setImportBusy(false);
+      return;
+    }
+    if (files.length === 0) {
+      setImportBusy(false);
+      return;
+    }
     beginImport(files);
     setError(null);
     setReport(null);
@@ -195,13 +247,14 @@ export default function ImportBar({ onImported }: Props) {
     const failures: string[] = [];
     let lastReport: ImportReport | null = null;
     for (const f of files) {
+      if (cancelQueue.current) break;
       try {
-        const r = await importFn(f);
+        const r = await runOwnedJob(f, (jobId) => importFn(f, jobId));
         lastReport = r;
         totalAdded += r.added;
         failedSounds += r.failed.length;
       } catch (e) {
-        failures.push(`${f}: ${String(e)}`);
+        if (!cancelQueue.current) failures.push(`${f}: ${String(e)}`);
       }
     }
     if (lastReport) setReport(lastReport);
@@ -218,22 +271,33 @@ export default function ImportBar({ onImported }: Props) {
     }
     const existing = lastReport?.already_there ?? 0;
     if (existing > 0) showNotice(`${existing} existing track${existing === 1 ? "" : "s"} already in library`);
-    finishProgress(failures.length > 0 ? failures[0] : null);
-    setBusy(false);
+    finishProgress(failures.length > 0 ? failures[0] : cancelQueue.current ? "import cancelled" : null);
+    setImportBusy(false);
     onImported();
   };
 
   const browseAndImportCustom = async () => {
-    const files = await pickFiles([
-      { name: "Audio", extensions: ["mp3", "wav", "flac", "ogg", "aac", "m4a"] },
-    ]);
-    if (files.length === 0) return;
-    setBusy(true);
+    if (busyRef.current) return;
+    setImportBusy(true);
+    let files: string[];
+    try {
+      files = await pickFiles([
+        { name: "Audio", extensions: ["mp3", "wav", "flac", "ogg", "aac", "m4a"] },
+      ]);
+    } catch (cause) {
+      setError(String(cause));
+      setImportBusy(false);
+      return;
+    }
+    if (files.length === 0) {
+      setImportBusy(false);
+      return;
+    }
     beginImport(files);
     setError(null);
     setReport(null);
     try {
-      const rs = await importCustomAndWait(files);
+      const rs = await runOwnedJob(files[0], (jobId) => importCustomAndWait(files, jobId));
       const failed = rs.filter((r) => !r.added && r.error !== "already in library");
       const added = rs.filter((r) => r.added).length;
       const existing = rs.filter((r) => r.error === "already in library").length;
@@ -249,18 +313,18 @@ export default function ImportBar({ onImported }: Props) {
       setError(String(e));
       finishProgress(String(e));
     }
-    setBusy(false);
+    setImportBusy(false);
     onImported();
   };
 
   const importFromMenu = async (command: AppMenuCommand) => {
-    if (busy) return;
+    if (busyRef.current) return;
     if (command === "open-swf") {
-      await browseAndImport(importSwfAndWait, [{ name: "Flash files", extensions: ["swf"] }]);
+      await browseAndImport((path, jobId) => importSwfAndWait(path, jobId, containerMode === "extract"), [{ name: "Flash files", extensions: ["swf"] }]);
       return;
     }
     if (command === "open-exe") {
-      await browseAndImport(importExeAndWait, [{ name: "Projector files", extensions: ["exe"] }]);
+      await browseAndImport((path, jobId) => importExeAndWait(path, jobId, containerMode === "extract"), [{ name: "Projector files", extensions: ["exe"] }]);
       return;
     }
     if (command === "import-audio") {
@@ -269,12 +333,22 @@ export default function ImportBar({ onImported }: Props) {
     }
     if (command !== "import-files") return;
 
-    const paths = await pickFiles([
-      { name: "Flash and projector files", extensions: ["swf", "exe"] },
-      { name: "Audio", extensions: ["mp3", "wav", "flac", "ogg", "aac", "m4a"] },
-    ]);
-    if (paths.length === 0) return;
-    setBusy(true);
+    setImportBusy(true);
+    let paths: string[];
+    try {
+      paths = await pickFiles([
+        { name: "Flash and projector files", extensions: ["swf", "exe"] },
+        { name: "Audio", extensions: ["mp3", "wav", "flac", "ogg", "aac", "m4a"] },
+      ]);
+    } catch (cause) {
+      setError(String(cause));
+      setImportBusy(false);
+      return;
+    }
+    if (paths.length === 0) {
+      setImportBusy(false);
+      return;
+    }
     beginImport(paths);
     setError(null);
     setReport(null);
@@ -287,15 +361,15 @@ export default function ImportBar({ onImported }: Props) {
       try {
         const kind = importKindForPath(path);
         if (kind === "swf") {
-          const report = await importSwfAndWait(path);
+          const report = await runOwnedJob(path, (jobId) => importSwfAndWait(path, jobId, containerMode === "extract"));
           added += report.added;
           existing += report.already_there;
         } else if (kind === "exe") {
-          const report = await importExeAndWait(path);
+          const report = await runOwnedJob(path, (jobId) => importExeAndWait(path, jobId, containerMode === "extract"));
           added += report.added;
           existing += report.already_there;
         } else {
-          const reports = await importCustomAndWait([path]);
+          const reports = await runOwnedJob(path, (jobId) => importCustomAndWait([path], jobId));
           added += reports.filter((report) => report.added).length;
           existing += reports.filter((report) => report.error === "already in library").length;
           const rejected = reports.find((report) => !report.added && report.error !== "already in library");
@@ -305,8 +379,10 @@ export default function ImportBar({ onImported }: Props) {
           }
         }
       } catch (reason) {
-        failed++;
-        firstError ??= String(reason);
+        if (!cancelQueue.current) {
+          failed++;
+          firstError ??= String(reason);
+        }
       }
     }
     if (failed > 0) {
@@ -320,7 +396,7 @@ export default function ImportBar({ onImported }: Props) {
       setDragCount(added);
       setTimeout(() => setDragCount(null), 3000);
     }
-    setBusy(false);
+    setImportBusy(false);
     onImported();
   };
 
@@ -331,7 +407,7 @@ export default function ImportBar({ onImported }: Props) {
     };
     window.addEventListener("olooper:import-command", handleMenuCommand);
     return () => window.removeEventListener("olooper:import-command", handleMenuCommand);
-  }, [busy]);
+  }, [busy, containerMode]);
 
   return (
     <>
@@ -348,14 +424,14 @@ export default function ImportBar({ onImported }: Props) {
 
       <div className="flex h-8 shrink-0 items-center gap-1 border-l border-border pl-2">
         <BrowseBtn
-          onClick={() => browseAndImport(importSwfAndWait, [
+          onClick={() => browseAndImport((path, jobId) => importSwfAndWait(path, jobId, containerMode === "extract"), [
             { name: "Flash files", extensions: ["swf"] },
           ])}
           disabled={busy}
           label="SWF"
         />
         <BrowseBtn
-          onClick={() => browseAndImport(importExeAndWait, [
+          onClick={() => browseAndImport((path, jobId) => importExeAndWait(path, jobId, containerMode === "extract"), [
             { name: "Projector files", extensions: ["exe"] },
           ])}
           disabled={busy}
@@ -366,6 +442,17 @@ export default function ImportBar({ onImported }: Props) {
           disabled={busy}
           label="Audio"
         />
+        <select
+          aria-label="SWF and EXE audio import mode"
+          title="Choose whether to extract audio or play it from the copied SWF/EXE source"
+          value={containerMode}
+          onChange={(event) => setContainerMode(event.target.value as "extract" | "embedded")}
+          disabled={busy}
+          className="max-w-28 rounded border border-border bg-elevated px-1.5 py-1 text-[9px] text-text-secondary disabled:opacity-40"
+        >
+          <option value="extract">Extract audio</option>
+          <option value="embedded">Play from source</option>
+        </select>
 
         {progress && !progress.done && (
           <div className="flex items-center gap-2">

@@ -25,6 +25,10 @@ export default function Waveform({ refreshKey, status, trackTitle, trackCover, t
   const wrapRef = useRef<HTMLDivElement>(null);
   const statusRef = useRef<PlayerStatus | null>(null);
   const waveRef = useRef<WaveformData | null>(null);
+  const waveTrackIdRef = useRef<number | null>(null);
+  const wavePathRef = useRef<string | null>(null);
+  const trackIdRef = useRef(trackId);
+  trackIdRef.current = trackId;
   const cuesRef = useRef<SeratoCue[]>([]);
   const zoomRef = useRef(1);
   const previewRef = useRef<{ start: number; end: number } | null>(null);
@@ -55,6 +59,16 @@ export default function Waveform({ refreshKey, status, trackTitle, trackCover, t
   useEffect(() => {
     statusRef.current = status;
   }, [status]);
+
+  useEffect(() => {
+    waveRef.current = null;
+    waveTrackIdRef.current = null;
+    wavePathRef.current = null;
+    setError(null);
+    setGenerating(false);
+    setDragging(null);
+    previewRef.current = null;
+  }, [trackId, loadedPath]);
 
   useEffect(() => { zoomRef.current = zoom; }, [zoom]);
 
@@ -105,6 +119,8 @@ export default function Waveform({ refreshKey, status, trackTitle, trackCover, t
         .then((w) => {
           if (cancelled) return;
           waveRef.current = w;
+          waveTrackIdRef.current = trackId;
+          wavePathRef.current = loadedPath;
           setError(null);
         })
         .catch((e) => {
@@ -124,7 +140,7 @@ export default function Waveform({ refreshKey, status, trackTitle, trackCover, t
       setGenerating(false);
       window.clearTimeout(timer);
     };
-  }, [loadedPath, status?.loading, refreshKey, zoom]);
+  }, [loadedPath, status?.loading, refreshKey, zoom, trackId]);
 
   // Render loop: interpolate between polls while playing.
   useEffect(() => {
@@ -136,7 +152,8 @@ export default function Waveform({ refreshKey, status, trackTitle, trackCover, t
       const canvas = canvasRef.current;
       const st = statusRef.current;
       const wave = waveRef.current;
-      if (!canvas || !st?.loaded || !wave || wave.peaks.length === 0) return;
+      if (!canvas || !st?.loaded || st.loading || !wave || wave.peaks.length === 0
+        || waveTrackIdRef.current !== trackIdRef.current || wavePathRef.current !== st.path) return;
       if (st.position_ms !== lastPos) {
         lastPos = st.position_ms;
         lastPoll = performance.now();
@@ -154,7 +171,8 @@ export default function Waveform({ refreshKey, status, trackTitle, trackCover, t
     const canvas = canvasRef.current;
     const st = statusRef.current;
     const wave = waveRef.current;
-    if (!canvas || !st?.loaded || !wave) return null;
+    if (!canvas || !st?.loaded || st.loading || !wave
+      || waveTrackIdRef.current !== trackIdRef.current || wavePathRef.current !== st.path) return null;
     const rect = canvas.getBoundingClientRect();
     const frac = Math.min(1, Math.max(0, (e.clientX - rect.left) / rect.width));
     const view = Math.min(wave.duration_ms, Math.max(20, wave.duration_ms / zoomRef.current));
