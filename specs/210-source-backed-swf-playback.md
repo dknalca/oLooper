@@ -2,9 +2,9 @@
 
 ## Import choice
 
-- The SWF/EXE import controls expose two modes: **Extract audio** (the existing
-  behavior) and **Play from source** (the space-saving mode). The selection is
-  remembered for later imports; extraction remains the default.
+- When SWF/EXE files are selected or dropped for import, ask whether to **Extract
+  audio** (the existing behavior) or **Play from source** (the space-saving mode).
+  Ask for each import batch; do not keep a persistent mode selector or preference.
 - Both modes copy the original SWF/EXE into the selected library's
   `loopersFlash/` directory and create one catalog row per supported sound.
 - Source-backed rows reference the managed container and sound ID. They do not
@@ -23,8 +23,14 @@
   Serato tag writing are unavailable; the SWF/EXE is never modified. Catalog
   BPM, favorites, playlists, app loop bounds, and manual playback controls remain
   track-local. Explicit export may produce a WAV in the user's chosen folder.
-- Removing a source-backed track/group removes catalog state and its managed
-  cover cache only. The copied SWF/EXE source remains available in the library.
+- Removing a track/group removes its catalog state, extracted audio files (when
+  present), and managed cover cache. When no remaining catalog track references
+  the imported container, its library-owned copy in `loopersFlash/` is removed.
+  The original SWF/EXE outside the library is never deleted.
+- Before deleting a looper, show a confirmation popup explaining that its
+  imported SWF/EXE library copy (when applicable), extracted/downloaded audio
+  files (if present), and cover will be deleted. Cancellation must not start
+  deletion; explicit acceptance is required. External originals remain intact.
 
 ## Acceptance
 
@@ -35,4 +41,5 @@
 - A missing, modified, malformed, or oversized source fails safely without
   executing it or applying another loop's sound data.
 - Source-backed tracks expose only fixed CUE 1, do not read/write Serato tags,
-  and removal never deletes the copied SWF/EXE.
+  and deletion removes the last unreferenced library copy while preserving the
+  user's original SWF/EXE input.

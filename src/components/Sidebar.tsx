@@ -93,6 +93,7 @@ export default function Sidebar({ libraryReady, libraryGeneration, refreshKey, a
   const [activeId, setActiveId] = useState<number | null>(null);
   const [contextMenu, setContextMenu] = useState<number | null>(null);
   const [groupMenu, setGroupMenu] = useState<string | null>(null);
+  const [groupDeletePrompt, setGroupDeletePrompt] = useState<{ sourceHash: string; name: string } | null>(null);
   const [playlistMenu, setPlaylistMenu] = useState<number | null>(null);
   const [dropTarget, setDropTarget] = useState<LibraryDropTarget>(null);
   const [draggingTrackIds, setDraggingTrackIds] = useState<number[]>([]);
@@ -835,9 +836,15 @@ export default function Sidebar({ libraryReady, libraryGeneration, refreshKey, a
   };
 
   const removeGroup = (sourceHash: string, name: string) => {
-    if (!window.confirm(`Remove “${name}” and delete its library audio copies and cover? Original SWF/EXE/source files will be kept.`)) return;
-    libraryRemoveLooper(sourceHash).then(refresh).catch((e) => { refresh(); setError(String(e)); });
     setGroupMenu(null);
+    setGroupDeletePrompt({ sourceHash, name });
+  };
+
+  const confirmRemoveGroup = () => {
+    if (!groupDeletePrompt) return;
+    const { sourceHash } = groupDeletePrompt;
+    setGroupDeletePrompt(null);
+    libraryRemoveLooper(sourceHash).then(refresh).catch((e) => { refresh(); setError(String(e)); });
   };
 
   const openTrackMenu = (event: React.MouseEvent, trackId: number) => {
@@ -1199,6 +1206,31 @@ export default function Sidebar({ libraryReady, libraryGeneration, refreshKey, a
             <button onClick={() => { libraryGroupDirectory(groupMenu).then(revealInFileManager).catch((e: unknown) => setError(String(e))); setGroupMenu(null); }} className="w-full px-3 py-1.5 text-left text-xs text-text hover:bg-surface-hover">Open looper folder</button>
             <button onClick={() => renameGroup(groupMenu, groupName(track))} className="w-full px-3 py-1.5 text-left text-xs text-text hover:bg-surface-hover">Rename looper</button>
             <button onClick={() => removeGroup(groupMenu, groupName(track))} className="w-full px-3 py-1.5 text-left text-xs text-danger hover:bg-danger/10">Remove group from library</button>
+          </div>
+        );
+      })()}
+      {groupDeletePrompt && (() => {
+        const groupTracks = tracks.filter((track) => track.source_hash === groupDeletePrompt.sourceHash);
+        const hasImportedContainer = groupTracks.some((track) => track.source_type === "swf" || track.source_type === "exe");
+        const hasStoredAudio = groupTracks.some((track) => track.audio_storage === "extracted");
+        return (
+          <div
+            className="fixed inset-0 z-[120] flex items-center justify-center bg-black/65 p-4 backdrop-blur-sm"
+            onMouseDown={(event) => { if (event.target === event.currentTarget) setGroupDeletePrompt(null); }}
+          >
+            <section role="dialog" aria-modal="true" aria-labelledby="delete-looper-title" aria-describedby="delete-looper-description" className="w-full max-w-md rounded-lg border border-border bg-surface p-5 shadow-2xl">
+              <h2 id="delete-looper-title" className="text-sm font-semibold text-text">Delete looper “{groupDeletePrompt.name}”?</h2>
+              <div id="delete-looper-description" className="mt-3 space-y-2 text-xs leading-relaxed text-text-secondary">
+                {hasImportedContainer && <p>The imported SWF/EXE copy in the library will be deleted when no other tracks use it.</p>}
+                {hasStoredAudio && <p>All extracted or downloaded audio files for this looper will be deleted.</p>}
+                <p>The library cover will also be deleted. Original files outside the library will be kept.</p>
+                <p>This cannot be undone. Confirm to continue.</p>
+              </div>
+              <div className="mt-5 flex justify-end gap-2">
+                <button autoFocus onClick={() => setGroupDeletePrompt(null)} className="rounded border border-border px-3 py-2 text-xs text-text-secondary hover:bg-surface-hover hover:text-text">Cancel</button>
+                <button onClick={confirmRemoveGroup} className="rounded bg-danger px-3 py-2 text-xs font-medium text-white hover:bg-danger/85">Delete looper</button>
+              </div>
+            </section>
           </div>
         );
       })()}

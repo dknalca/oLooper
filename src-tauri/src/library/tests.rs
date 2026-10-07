@@ -627,13 +627,18 @@ fn legacy_database_cues_are_migrated_into_the_audio_file_on_open() {
 }
 
 #[test]
-fn looper_group_rename_and_remove_delete_derived_audio_only() {
+fn looper_group_rename_and_remove_delete_managed_audio_and_source() {
     let root = tmp_root("group-management");
     let lib = Library::open(&root).unwrap();
     let source_dir = root.join("loopersFlash");
     std::fs::create_dir_all(&source_dir).unwrap();
     let source = source_dir.join("old.swf");
-    std::fs::write(&source, b"original swf source").unwrap();
+    std::fs::write(&source, b"managed swf copy").unwrap();
+    let original = root.with_file_name(format!(
+        "{}-original.swf",
+        root.file_name().unwrap().to_string_lossy()
+    ));
+    std::fs::write(&original, b"original swf source").unwrap();
     let old_dir = root.join("Old Looper");
     std::fs::create_dir_all(&old_dir).unwrap();
     let first = old_dir.join("01_1.mp3");
@@ -708,8 +713,146 @@ fn looper_group_rename_and_remove_delete_derived_audio_only() {
     assert!(!renamed_dir.join("01_1.mp3").exists());
     assert!(!renamed_dir.join("02_2.mp3").exists());
     assert!(!renamed_dir.join("cover.jpg").exists());
-    assert!(source.is_file());
+    assert!(!source.exists());
+    assert_eq!(std::fs::read(&original).unwrap(), b"original swf source");
+    std::fs::remove_file(original).ok();
     std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn container_removal_handles_both_formats_storage_modes_and_rollback() {
+    for format in ["swf", "exe"] {
+        for storage in ["embedded", "extracted"] {
+            let root = tmp_root("container-removal");
+            let lib = Library::open(&root).unwrap();
+            let sources = root.join("loopersFlash");
+            std::fs::create_dir_all(&sources).unwrap();
+            let source = sources.join(format!("Looper.{format}"));
+            std::fs::write(&source, b"managed container").unwrap();
+            let audio_dir = root.join("Audio");
+            std::fs::create_dir_all(&audio_dir).unwrap();
+            let mut ids = Vec::new();
+            for sound_id in 1..=2 {
+                let audio = audio_dir.join(format!("{sound_id}.wav"));
+                let path = if storage == "extracted" {
+                    std::fs::write(&audio, Library::loop_buffer_to_wav(&wav_buf())).unwrap();
+                    audio
+                } else {
+                    source.clone()
+                };
+                ids.push(
+                    lib.add_track_with_storage(
+                        "Loop",
+                        "Looper",
+                        &path,
+                        format,
+                        source.to_str().unwrap(),
+                        "container-group",
+                        sound_id,
+                        None,
+                        None,
+                        "wav",
+                        &wav_buf(),
+                        0,
+                        0,
+                        storage,
+                    )
+                    .unwrap()
+                    .0,
+                );
+            }
+            assert!(lib.remove_track(ids[0]).unwrap());
+            assert!(source.is_file(), "the other loop still needs the container");
+            assert!(lib.get_track(ids[1]).unwrap().unwrap().exists);
+            lib.conn.execute_batch(
+                "CREATE TRIGGER fail_delete BEFORE DELETE ON tracks BEGIN SELECT RAISE(ABORT, 'test failure'); END;"
+            ).unwrap();
+            assert!(lib.remove_looper("container-group").is_err());
+            assert_eq!(std::fs::read(&source).unwrap(), b"managed container");
+            assert!(lib.get_track(ids[1]).unwrap().unwrap().exists);
+            lib.conn.execute_batch("DROP TRIGGER fail_delete").unwrap();
+            assert_eq!(lib.remove_looper("container-group").unwrap(), 1);
+            assert!(!source.exists());
+            assert!(!audio_dir.join("1.wav").exists());
+            assert!(!audio_dir.join("2.wav").exists());
+            drop(lib);
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+}
+
+#[test]
+fn mixed_looper_removal_deletes_audio_but_preserves_a_shared_container() {
+    let root = tmp_root("mixed-shared-container");
+    let lib = Library::open(&root).unwrap();
+    std::fs::create_dir_all(root.join("loopersFlash")).unwrap();
+    let source = root.join("loopersFlash").join("Shared.swf");
+    std::fs::write(&source, b"shared container").unwrap();
+    let audio = root.join("extracted.wav");
+    std::fs::write(&audio, Library::loop_buffer_to_wav(&wav_buf())).unwrap();
+    for (hash, sound_id, storage, path) in [
+        ("mixed", 1, "embedded", &source),
+        ("mixed", 2, "extracted", &audio),
+        ("other", 3, "embedded", &source),
+    ] {
+        lib.add_track_with_storage(
+            "Loop",
+            "Looper",
+            path,
+            "swf",
+            source.to_str().unwrap(),
+            hash,
+            sound_id,
+            None,
+            None,
+            "wav",
+            &wav_buf(),
+            0,
+            0,
+            storage,
+        )
+        .unwrap();
+    }
+    assert_eq!(lib.remove_looper("mixed").unwrap(), 2);
+    assert!(!audio.exists());
+    assert!(source.exists());
+    assert_eq!(lib.remove_looper("other").unwrap(), 1);
+    assert!(!source.exists());
+    drop(lib);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn looper_removal_preserves_external_container() {
+    let root = tmp_root("external-container");
+    let outside = tmp_root("external-original");
+    let lib = Library::open(&root).unwrap();
+    let source = outside.join("Original.exe");
+    std::fs::write(&source, b"original projector").unwrap();
+    let audio = root.join("loop.wav");
+    std::fs::write(&audio, Library::loop_buffer_to_wav(&wav_buf())).unwrap();
+    lib.add_track(
+        "Loop",
+        "Looper",
+        &audio,
+        "exe",
+        source.to_str().unwrap(),
+        "external-container",
+        1,
+        None,
+        None,
+        "wav",
+        &wav_buf(),
+        0,
+        0,
+    )
+    .unwrap();
+    assert_eq!(lib.remove_looper("external-container").unwrap(), 1);
+    assert!(!audio.exists());
+    assert_eq!(std::fs::read(&source).unwrap(), b"original projector");
+    drop(lib);
+    std::fs::remove_dir_all(root).unwrap();
+    std::fs::remove_dir_all(outside).unwrap();
 }
 
 #[test]
@@ -1306,6 +1449,31 @@ fn embedded_import_lists_tracks_and_decodes_from_the_managed_source_without_audi
     assert_eq!(decoded.rate, expected.rate);
     assert_eq!(decoded.channels, expected.channels);
 
+    // Exercise the identical source-backed decode path for Windows projectors,
+    // using a synthetic MZ container rather than executing an EXE.
+    let exe_path = root.join("loopersFlash").join("Projector.exe");
+    let mut exe_bytes = b"MZ".to_vec();
+    exe_bytes.extend_from_slice(&[0; 512]);
+    exe_bytes.extend_from_slice(&source_bytes);
+    std::fs::write(&exe_path, &exe_bytes).unwrap();
+    let exe_hash = sha256_hex(&exe_bytes);
+    let exe_request = crate::player::AudioLoadRequest::embedded_sound(
+        "embedded:projector-test".to_string(),
+        exe_path.to_string_lossy().to_string(),
+        "exe".to_string(),
+        23,
+        exe_hash.clone(),
+    );
+    assert_eq!(exe_request.decode().unwrap().samples, expected.samples);
+    assert!(decode_embedded_sound_file(exe_path.to_str().unwrap(), "exe", 24, &exe_hash).is_err());
+    std::fs::write(&exe_path, b"MZmodified").unwrap();
+    assert!(exe_request
+        .decode()
+        .unwrap_err()
+        .contains("changed after import"));
+    std::fs::remove_file(&exe_path).unwrap();
+    assert!(exe_request.decode().is_err());
+
     let export_directory = root.join("exports");
     std::fs::create_dir_all(&export_directory).unwrap();
     assert_eq!(
@@ -1344,7 +1512,7 @@ fn embedded_import_lists_tracks_and_decodes_from_the_managed_source_without_audi
         source_path
     );
     assert!(lib.remove_track(track.id).unwrap());
-    assert!(Path::new(&source_path).is_file());
+    assert!(!Path::new(&source_path).exists());
     std::fs::remove_dir_all(&root).ok();
 }
 

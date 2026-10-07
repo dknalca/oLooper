@@ -721,6 +721,45 @@ impl Library {
         Ok(path)
     }
 
+    /// Resolve the library-owned SWF/EXE copy for a track. Original files
+    /// outside `loopersFlash` and symlinks are never eligible for deletion.
+    fn managed_container_path_for_track(&self, track: &Track) -> Result<Option<PathBuf>, String> {
+        if !matches!(track.source_type.as_str(), "swf" | "exe") {
+            return Ok(None);
+        }
+        let candidate = PathBuf::from(&track.source_path);
+        let metadata = match std::fs::symlink_metadata(&candidate) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(format!("cannot inspect imported source: {error}")),
+        };
+        if !metadata.file_type().is_file() {
+            return Ok(None);
+        }
+        let root = self
+            .root
+            .canonicalize()
+            .map_err(|error| format!("cannot resolve library root: {error}"))?;
+        let source_dir = match root.join("loopersFlash").canonicalize() {
+            Ok(directory) if directory.starts_with(&root) => directory,
+            Ok(_) => return Ok(None),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(format!("cannot resolve imported source folder: {error}")),
+        };
+        let path = match candidate.canonicalize() {
+            Ok(path) => path,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(format!("cannot resolve imported source: {error}")),
+        };
+        if path.parent() != Some(source_dir.as_path())
+            || path.extension().and_then(|extension| extension.to_str())
+                != Some(track.source_type.as_str())
+        {
+            return Ok(None);
+        }
+        Ok(Some(path))
+    }
+
     pub fn managed_audio_path_for_track(&self, id: i64) -> Result<PathBuf, String> {
         let track = self
             .get_track(id)?
@@ -968,8 +1007,8 @@ impl Library {
             .ok_or_else(|| format!("track {id} vanished"))
     }
 
-    /// Delete one catalog track and its library-managed audio copy. The source
-    /// path (original SWF/EXE or user file) is never removed.
+    /// Delete one catalog track and its library-managed audio copy. Remove a
+    /// managed SWF/EXE copy only when the final track referencing it is removed.
     pub fn remove_track(&self, id: i64) -> Result<bool, String> {
         let Some(track) = self.get_track(id)? else {
             return Ok(false);
@@ -1000,6 +1039,19 @@ impl Library {
                 candidates.push(directory.join("cover.jpg"));
             } else if let Some(directory) = file_path.parent() {
                 candidates.push(directory.join("cover.jpg"));
+            }
+            if let Some(source) = self.managed_container_path_for_track(&track)? {
+                let references: i64 = self
+                    .conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM tracks WHERE source_path=?1 AND id<>?2",
+                        rusqlite::params![track.source_path, id],
+                        |row| row.get(0),
+                    )
+                    .map_err(|error| error.to_string())?;
+                if references == 0 {
+                    candidates.push(source);
+                }
             }
         }
         let quarantined = self.quarantine_files(&candidates)?;
@@ -1578,8 +1630,8 @@ impl Library {
         Ok(())
     }
 
-    /// Remove a looper's catalog rows, derived audio, and cover. Preserved source
-    /// SWF/EXE files live elsewhere and are never included in this deletion.
+    /// Remove a looper's catalog rows, derived audio, cover, and unreferenced
+    /// library-owned SWF/EXE copies. Original files outside the library remain.
     pub fn remove_looper(&self, source_hash: &str) -> Result<usize, String> {
         let tracks = self.group_tracks(source_hash)?;
         if tracks[0].source_type == "custom" {
@@ -1591,19 +1643,31 @@ impl Library {
         } else {
             None
         };
-        let mut candidates: Vec<PathBuf> = if embedded {
-            vec![embedded_directory.as_ref().unwrap().join("cover.jpg")]
-        } else {
-            tracks
-                .iter()
-                .map(|track| PathBuf::from(&track.file_path))
-                .collect()
-        };
-        if !embedded {
-            for track in &tracks {
+        let mut candidates = Vec::new();
+        for track in &tracks {
+            if track.audio_storage == "extracted" {
+                candidates.push(PathBuf::from(&track.file_path));
                 if let Some(parent) = Path::new(&track.file_path).parent() {
                     candidates.push(parent.join("cover.jpg"));
                 }
+            } else {
+                candidates.push(self.group_cover_directory(source_hash)?.join("cover.jpg"));
+            }
+        }
+        for track in &tracks {
+            let Some(source) = self.managed_container_path_for_track(track)? else {
+                continue;
+            };
+            let references: i64 = self
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM tracks WHERE source_path=?1 AND source_hash<>?2",
+                    rusqlite::params![track.source_path, source_hash],
+                    |row| row.get(0),
+                )
+                .map_err(|error| error.to_string())?;
+            if references == 0 {
+                candidates.push(source);
             }
         }
         let quarantined = self.quarantine_files(&candidates)?;

@@ -1,0 +1,52 @@
+name: Check Windows compatibility
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 12.9.1
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Install dependencies and check frontend
+        shell: pwsh
+        run: |
+          pnpm install --frozen-lockfile
+          if ($LASTEXITCODE -ne 0) { throw "Dependency installation failed." }
+          pnpm run typecheck
+          if ($LASTEXITCODE -ne 0) { throw "Typecheck failed." }
+          pnpm test
+          if ($LASTEXITCODE -ne 0) { throw "Frontend tests failed." }
+      - name: Test Rust on Windows
+        shell: pwsh
+        run: |
+          cargo test --manifest-path src-tauri/Cargo.toml --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { throw "Rust tests failed." }
+      - name: Install NSIS and build installer
+        shell: pwsh
+        run: |
+          if (-not (Get-Command makensis.exe -ErrorAction SilentlyContinue)) {
+            choco install nsis --yes --no-progress
+            if ($LASTEXITCODE -ne 0) { throw "NSIS installation failed." }
+          }
+          .\scripts\build.ps1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-x64-installer
+          path: dist/installers/*-windows-x64-setup.exe
+          if-no-files-found: error

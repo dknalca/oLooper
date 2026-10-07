@@ -1,5 +1,18 @@
 # Release notes
 
+## 0.6.3
+
+- Ask for the import mode each time SWF/EXE files are selected or dropped:
+  extract their audio or play directly from the managed source copy.
+- Confirm looper removal in an in-app dialog that lists the managed SWF/EXE,
+  extracted/downloaded audio, and cover files that may be removed.
+- Delete managed container copies and extracted audio when removing the final
+  referencing looper, while preserving original files outside the library.
+- Fix deletion for groups containing both extracted and source-backed tracks;
+  restore staged files if catalog deletion fails.
+- Expand regression tests for SWF/EXE playback and removal, and add Windows CI
+  coverage for x64 tests and installer generation.
+
 ## 0.6.2
 
 - Fixed **Reveal audio file** on Windows: files are selected in Explorer and

@@ -26,8 +26,7 @@ interface ImportFileState {
 }
 
 export default function ImportBar({ onImported }: Props) {
-  const [containerMode, setContainerMode] = useState<"extract" | "embedded">(() =>
-    localStorage.getItem("olooper.import.containerMode") === "embedded" ? "embedded" : "extract");
+  const [modePrompt, setModePrompt] = useState<{ resolve: (mode: "extract" | "embedded" | null) => void } | null>(null);
   const [busy, setBusy] = useState(false);
   const [dragging, setDragging] = useState(false);
   const [report, setReport] = useState<ImportReport | null>(null);
@@ -43,10 +42,19 @@ export default function ImportBar({ onImported }: Props) {
   const activeJobIdRef = useRef<string | null>(null);
   const activePathRef = useRef<string | null>(null);
   const internalTrackDrag = useRef(false);
+  const modeDialogRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    localStorage.setItem("olooper.import.containerMode", containerMode);
-  }, [containerMode]);
+    if (!modePrompt) return;
+    const previousFocus = document.activeElement as HTMLElement | null;
+    modeDialogRef.current?.querySelector<HTMLButtonElement>("button")?.focus();
+    return () => previousFocus?.focus();
+  }, [modePrompt]);
+
+  const chooseContainerMode = (paths: string[]): Promise<"extract" | "embedded" | null> => {
+    if (!paths.some((path) => ["swf", "exe"].includes(importKindForPath(path)))) return Promise.resolve("extract");
+    return new Promise((resolve) => setModePrompt({ resolve }));
+  };
 
   const setImportBusy = (value: boolean) => {
     busyRef.current = value;
@@ -162,10 +170,12 @@ export default function ImportBar({ onImported }: Props) {
             return;
           }
           setImportBusy(true);
-          beginImport(paths);
           setError(null);
           setReport(null);
           (async () => {
+            const containerMode = await chooseContainerMode(paths);
+            if (!containerMode) { setImportBusy(false); return; }
+            beginImport(paths);
             let totalAdded = 0;
             let totalExisting = 0;
             let totalFailed = 0;
@@ -218,10 +228,10 @@ export default function ImportBar({ onImported }: Props) {
       .then((f) => { off = f; })
       .catch((e) => setError(`Drag and drop unavailable: ${String(e)}`));
     return () => off?.();
-  }, [containerMode, onImported]);
+  }, [onImported]);
 
   const browseAndImport = async (
-    importFn: (p: string, jobId: string) => Promise<ImportReport>,
+    importFn: (p: string, jobId: string, mode: "extract" | "embedded") => Promise<ImportReport>,
     filters: { name: string; extensions: string[] }[],
   ) => {
     if (busyRef.current) return;
@@ -238,6 +248,8 @@ export default function ImportBar({ onImported }: Props) {
       setImportBusy(false);
       return;
     }
+    const containerMode = await chooseContainerMode(files);
+    if (!containerMode) { setImportBusy(false); return; }
     beginImport(files);
     setError(null);
     setReport(null);
@@ -249,7 +261,7 @@ export default function ImportBar({ onImported }: Props) {
     for (const f of files) {
       if (cancelQueue.current) break;
       try {
-        const r = await runOwnedJob(f, (jobId) => importFn(f, jobId));
+        const r = await runOwnedJob(f, (jobId) => importFn(f, jobId, containerMode));
         lastReport = r;
         totalAdded += r.added;
         failedSounds += r.failed.length;
@@ -320,11 +332,11 @@ export default function ImportBar({ onImported }: Props) {
   const importFromMenu = async (command: AppMenuCommand) => {
     if (busyRef.current) return;
     if (command === "open-swf") {
-      await browseAndImport((path, jobId) => importSwfAndWait(path, jobId, containerMode === "extract"), [{ name: "Flash files", extensions: ["swf"] }]);
+      await browseAndImport((path, jobId, mode) => importSwfAndWait(path, jobId, mode === "extract"), [{ name: "Flash files", extensions: ["swf"] }]);
       return;
     }
     if (command === "open-exe") {
-      await browseAndImport((path, jobId) => importExeAndWait(path, jobId, containerMode === "extract"), [{ name: "Projector files", extensions: ["exe"] }]);
+      await browseAndImport((path, jobId, mode) => importExeAndWait(path, jobId, mode === "extract"), [{ name: "Projector files", extensions: ["exe"] }]);
       return;
     }
     if (command === "import-audio") {
@@ -349,6 +361,8 @@ export default function ImportBar({ onImported }: Props) {
       setImportBusy(false);
       return;
     }
+    const containerMode = await chooseContainerMode(paths);
+    if (!containerMode) { setImportBusy(false); return; }
     beginImport(paths);
     setError(null);
     setReport(null);
@@ -407,7 +421,7 @@ export default function ImportBar({ onImported }: Props) {
     };
     window.addEventListener("olooper:import-command", handleMenuCommand);
     return () => window.removeEventListener("olooper:import-command", handleMenuCommand);
-  }, [busy, containerMode]);
+  }, [busy]);
 
   return (
     <>
@@ -422,16 +436,49 @@ export default function ImportBar({ onImported }: Props) {
 
       {notice && <div className="fixed left-1/2 top-12 z-[80] -translate-x-1/2 rounded border border-success/40 bg-surface px-4 py-3 text-xs text-success shadow-xl" role="status">{notice}</div>}
 
+      {modePrompt && (
+        <div ref={modeDialogRef} className="fixed inset-0 z-[100] flex items-center justify-center bg-black/60 p-4" role="dialog" aria-modal="true" aria-labelledby="container-import-title" onKeyDown={(event) => {
+          if (event.key === "Escape") {
+            event.preventDefault();
+            event.stopPropagation();
+            modePrompt.resolve(null);
+            setModePrompt(null);
+          } else if (event.key === "Tab") {
+            const buttons = modeDialogRef.current?.querySelectorAll<HTMLButtonElement>("button");
+            if (!buttons?.length) return;
+            const first = buttons[0];
+            const last = buttons[buttons.length - 1];
+            if (event.shiftKey && document.activeElement === first) {
+              event.preventDefault();
+              last.focus();
+            } else if (!event.shiftKey && document.activeElement === last) {
+              event.preventDefault();
+              first.focus();
+            }
+          }
+        }}>
+          <div className="w-full max-w-sm rounded-lg border border-border bg-surface p-5 shadow-2xl">
+            <h2 id="container-import-title" className="text-sm font-semibold text-text">Import SWF/EXE audio</h2>
+            <p className="mt-2 text-xs text-text-secondary">Choose how to handle the audio in the selected file(s).</p>
+            <div className="mt-4 flex flex-col gap-2">
+              <button onClick={() => { modePrompt.resolve("extract"); setModePrompt(null); }} className="rounded border border-border bg-elevated px-3 py-2 text-left text-xs text-text hover:border-accent">Extract audio</button>
+              <button onClick={() => { modePrompt.resolve("embedded"); setModePrompt(null); }} className="rounded border border-border bg-elevated px-3 py-2 text-left text-xs text-text hover:border-accent">Play from source (no extraction)</button>
+              <button onClick={() => { modePrompt.resolve(null); setModePrompt(null); }} className="self-end px-2 py-1 text-[10px] text-text-secondary hover:text-text">Cancel</button>
+            </div>
+          </div>
+        </div>
+      )}
+
       <div className="flex h-8 shrink-0 items-center gap-1 border-l border-border pl-2">
         <BrowseBtn
-          onClick={() => browseAndImport((path, jobId) => importSwfAndWait(path, jobId, containerMode === "extract"), [
+          onClick={() => browseAndImport((path, jobId, mode) => importSwfAndWait(path, jobId, mode === "extract"), [
             { name: "Flash files", extensions: ["swf"] },
           ])}
           disabled={busy}
           label="SWF"
         />
         <BrowseBtn
-          onClick={() => browseAndImport((path, jobId) => importExeAndWait(path, jobId, containerMode === "extract"), [
+          onClick={() => browseAndImport((path, jobId, mode) => importExeAndWait(path, jobId, mode === "extract"), [
             { name: "Projector files", extensions: ["exe"] },
           ])}
           disabled={busy}
@@ -442,18 +489,6 @@ export default function ImportBar({ onImported }: Props) {
           disabled={busy}
           label="Audio"
         />
-        <select
-          aria-label="SWF and EXE audio import mode"
-          title="Choose whether to extract audio or play it from the copied SWF/EXE source"
-          value={containerMode}
-          onChange={(event) => setContainerMode(event.target.value as "extract" | "embedded")}
-          disabled={busy}
-          className="max-w-28 rounded border border-border bg-elevated px-1.5 py-1 text-[9px] text-text-secondary disabled:opacity-40"
-        >
-          <option value="extract">Extract audio</option>
-          <option value="embedded">Play from source</option>
-        </select>
-
         {progress && !progress.done && (
           <div className="flex items-center gap-2">
             <span className="max-w-24 truncate text-[9px] text-accent animate-pulse">{progress.stage}</span>
