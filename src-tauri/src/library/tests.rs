@@ -98,7 +98,7 @@ fn wav_id3_tag(path: &Path) -> Tag {
 fn migrate_starts_at_current_schema() {
     let root = tmp_root("migrate");
     let lib = Library::open(&root).unwrap();
-    assert_eq!(lib.schema_version().unwrap(), 9);
+    assert_eq!(lib.schema_version().unwrap(), 10);
     assert!(root.join("Custom Loops").is_dir());
     assert!(root.join("olooper.db").is_file());
     std::fs::remove_dir_all(&root).ok();
@@ -132,14 +132,14 @@ fn migration_v6_adds_empty_playlists_without_changing_tracks() {
     let conn = Connection::open(root.join("olooper.db")).unwrap();
     conn.execute_batch(
         "DROP TABLE playlist_tracks; DROP TABLE playlists; DROP TABLE looper_order; \
-         ALTER TABLE tracks DROP COLUMN audio_storage; \
+         ALTER TABLE tracks DROP COLUMN audio_storage; ALTER TABLE tracks DROP COLUMN source_managed; \
          PRAGMA user_version=6;",
     )
     .unwrap();
     drop(conn);
 
     let migrated = Library::open(&root).unwrap();
-    assert_eq!(migrated.schema_version().unwrap(), 9);
+    assert_eq!(migrated.schema_version().unwrap(), 10);
     assert!(migrated.list_playlists().unwrap().is_empty());
     assert_eq!(migrated.list_tracks().unwrap()[0].id, track_id);
     std::fs::remove_dir_all(root).ok();
@@ -154,13 +154,13 @@ fn migration_v7_adds_looper_order_and_preserves_existing_groups() {
 
     let conn = Connection::open(root.join("olooper.db")).unwrap();
     conn.execute_batch(
-        "DROP TABLE looper_order; ALTER TABLE tracks DROP COLUMN audio_storage; PRAGMA user_version=7;",
+        "DROP TABLE looper_order; ALTER TABLE tracks DROP COLUMN audio_storage; ALTER TABLE tracks DROP COLUMN source_managed; PRAGMA user_version=7;",
     )
         .unwrap();
     drop(conn);
 
     let migrated = Library::open(&root).unwrap();
-    assert_eq!(migrated.schema_version().unwrap(), 9);
+    assert_eq!(migrated.schema_version().unwrap(), 10);
     assert_eq!(
         migrated.list_looper_order().unwrap(),
         vec!["looper-order-first"]
@@ -177,14 +177,15 @@ fn migration_v8_defaults_existing_tracks_to_extracted_audio() {
     drop(lib);
 
     let conn = Connection::open(root.join("olooper.db")).unwrap();
-    conn.execute_batch("ALTER TABLE tracks DROP COLUMN audio_storage; PRAGMA user_version=8;")
+    conn.execute_batch("ALTER TABLE tracks DROP COLUMN audio_storage; ALTER TABLE tracks DROP COLUMN source_managed; PRAGMA user_version=8;")
         .unwrap();
     drop(conn);
 
     let migrated = Library::open(&root).unwrap();
-    assert_eq!(migrated.schema_version().unwrap(), 9);
+    assert_eq!(migrated.schema_version().unwrap(), 10);
     let track = migrated.get_track(track_id).unwrap().unwrap();
     assert_eq!(track.audio_storage, "extracted");
+    assert!(track.source_managed);
     assert_eq!(track.playback_path, track.file_path);
     std::fs::remove_dir_all(root).ok();
 }
@@ -756,6 +757,7 @@ fn container_removal_handles_both_formats_storage_modes_and_rollback() {
                         0,
                         0,
                         storage,
+                        matches!(format, "swf" | "exe"),
                     )
                     .unwrap()
                     .0,
@@ -810,6 +812,7 @@ fn mixed_looper_removal_deletes_audio_but_preserves_a_shared_container() {
             0,
             0,
             storage,
+            true,
         )
         .unwrap();
     }
@@ -1424,6 +1427,7 @@ fn embedded_import_lists_tracks_and_decodes_from_the_managed_source_without_audi
             "swf",
             &source_path,
             &hash,
+            true,
             None,
             None,
             &parsed.sounds,
@@ -1435,6 +1439,7 @@ fn embedded_import_lists_tracks_and_decodes_from_the_managed_source_without_audi
     assert_eq!(report.added, 1);
     let track = lib.get_track(report.track_ids[0]).unwrap().unwrap();
     assert_eq!(track.audio_storage, "embedded");
+    assert!(track.source_managed);
     assert_eq!(track.file_path, source_path);
     assert_eq!(track.playback_path, format!("embedded:{}", track.id));
     assert!(track.exists);
@@ -1513,6 +1518,50 @@ fn embedded_import_lists_tracks_and_decodes_from_the_managed_source_without_audi
     );
     assert!(lib.remove_track(track.id).unwrap());
     assert!(!Path::new(&source_path).exists());
+
+    let external_library_root = root.join("no-copy-library");
+    let external_lib = Library::open(&external_library_root).unwrap();
+    let external_source = external_library_root
+        .join("loopersFlash")
+        .join("outside-library.swf");
+    std::fs::create_dir_all(external_source.parent().unwrap()).unwrap();
+    std::fs::write(&external_source, &source_bytes).unwrap();
+    let external_source_text = external_source.to_string_lossy().to_string();
+    let external_report = external_lib
+        .import_embedded_sounds_with_cover_and_progress(
+            "Outside library",
+            "swf",
+            &external_source_text,
+            &hash,
+            false,
+            None,
+            None,
+            &parsed.sounds,
+            None,
+            |_, _, _| Ok(()),
+        )
+        .unwrap();
+    let external_track = external_lib
+        .get_track(external_report.track_ids[0])
+        .unwrap()
+        .unwrap();
+    assert!(external_track.exists);
+    assert!(!external_track.source_managed);
+    assert_eq!(
+        external_lib
+            .playback_request(external_track.id)
+            .unwrap()
+            .decode()
+            .unwrap()
+            .samples,
+        expected.samples
+    );
+    assert_eq!(external_lib.remove_looper(&hash).unwrap(), 1);
+    assert!(
+        external_source.is_file(),
+        "removing a catalog group must preserve an external source"
+    );
+    std::fs::remove_file(external_source).unwrap();
     std::fs::remove_dir_all(&root).ok();
 }
 

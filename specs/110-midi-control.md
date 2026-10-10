@@ -21,14 +21,18 @@ Options…**, with assignments remembered locally.
   re-arms that control. Continuous CC values do not drive parameters.
 - Assignable actions: Play/Pause, Stop, Previous/Next, Toggle Loop, AUTO loop,
   Speed ±5%, CUE 1–4, and Clear CUE 2–4. CUE 1 recalls the start of the track.
-- Assignments and the selected input ID persist in local application storage;
+- Assignments and the selected input/output IDs persist in local application storage;
   no SQLite migration is required.
+- A separately selected MIDI output sends Note On/Off or CC 127/0 feedback for
+  assigned pads. Feedback is cleared when an assignment is removed or the output
+  disconnects. Hardware determines whether/how these messages illuminate pads;
+  RGB colors and vendor SysEx are not configured by oLooper.
 
 ## Architecture
 
-- `src-tauri/src/midi.rs` owns MIDI input enumeration/connection and parses
-  incoming channel messages. The callback emits data only; it never calls player
-  or library commands directly.
+- `src-tauri/src/midi.rs` owns MIDI input/output enumeration and connection and
+  parses incoming channel messages. The input callback emits data only; it never
+  calls player or library commands directly.
 - Tauri MIDI commands and the `olooper:midi-message` event are bridged through
   `src/tauri.ts`.
 - App maps one-to-one bindings to an explicit `MidiAction` allowlist and invokes
@@ -50,8 +54,9 @@ Options…**, with assignments remembered locally.
 - [x] CC assignments trigger only on a zero-to-nonzero transition.
 - [x] Duplicate control assignments move to the most recently learned action.
 - [x] MIDI input parsing is unit-tested without physical hardware.
+- [ ] Assignments send discrete output feedback and clear their LEDs when removed.
 
 ## Non-goals
 
-- Continuous CC/fader control, MIDI output, SysEx, Note Off actions, and multiple
+- Continuous CC/fader control, RGB color programming/vendor SysEx, Note Off actions, and multiple
   simultaneous MIDI inputs.

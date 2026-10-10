@@ -22,6 +22,10 @@ fn import_unmark_cancelled(job_id: &str) {
     }
 }
 
+fn should_copy_container(extract_audio: bool, copy_source: bool) -> bool {
+    extract_audio || copy_source
+}
+
 pub mod analysis;
 pub mod audio_conversion;
 pub mod audio_log;
@@ -504,8 +508,13 @@ pub fn run() {
             library_set_serato_cue,
             library_sync_serato_metadata,
             midi_list_inputs,
+            midi_list_outputs,
             midi_connected_input,
+            midi_connected_output,
             midi_connect,
+            midi_connect_output,
+            midi_disconnect_output,
+            midi_set_led,
             midi_disconnect,
             import_swf,
             import_exe,
@@ -1083,12 +1092,27 @@ fn midi_list_inputs() -> Result<Vec<midi::MidiInputInfo>, String> {
 }
 
 #[tauri::command]
+fn midi_list_outputs() -> Result<Vec<midi::MidiOutputInfo>, String> {
+    midi::list_outputs()
+}
+
+#[tauri::command]
 fn midi_connected_input(
     state: tauri::State<'_, Mutex<midi::MidiManager>>,
 ) -> Result<Option<midi::MidiInputInfo>, String> {
     state
         .lock()
         .map(|manager| manager.connected_input())
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn midi_connected_output(
+    state: tauri::State<'_, Mutex<midi::MidiManager>>,
+) -> Result<Option<midi::MidiOutputInfo>, String> {
+    state
+        .lock()
+        .map(|manager| manager.connected_output())
         .map_err(|error| error.to_string())
 }
 
@@ -1102,6 +1126,38 @@ fn midi_connect(
         .lock()
         .map_err(|error| error.to_string())?
         .connect(&app, &input_id)
+}
+
+#[tauri::command]
+fn midi_connect_output(
+    output_id: String,
+    state: tauri::State<'_, Mutex<midi::MidiManager>>,
+) -> Result<midi::MidiOutputInfo, String> {
+    state
+        .lock()
+        .map_err(|error| error.to_string())?
+        .connect_output(&output_id)
+}
+
+#[tauri::command]
+fn midi_disconnect_output(state: tauri::State<'_, Mutex<midi::MidiManager>>) -> Result<(), String> {
+    state
+        .lock()
+        .map_err(|error| error.to_string())?
+        .disconnect_output();
+    Ok(())
+}
+
+#[tauri::command]
+fn midi_set_led(
+    binding: midi::MidiLedBinding,
+    enabled: bool,
+    state: tauri::State<'_, Mutex<midi::MidiManager>>,
+) -> Result<(), String> {
+    state
+        .lock()
+        .map_err(|error| error.to_string())?
+        .set_led(&binding, enabled)
 }
 
 #[tauri::command]
@@ -1165,6 +1221,7 @@ struct ImportJob {
     root: std::path::PathBuf,
     kind: ImportKind,
     extract_audio: bool,
+    copy_source: bool,
     paths: Vec<String>,
     cover_path: Option<String>,
     job_id: String,
@@ -1193,7 +1250,20 @@ fn run_container_job(app: &tauri::AppHandle, job: &ImportJob, exe: bool) {
         fail("import cancelled".to_string());
         return;
     }
-    emit_import_progress(app, &job.job_id, "copying source", 0, 0, path, false, None);
+    emit_import_progress(
+        app,
+        &job.job_id,
+        if should_copy_container(job.extract_audio, job.copy_source) {
+            "copying source"
+        } else {
+            "reading source"
+        },
+        0,
+        0,
+        path,
+        false,
+        None,
+    );
     let data = match read_input(path) {
         Ok(data) => data,
         Err(e) => {
@@ -1201,12 +1271,16 @@ fn run_container_job(app: &tauri::AppHandle, job: &ImportJob, exe: bool) {
             return;
         }
     };
-    let copied_path = match copy_dropped_source(&job.root, path, &data) {
-        Ok(path) => path,
-        Err(e) => {
-            fail(e);
-            return;
+    let copied_path = if should_copy_container(job.extract_audio, job.copy_source) {
+        match copy_dropped_source(&job.root, path, &data) {
+            Ok(path) => path,
+            Err(e) => {
+                fail(e);
+                return;
+            }
         }
+    } else {
+        path.to_string()
     };
     emit_import_progress(
         app,
@@ -1288,6 +1362,7 @@ fn run_container_job(app: &tauri::AppHandle, job: &ImportJob, exe: bool) {
             source_type,
             &copied_path,
             &source_hash,
+            job.copy_source,
             exe_offset,
             exe_length,
             &sounds.sounds,
@@ -1537,6 +1612,7 @@ fn import_swf(
     path: String,
     job_id: String,
     extract_audio: bool,
+    copy_source: bool,
     queue: tauri::State<'_, ImportQueue>,
     db: Db<'_>,
 ) -> Result<String, String> {
@@ -1551,6 +1627,7 @@ fn import_swf(
             root,
             kind: ImportKind::Swf,
             extract_audio,
+            copy_source,
             paths: vec![path],
             cover_path: None,
             job_id: job_id.clone(),
@@ -1564,6 +1641,7 @@ fn import_exe(
     path: String,
     job_id: String,
     extract_audio: bool,
+    copy_source: bool,
     queue: tauri::State<'_, ImportQueue>,
     db: Db<'_>,
 ) -> Result<String, String> {
@@ -1578,6 +1656,7 @@ fn import_exe(
             root,
             kind: ImportKind::Exe,
             extract_audio,
+            copy_source,
             paths: vec![path],
             cover_path: None,
             job_id: job_id.clone(),
@@ -1607,6 +1686,7 @@ fn import_custom(
             root,
             kind: ImportKind::Custom,
             extract_audio: true,
+            copy_source: true,
             paths,
             cover_path: None,
             job_id: job_id.clone(),
@@ -1634,6 +1714,7 @@ fn import_tablist(
             root,
             kind: ImportKind::Tablist,
             extract_audio: true,
+            copy_source: true,
             paths: vec![url],
             cover_path,
             job_id: job_id.clone(),
@@ -1660,6 +1741,13 @@ async fn tablist_search(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_copy_preference_only_skips_copy_for_source_backed_imports() {
+        assert!(should_copy_container(true, false));
+        assert!(should_copy_container(false, true));
+        assert!(!should_copy_container(false, false));
+    }
 
     #[test]
     fn status_reports_crate_version_and_os() {

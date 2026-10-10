@@ -19,7 +19,7 @@ use crate::import::swf::Sound;
 mod serato;
 
 /// Current schema version (`PRAGMA user_version`).
-const SCHEMA_VERSION: i32 = 9;
+const SCHEMA_VERSION: i32 = 10;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Track {
@@ -35,6 +35,7 @@ pub struct Track {
     pub audio_storage: String,
     pub source_type: String,
     pub source_path: String,
+    pub source_managed: bool,
     pub source_hash: String,
     pub source_sound_id: i64,
     pub codec: String,
@@ -344,7 +345,7 @@ impl Library {
                  source_sound_id,codec,sample_rate,channels,duration_ms,seek_samples,trimmed_leading,\
                  bpm,bpm_confidence,bpm_source,primary_cue_ms,loop_start_ms,\
                    loop_end_ms,loop_enabled,loop_start_frame,loop_end_frame,loop_origin,\
-                 loop_quality,loop_needs_review,total_frames,imported_at,updated_at,favorite,tags,last_played_at,audio_storage \
+                 loop_quality,loop_needs_review,total_frames,imported_at,updated_at,favorite,tags,last_played_at,audio_storage,source_managed \
                  FROM tracks ORDER BY id",
             )
             .map_err(|e| e.to_string())?;
@@ -367,6 +368,7 @@ impl Library {
                     audio_storage: audio_storage.clone(),
                     source_type: r.get(4)?,
                     source_path: r.get(5)?,
+                    source_managed: r.get::<_, i64>(33)? != 0,
                     source_hash: r.get(6)?,
                     source_sound_id: r.get(7)?,
                     codec: r.get(8)?,
@@ -711,6 +713,13 @@ impl Library {
         let path = Path::new(&track.file_path)
             .canonicalize()
             .map_err(|error| format!("cannot resolve track source: {error}"))?;
+        if track.audio_storage == "embedded" && matches!(track.source_type.as_str(), "swf" | "exe")
+        {
+            if !path.is_file() {
+                return Err("looper source is not a regular file".to_string());
+            }
+            return Ok(path);
+        }
         let root = self
             .root
             .canonicalize()
@@ -724,7 +733,7 @@ impl Library {
     /// Resolve the library-owned SWF/EXE copy for a track. Original files
     /// outside `loopersFlash` and symlinks are never eligible for deletion.
     fn managed_container_path_for_track(&self, track: &Track) -> Result<Option<PathBuf>, String> {
-        if !matches!(track.source_type.as_str(), "swf" | "exe") {
+        if !track.source_managed || !matches!(track.source_type.as_str(), "swf" | "exe") {
             return Ok(None);
         }
         let candidate = PathBuf::from(&track.source_path);
@@ -860,6 +869,7 @@ impl Library {
             seek_samples,
             trimmed_leading,
             "extracted",
+            matches!(source_type, "swf" | "exe"),
         )
     }
 
@@ -880,6 +890,7 @@ impl Library {
         seek_samples: i64,
         trimmed_leading: i64,
         audio_storage: &str,
+        source_managed: bool,
     ) -> Result<(i64, bool), String> {
         if !matches!(audio_storage, "extracted" | "embedded") {
             return Err("unknown audio storage mode".to_string());
@@ -896,9 +907,9 @@ impl Library {
                  seek_samples,trimmed_leading,\
                  primary_cue_ms,loop_start_ms,loop_end_ms,loop_enabled,\
                  loop_start_frame,loop_end_frame,loop_origin,loop_quality,loop_needs_review,total_frames,\
-                  imported_at,updated_at,audio_storage) \
+                   imported_at,updated_at,audio_storage,source_managed) \
                    VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,\
-                    0,0,?13,1,0,?16,'manual',1.0,0,?16,?17,?17,?18) \
+                     0,0,?13,1,0,?16,'manual',1.0,0,?16,?17,?17,?18,?19) \
                  ON CONFLICT(source_hash,source_sound_id) DO NOTHING",
                 rusqlite::params![
                     title,
@@ -919,6 +930,7 @@ impl Library {
                     total_frames,
                     now,
                     audio_storage,
+                    source_managed as i64,
                 ],
             )
             .map_err(|e| e.to_string())?;
@@ -1076,8 +1088,10 @@ impl Library {
         if last_group_track {
             if let Some(directory) = embedded_directory {
                 let _ = std::fs::remove_dir(directory);
-            } else if let Some(directory) = file_path.parent() {
-                let _ = std::fs::remove_dir(directory);
+            } else if file_path.starts_with(&self.root) {
+                if let Some(directory) = file_path.parent() {
+                    let _ = std::fs::remove_dir(directory);
+                }
             }
         }
         Ok(true)
@@ -1411,6 +1425,16 @@ impl Library {
 
     pub fn group_directory(&self, source_hash: &str) -> Result<PathBuf, String> {
         let track = self.group_tracks(source_hash)?.into_iter().next().unwrap();
+        if track.audio_storage == "embedded"
+            && matches!(track.source_type.as_str(), "swf" | "exe")
+            && !track.source_managed
+        {
+            return PathBuf::from(&track.file_path)
+                .parent()
+                .ok_or("source has no parent directory")?
+                .canonicalize()
+                .map_err(|error| format!("looper source folder is missing: {error}"));
+        }
         let root = self
             .root
             .canonicalize()
@@ -2097,6 +2121,7 @@ impl Library {
             sounds,
             cover_image,
             true,
+            matches!(source_type, "swf" | "exe"),
             progress,
         )
     }
@@ -2108,6 +2133,7 @@ impl Library {
         source_type: &str,
         source_path: &str,
         source_hash: &str,
+        source_managed: bool,
         exe_offset: Option<i64>,
         exe_length: Option<i64>,
         sounds: &[Sound],
@@ -2127,6 +2153,7 @@ impl Library {
             sounds,
             cover_image,
             false,
+            source_managed,
             progress,
         )
     }
@@ -2143,6 +2170,7 @@ impl Library {
         sounds: &[Sound],
         cover_image: Option<&[u8]>,
         extract_audio: bool,
+        source_managed: bool,
         mut progress: F,
     ) -> Result<ImportReport, (ImportReport, String)>
     where
@@ -2458,6 +2486,7 @@ impl Library {
                     0,
                     0,
                     audio_storage,
+                    source_managed,
                 ) {
                     Ok((id, true)) => {
                         if let Some(estimate) = item.estimate {
@@ -3100,6 +3129,17 @@ fn migrate(conn: &Connection) -> Result<(), String> {
              COMMIT;",
         )
         .map_err(|e| format!("migration 8→9 failed: {e}"))?;
+    }
+    if v < 10 {
+        conn.execute_batch(
+            "BEGIN;
+             ALTER TABLE tracks ADD COLUMN source_managed INTEGER NOT NULL DEFAULT 1
+               CHECK(source_managed IN (0,1));
+             UPDATE tracks SET source_managed=0 WHERE source_type NOT IN ('swf','exe');
+             PRAGMA user_version = 10;
+             COMMIT;",
+        )
+        .map_err(|e| format!("migration 9→10 failed: {e}"))?;
     }
     Ok(())
 }

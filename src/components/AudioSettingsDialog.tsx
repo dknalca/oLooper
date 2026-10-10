@@ -22,6 +22,8 @@ interface Props {
   selection: AudioOutputSelection;
   startupError: string | null;
   onSelectionChange: (selection: AudioOutputSelection) => void;
+  copySourceOnImport: boolean;
+  onCopySourceOnImportChange: (enabled: boolean) => void;
   onPlayerStatusChange: (status: PlayerStatus) => void;
   onOutputTestStarted: () => void;
   onClose: () => void;
@@ -32,6 +34,8 @@ export default function AudioSettingsDialog({
   selection,
   startupError,
   onSelectionChange,
+  copySourceOnImport,
+  onCopySourceOnImportChange,
   onPlayerStatusChange,
   onOutputTestStarted,
   onClose,
@@ -260,6 +264,19 @@ export default function AudioSettingsDialog({
             <option value="">System default{systemDefault ? ` — ${systemDefault.name}` : ""}</option>
             {devices.map((device) => <option key={device.id} value={device.id}>{device.name}{device.is_default ? " (system default)" : ""}</option>)}
           </select>
+        </label>
+
+        <label className="mt-4 flex items-start gap-2 rounded border border-border bg-elevated p-3 text-xs text-text">
+          <input
+            type="checkbox"
+            checked={copySourceOnImport}
+            onChange={(event) => onCopySourceOnImportChange(event.target.checked)}
+            className="mt-0.5"
+          />
+          <span>
+            <span className="block font-medium">Copy SWF/EXE sources when playing from source</span>
+            <span className="mt-1 block text-[10px] text-text-secondary">When disabled, “Play from source” keeps a reference to the original file instead of copying it. Extracted-audio imports still copy their source. The original must remain available for playback.</span>
+          </span>
         </label>
 
         <div className="mt-4 grid grid-cols-2 gap-3">

@@ -28,6 +28,9 @@ ready to practice immediately with the same player/waveform as extractions.
 
 - Rows with `source_type=custom`, `source_hash` = file SHA-256,
   `source_sound_id` = 0, `bpm_source='analyzed'` (or NULL when no estimate).
+- All custom-audio rows appear under one **Audios importados** library group.
+  Their per-file hashes and physical storage remain independent for deduplication,
+  playback, favorites, and playlist references.
 
 ## Failure behavior
 
@@ -56,6 +59,7 @@ ready to practice immediately with the same player/waveform as extractions.
 - [x] Click-track fixture estimates BPM within ±1 (test, synthetic).
 - [x] Silence/ambient yields no estimate (NULL), import still succeeds.
 - [x] Same file twice → second is a no-op; same name different bytes → `(2)`.
+- [x] All imported custom audio is presented in one **Audios importados** group.
 - [x] Unit tests: estimator on synthetic clicks, collision naming, dedup.
 - [x] Native file picker: Browse buttons open OS dialog, selected files import.
 

@@ -18,7 +18,10 @@ import {
   listenAppMenuCommand,
   listenMidiMessage,
   midiConnect,
+  midiConnectOutput,
+  midiDisconnectOutput,
   midiDisconnect,
+  midiSetLed,
   playerAutoLoop,
   playerLoadTrack,
   playerUnload,
@@ -113,15 +116,18 @@ export default function App() {
   const [loopEditing, setLoopEditing] = useState(false);
   const [midiOptionsOpen, setMidiOptionsOpen] = useState(false);
   const [audioOptionsOpen, setAudioOptionsOpen] = useState(false);
+  const [copySourceOnImport, setCopySourceOnImport] = useState(() => localStorage.getItem("olooper.import.copy-source") !== "false");
   const [audioSelection, setAudioSelection] = useState<AudioOutputSelection>(readAudioSelection);
   const [audioStartupError, setAudioStartupError] = useState<string | null>(null);
   const [midiInputId, setMidiInputId] = useState<string | null>(() => localStorage.getItem("olooper.midi.input"));
+  const [midiOutputId, setMidiOutputId] = useState<string | null>(() => localStorage.getItem("olooper.midi.output"));
   const [midiBindings, setMidiBindings] = useState<MidiBindings>(readMidiBindings);
   const [midiLearningAction, setMidiLearningAction] = useState<MidiAction | null>(null);
   const [midiLearningConflict, setMidiLearningConflict] = useState<MidiAction | null>(null);
   const randomLoadGeneration = useRef(0);
   const libraryRootRef = useRef<string | null>(null);
   const midiBindingsRef = useRef(midiBindings);
+  const previousLedBindingsRef = useRef(midiBindings);
   const midiLearningActionRef = useRef(midiLearningAction);
   const midiActionHandlerRef = useRef<(action: MidiAction) => void>(() => {});
   midiBindingsRef.current = midiBindings;
@@ -342,6 +348,49 @@ export default function App() {
   }, [midiInputId]);
 
   useEffect(() => {
+    if (midiOutputId) localStorage.setItem("olooper.midi.output", midiOutputId);
+    else localStorage.removeItem("olooper.midi.output");
+  }, [midiOutputId]);
+
+  useEffect(() => {
+    const previous = previousLedBindingsRef.current;
+    for (const [action, oldBinding] of Object.entries(previous)) {
+      if (!oldBinding) continue;
+      const current = midiBindings[action as MidiAction];
+      if (!current || !sameMidiBinding(current, oldBinding)) {
+        void midiSetLed(oldBinding, false).catch(() => {});
+      }
+    }
+    for (const [action, binding] of Object.entries(midiBindings)) {
+      if (!binding) continue;
+      const oldBinding = previous[action as MidiAction];
+      if (!oldBinding || !sameMidiBinding(binding, oldBinding)) {
+        void midiSetLed(binding, true).catch(() => {});
+      }
+    }
+    previousLedBindingsRef.current = midiBindings;
+  }, [midiBindings]);
+
+  useEffect(() => {
+    if (!midiOutputId) {
+      midiDisconnectOutput().catch(() => {});
+      return;
+    }
+    let cancelled = false;
+    midiConnectOutput(midiOutputId).then(() => {
+      if (cancelled) return;
+      for (const binding of Object.values(midiBindingsRef.current)) {
+        if (binding) void midiSetLed(binding, true).catch(() => {});
+      }
+    }).catch(() => {});
+    return () => { cancelled = true; };
+  }, [midiOutputId]);
+
+  useEffect(() => {
+    localStorage.setItem("olooper.import.copy-source", String(copySourceOnImport));
+  }, [copySourceOnImport]);
+
+  useEffect(() => {
     let unlisten: (() => void) | undefined;
     let cancelled = false;
     listenMidiMessage((message) => {
@@ -530,10 +579,12 @@ export default function App() {
       <MidiSettingsDialog
         open={midiOptionsOpen}
         inputId={midiInputId}
+        outputId={midiOutputId}
         bindings={midiBindings}
         learningAction={midiLearningAction}
         conflictAction={midiLearningConflict}
         onInputIdChange={setMidiInputId}
+        onOutputIdChange={setMidiOutputId}
         onLearningChange={(action) => {
           setMidiLearningConflict(null);
           setMidiLearningAction(action);
@@ -555,6 +606,11 @@ export default function App() {
       <AudioSettingsDialog
         open={audioOptionsOpen}
         selection={audioSelection}
+        copySourceOnImport={copySourceOnImport}
+        onCopySourceOnImportChange={(enabled) => {
+          localStorage.setItem("olooper.import.copy-source", String(enabled));
+          setCopySourceOnImport(enabled);
+        }}
         startupError={audioStartupError}
         onSelectionChange={(next) => {
           setAudioStartupError(null);

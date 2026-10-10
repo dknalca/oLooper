@@ -1,21 +1,22 @@
 # Agent Instructions
 
-oLooper is a Tauri 2 desktop app: React/TypeScript in `src/`, Rust in `src-tauri/`; Rust MSRV is 1.87. The root package is the frontend; there is no configured lint command.
+oLooper is a Tauri 2 app: React/TypeScript frontend in `src/`, Rust backend in `src-tauri/` (MSRV 1.87). The root package is the frontend; use pnpm and `pnpm-lock.yaml`. There is no configured lint command.
 
 ## Commands
 
-- Use `pnpm` with `pnpm-lock.yaml`. Dev: `pnpm install`, then `pnpm tauri dev`. Vite uses fixed port 1420; keep it aligned with `src-tauri/tauri.conf.json`.
-- Frontend: `pnpm run typecheck`, `pnpm test`; focused test: `pnpm vitest run src/importFlow.test.ts`.
-- Rust: `cargo test --manifest-path src-tauri/Cargo.toml`; focused test: add a test-name filter (and `-- --exact` for exact matching).
-- The ignored SWF fixture regression requires `OLOOPER_TURNTABLE_FIXTURE=/path/to/file.swf cargo test --manifest-path src-tauri/Cargo.toml -- --ignored turntable_fixture`. Keep real samples in gitignored `loopersFlash/`, never in commits.
-- macOS bundle: `./scripts/build.sh [--dev | --native | --arm64 | --x64]`; `--x64` and `--arm64` make separate single-architecture bundles, while the default is universal. `./scripts/package-dmg.sh [--arm64 | --x64]` packages the corresponding unsigned DMG. Windows: `scripts/install-windows.ps1` (elevated PowerShell) installs prerequisites; restart the shell, then use `scripts/build.ps1` for an NSIS installer under `dist/installers/` or `scripts/build.ps1 -Dev` for an unbundled debug executable. Windows regenerates `icon.ico` from `src-tauri/icons/icon.png` via `scripts/generate-windows-icon.mjs`; `src-tauri/build.rs` watches the ICO so the embedded executable icon is rebuilt.
+- Develop: `pnpm install`, then `pnpm tauri dev`. Vite is fixed to port 1420; keep it aligned with `src-tauri/tauri.conf.json`.
+- Frontend checks: `pnpm run typecheck` and `pnpm test`; focused test: `pnpm test -- src/importFlow.test.ts`.
+- Rust tests: `cargo test --manifest-path src-tauri/Cargo.toml`; focus by appending a test-name filter (use `-- --exact` for exact matching).
+- The ignored SWF fixture regression requires `OLOOPER_TURNTABLE_FIXTURE=/path/to/file.swf cargo test --manifest-path src-tauri/Cargo.toml -- --ignored turntable_fixture`. Real samples belong in gitignored `loopersFlash/`, never commits.
+- macOS: `./scripts/build.sh [--dev | --native | --arm64 | --x64]` (default is Universal 2); `./scripts/package-dmg.sh [--arm64 | --x64]` packages an unsigned DMG. Windows: run `scripts/install-windows.ps1` in elevated PowerShell, restart the shell, then `scripts/build.ps1` (NSIS installer) or `scripts/build.ps1 -Dev` (unbundled debug executable).
 
 ## Architecture and constraints
 
-- Keep frontend Tauri command/dialog wrappers in `src/tauri.ts`; components should not call Tauri APIs directly. Current drag/drop exception: `getCurrentWebview` in `src/components/ImportBar.tsx`.
-- Backend setup and commands: `src-tauri/src/lib.rs`; audio engine: `player/`; import parsers: `import/`; waveform/BPM analysis: `waveform.rs`, `analysis.rs`. SQLite schema and migrations live in `library/mod.rs` (current schema v8; add migrations there). Playlists persist ordered track references, never audio copies.
-- Imports run on the `olooper-import` worker with a separate SQLite connection. Commands enqueue work; completion is emitted on `olooper:import-progress`, with final SWF/EXE `report` or custom-audio `custom_report`. Frontend `import*AndWait()` helpers subscribe and await completion. SQLite WAL and busy timeout support worker/read concurrency.
-- The selected library root owns catalog SQLite, extracted/managed audio and cover copies, copied SWF/EXE sources, and derived caches. Catalog fields are sourced from SQLite; four CUEs are stored in managed audio tags (CUE 1 is fixed at track start). Preserve Serato saved loops; do not expose loop-slot editing. MP3/WAV/AIFF use the legacy `Markers_` frame and must leave existing ID3 `Markers2` unchanged. Waveforms cache under `<library>/.olooper-cache/waveforms/`.
-- Never delete original SWF/EXE inputs or external custom-audio sources when removing library entries. Treat imported SWF/EXE/audio as untrusted: never execute projectors; retain parsing bounds/size checks, path sanitization, and validated/atomic writes.
-- For non-trivial features, update/add a spec in `specs/`; record lasting architectural decisions in `docs/adr/`. Add regression coverage for parsing, persistence, serialization, or security-sensitive changes.
-- `src-tauri/gen/` is generated and gitignored; `src-tauri/icons/` is committed and required to compile. Keep local data/artifacts such as `loopersFlash/`, `audios/`, `library/`, `.dev/`, `oLooper*.app/`, and `dist/` out of commits.
+- Backend commands/setup are in `src-tauri/src/lib.rs`; audio engine in `src-tauri/src/player/`; import parsers in `src-tauri/src/import/`; waveform/BPM analysis in `waveform.rs` and `analysis.rs`. SQLite schema and migrations are in `library/mod.rs` (current schema v10; add migrations there).
+- Keep frontend Tauri command/dialog wrappers in `src/tauri.ts`; components should not call Tauri APIs directly. Drag/drop in `src/components/ImportBar.tsx` is the current `getCurrentWebview` exception.
+- Imports run on the `olooper-import` worker with a separate SQLite connection. Completion uses `olooper:import-progress` events (`report` for SWF/EXE, `custom_report` for custom audio); frontend wait helpers subscribe to these events. SQLite WAL and busy timeout allow worker/read concurrency.
+- The selected library root owns the catalog DB, managed audio/covers, copied SWF/EXE sources, and derived caches. Playlists reference ordered track IDs and never copy audio. Waveforms cache under `<library>/.olooper-cache/waveforms/`.
+- Preserve Serato saved loops; do not expose loop-slot editing. CUE 1 is fixed at track start. MP3/WAV/AIFF use the legacy `Markers_` frame; preserve existing ID3 `Markers2` metadata.
+- Never execute SWF/EXE projectors. Treat imported files as untrusted: retain parsing bounds/size checks, path sanitization, and validated/atomic writes. Removing a library entry must not delete original SWF/EXE inputs or external custom-audio sources.
+- For non-trivial features, update/add a spec in `specs/`; record lasting architectural decisions in `docs/adr/`. Add regression coverage for parsing, persistence, serialization, and security-sensitive changes.
+- `src-tauri/gen/` is generated and gitignored; `src-tauri/icons/` is committed and required to compile. Keep local data/artifacts (`loopersFlash/`, `audios/`, `library/`, `.dev/`, `oLooper*.app/`, `dist/`) out of commits.

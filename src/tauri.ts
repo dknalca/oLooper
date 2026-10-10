@@ -243,6 +243,7 @@ export interface Track {
   audio_storage: "extracted" | "embedded";
   source_type: string;
   source_path: string;
+  source_managed: boolean;
   source_hash: string;
   source_sound_id: number;
   codec: string;
@@ -377,8 +378,12 @@ export function libraryRandomTrack(excludeId: number | null): Promise<Track | nu
   return invoke<Track | null>("library_random_track", { excludeId });
 }
 
-export function importSwf(path: string, jobId = importJobId(), extractAudio = true): Promise<string> {
-  return invoke<string>("import_swf", { path, jobId, extractAudio });
+function copyContainerOnImport(): boolean {
+  return localStorage.getItem("olooper.import.copy-source") !== "false";
+}
+
+export function importSwf(path: string, jobId = importJobId(), extractAudio = true, copySource = copyContainerOnImport()): Promise<string> {
+  return invoke<string>("import_swf", { path, jobId, extractAudio, copySource });
 }
 
 /** Register before enqueueing to avoid missing a fast worker completion. */
@@ -436,12 +441,13 @@ export async function importSwfAndWait(
   path: string,
   jobId = importJobId(),
   extractAudio = true,
+  copySource = copyContainerOnImport(),
 ): Promise<ImportReport> {
   const waiter = waitForImportDone(jobId);
   await waiter.ready;
   let done: ImportProgress;
   try {
-    await importSwf(path, jobId, extractAudio);
+    await importSwf(path, jobId, extractAudio, copySource);
     done = await waiter.done;
   } catch (error) {
     waiter.cancel();
@@ -452,8 +458,8 @@ export async function importSwfAndWait(
   throw new Error("import finished without a report");
 }
 
-export function importExe(path: string, jobId = importJobId(), extractAudio = true): Promise<string> {
-  return invoke<string>("import_exe", { path, jobId, extractAudio });
+export function importExe(path: string, jobId = importJobId(), extractAudio = true, copySource = copyContainerOnImport()): Promise<string> {
+  return invoke<string>("import_exe", { path, jobId, extractAudio, copySource });
 }
 
 /**
@@ -464,12 +470,13 @@ export async function importExeAndWait(
   path: string,
   jobId = importJobId(),
   extractAudio = true,
+  copySource = copyContainerOnImport(),
 ): Promise<ImportReport> {
   const waiter = waitForImportDone(jobId);
   await waiter.ready;
   let done: ImportProgress;
   try {
-    await importExe(path, jobId, extractAudio);
+    await importExe(path, jobId, extractAudio, copySource);
     done = await waiter.done;
   } catch (error) {
     waiter.cancel();
@@ -528,6 +535,14 @@ export interface MidiInputInfo {
   name: string;
 }
 
+export type MidiOutputInfo = MidiInputInfo;
+
+export interface MidiLedBinding {
+  kind: "note" | "cc";
+  channel: number;
+  number: number;
+}
+
 export interface MidiBinding {
   inputId: string;
   inputName: string;
@@ -544,12 +559,32 @@ export function midiListInputs(): Promise<MidiInputInfo[]> {
   return invoke<MidiInputInfo[]>("midi_list_inputs");
 }
 
+export function midiListOutputs(): Promise<MidiOutputInfo[]> {
+  return invoke<MidiOutputInfo[]>("midi_list_outputs");
+}
+
 export function midiConnectedInput(): Promise<MidiInputInfo | null> {
   return invoke<MidiInputInfo | null>("midi_connected_input");
 }
 
+export function midiConnectedOutput(): Promise<MidiOutputInfo | null> {
+  return invoke<MidiOutputInfo | null>("midi_connected_output");
+}
+
 export function midiConnect(inputId: string): Promise<MidiInputInfo> {
   return invoke<MidiInputInfo>("midi_connect", { inputId });
+}
+
+export function midiConnectOutput(outputId: string): Promise<MidiOutputInfo> {
+  return invoke<MidiOutputInfo>("midi_connect_output", { outputId });
+}
+
+export function midiDisconnectOutput(): Promise<void> {
+  return invoke<void>("midi_disconnect_output");
+}
+
+export function midiSetLed(binding: MidiLedBinding, enabled: boolean): Promise<void> {
+  return invoke<void>("midi_set_led", { binding, enabled });
 }
 
 export function midiDisconnect(): Promise<void> {

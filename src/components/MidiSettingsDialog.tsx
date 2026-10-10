@@ -1,12 +1,17 @@
 import { useEffect, useState } from "react";
 import {
   midiConnectedInput,
+  midiConnectedOutput,
   midiConnect,
+  midiConnectOutput,
   midiDisconnect,
+  midiDisconnectOutput,
   midiListInputs,
+  midiListOutputs,
   type MidiAction,
   type MidiBinding,
   type MidiInputInfo,
+  type MidiOutputInfo,
 } from "../tauri";
 
 export const MIDI_ACTIONS: { id: MidiAction; label: string; group: string }[] = [
@@ -33,10 +38,12 @@ export const MIDI_ACTIONS: { id: MidiAction; label: string; group: string }[] = 
 interface Props {
   open: boolean;
   inputId: string | null;
+  outputId: string | null;
   bindings: Partial<Record<MidiAction, MidiBinding>>;
   learningAction: MidiAction | null;
   conflictAction: MidiAction | null;
   onInputIdChange: (id: string | null) => void;
+  onOutputIdChange: (id: string | null) => void;
   onLearningChange: (action: MidiAction | null) => void;
   onClearBinding: (action: MidiAction) => void;
   onClose: () => void;
@@ -49,17 +56,22 @@ function bindingLabel(binding: MidiBinding): string {
 export default function MidiSettingsDialog({
   open,
   inputId,
+  outputId,
   bindings,
   learningAction,
   conflictAction,
   onInputIdChange,
+  onOutputIdChange,
   onLearningChange,
   onClearBinding,
   onClose,
 }: Props) {
   const [devices, setDevices] = useState<MidiInputInfo[]>([]);
+  const [outputDevices, setOutputDevices] = useState<MidiOutputInfo[]>([]);
   const [connected, setConnected] = useState<MidiInputInfo | null>(null);
+  const [connectedOutput, setConnectedOutput] = useState<MidiOutputInfo | null>(null);
   const [selectedId, setSelectedId] = useState(inputId ?? "");
+  const [selectedOutputId, setSelectedOutputId] = useState(outputId ?? "");
   const [loading, setLoading] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -68,14 +80,19 @@ export default function MidiSettingsDialog({
     setLoading(true);
     setError(null);
     try {
-      const [available, active] = await Promise.all([midiListInputs(), midiConnectedInput()]);
+      const [available, active, outputs, activeOutput] = await Promise.all([midiListInputs(), midiConnectedInput(), midiListOutputs(), midiConnectedOutput()]);
       setDevices(available);
       setConnected(active);
+      setOutputDevices(outputs);
+      setConnectedOutput(activeOutput);
       setSelectedId((current) => {
         if (current && available.some((device) => device.id === current)) return current;
         if (inputId && available.some((device) => device.id === inputId)) return inputId;
         return active?.id ?? available[0]?.id ?? "";
       });
+      setSelectedOutputId((current) => current && outputs.some((device) => device.id === current)
+        ? current
+        : outputId && outputs.some((device) => device.id === outputId) ? outputId : activeOutput?.id ?? "");
     } catch (reason) {
       setError(String(reason));
     } finally {
@@ -87,6 +104,8 @@ export default function MidiSettingsDialog({
     if (open) void refreshDevices();
     else onLearningChange(null);
   }, [open]);
+
+  useEffect(() => { setSelectedOutputId(outputId ?? ""); }, [outputId]);
 
   useEffect(() => {
     const closeOnEscape = (event: KeyboardEvent) => {
@@ -131,6 +150,27 @@ export default function MidiSettingsDialog({
   };
 
   const selectedIsConnected = connected?.id === selectedId;
+
+  const connectOutput = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      if (selectedOutputId) {
+        const output = await midiConnectOutput(selectedOutputId);
+        setConnectedOutput(output);
+        onOutputIdChange(output.id);
+      } else {
+        await midiDisconnectOutput();
+        setConnectedOutput(null);
+        onOutputIdChange(null);
+      }
+    } catch (reason) {
+      setError(String(reason));
+      setConnectedOutput(null);
+    } finally {
+      setBusy(false);
+    }
+  };
 
   return (
     <div className="fixed inset-0 z-[130] flex items-center justify-center bg-app/80 p-4 backdrop-blur-sm" onClick={onClose}>
@@ -184,6 +224,20 @@ export default function MidiSettingsDialog({
             USB and Bluetooth MIDI inputs appear here when the operating system exposes them. Connect Bluetooth devices in system settings first, then select Refresh.
           </p>
           {error && <p className="mt-1 text-[10px] text-danger" role="alert">{error}</p>}
+        </section>
+
+        <section className="mb-4 rounded border border-border bg-elevated/50 p-3">
+          <div className="flex flex-wrap items-center gap-2">
+            <label className="min-w-0 flex-1 text-[10px] text-text-secondary">
+              MIDI output for pad lights
+              <select value={selectedOutputId} onChange={(event) => setSelectedOutputId(event.target.value)} disabled={loading || busy} className="mt-1 block w-full rounded border border-border bg-surface px-2 py-1.5 text-xs text-text disabled:opacity-50">
+                <option value="">No output</option>
+                {outputDevices.map((device) => <option key={device.id} value={device.id}>{device.name}</option>)}
+              </select>
+            </label>
+            <button onClick={() => void connectOutput()} disabled={busy || selectedOutputId === connectedOutput?.id} className="mt-4 rounded bg-accent px-2.5 py-1.5 text-[10px] font-medium text-white disabled:opacity-40">Apply output</button>
+          </div>
+          <p className="mt-2 text-[10px] text-text-secondary">When supported by the controller, assigned Note/CC pads are lit using MIDI feedback. LED color depends on the controller.</p>
         </section>
 
         {conflictAction && (

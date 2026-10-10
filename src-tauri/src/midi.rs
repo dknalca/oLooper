@@ -2,7 +2,9 @@
 
 use std::collections::{HashMap, HashSet};
 
-use midir::{Ignore, MidiInput, MidiInputConnection, MidiInputPort};
+use midir::{
+    Ignore, MidiInput, MidiInputConnection, MidiInputPort, MidiOutput, MidiOutputConnection,
+};
 use serde::Serialize;
 use tauri::Emitter as _;
 
@@ -12,6 +14,8 @@ pub struct MidiInputInfo {
     pub id: String,
     pub name: String,
 }
+
+pub type MidiOutputInfo = MidiInputInfo;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -27,7 +31,15 @@ pub struct MidiMessage {
     pub value: u8,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MidiLedBinding {
+    pub kind: MidiMessageKind,
+    pub channel: u8,
+    pub number: u8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum MidiMessageKind {
     Note,
@@ -88,6 +100,57 @@ fn take_discrete_press(
 pub struct MidiManager {
     connection: Option<MidiInputConnection<()>>,
     connected: Option<MidiInputInfo>,
+    output: Option<MidiOutputConnection>,
+    connected_output: Option<MidiOutputInfo>,
+    active_leds: HashMap<(MidiMessageKind, u8, u8), MidiLedBinding>,
+}
+
+fn outputs_with_info(
+    output: &MidiOutput,
+) -> Result<Vec<(midir::MidiOutputPort, MidiOutputInfo)>, String> {
+    let mut occurrences = HashMap::<String, usize>::new();
+    output
+        .ports()
+        .into_iter()
+        .map(|port| {
+            let name = output
+                .port_name(&port)
+                .map_err(|error| format!("cannot read MIDI output name: {error}"))?;
+            let occurrence = occurrences.entry(name.clone()).or_default();
+            let info = MidiOutputInfo {
+                id: format!("{name}#{occurrence}"),
+                name,
+            };
+            *occurrence += 1;
+            Ok((port, info))
+        })
+        .collect()
+}
+
+pub fn list_outputs() -> Result<Vec<MidiOutputInfo>, String> {
+    let output = MidiOutput::new("oLooper MIDI output")
+        .map_err(|error| format!("cannot initialize MIDI output: {error}"))?;
+    Ok(outputs_with_info(&output)?
+        .into_iter()
+        .map(|(_, info)| info)
+        .collect())
+}
+
+pub fn led_message(binding: &MidiLedBinding, enabled: bool) -> Result<[u8; 3], String> {
+    if !(1..=16).contains(&binding.channel) || binding.number > 127 {
+        return Err("invalid MIDI LED binding".to_string());
+    }
+    let status = match binding.kind {
+        MidiMessageKind::Note => {
+            if enabled {
+                0x90
+            } else {
+                0x80
+            }
+        }
+        MidiMessageKind::Cc => 0xb0,
+    } | (binding.channel - 1);
+    Ok([status, binding.number, if enabled { 127 } else { 0 }])
 }
 
 fn ports_with_info(input: &MidiInput) -> Result<Vec<(MidiInputPort, MidiInputInfo)>, String> {
@@ -127,6 +190,59 @@ impl MidiManager {
     pub fn disconnect(&mut self) {
         self.connection = None;
         self.connected = None;
+    }
+
+    pub fn connected_output(&self) -> Option<MidiOutputInfo> {
+        self.connected_output.clone()
+    }
+
+    pub fn disconnect_output(&mut self) {
+        if let Some(output) = self.output.as_mut() {
+            for binding in self.active_leds.values() {
+                if let Ok(message) = led_message(binding, false) {
+                    let _ = output.send(&message);
+                }
+            }
+        }
+        self.active_leds.clear();
+        self.output = None;
+        self.connected_output = None;
+    }
+
+    pub fn connect_output(&mut self, output_id: &str) -> Result<MidiOutputInfo, String> {
+        self.disconnect_output();
+        let output = MidiOutput::new("oLooper MIDI output")
+            .map_err(|error| format!("cannot initialize MIDI output: {error}"))?;
+        let (port, info) = outputs_with_info(&output)?
+            .into_iter()
+            .find(|(_, info)| info.id == output_id)
+            .ok_or_else(|| {
+                "MIDI output is no longer available; refresh the device list".to_string()
+            })?;
+        let connection = output
+            .connect(&port, "olooper-midi-feedback")
+            .map_err(|error| format!("cannot connect MIDI output: {error}"))?;
+        self.output = Some(connection);
+        self.connected_output = Some(info.clone());
+        Ok(info)
+    }
+
+    pub fn set_led(&mut self, binding: &MidiLedBinding, enabled: bool) -> Result<(), String> {
+        let message = led_message(binding, enabled)?;
+        let output = self
+            .output
+            .as_mut()
+            .ok_or_else(|| "no MIDI output connected".to_string())?;
+        output
+            .send(&message)
+            .map_err(|error| format!("cannot send MIDI pad feedback: {error}"))?;
+        let key = (binding.kind, binding.channel, binding.number);
+        if enabled {
+            self.active_leds.insert(key, binding.clone());
+        } else {
+            self.active_leds.remove(&key);
+        }
+        Ok(())
     }
 
     pub fn connect(
@@ -173,6 +289,37 @@ impl MidiManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn led_feedback_uses_discrete_note_and_cc_messages() {
+        let note = MidiLedBinding {
+            kind: MidiMessageKind::Note,
+            channel: 2,
+            number: 60,
+        };
+        assert_eq!(led_message(&note, true).unwrap(), [0x91, 60, 127]);
+        assert_eq!(led_message(&note, false).unwrap(), [0x81, 60, 0]);
+        let cc = MidiLedBinding {
+            kind: MidiMessageKind::Cc,
+            channel: 1,
+            number: 7,
+        };
+        assert_eq!(led_message(&cc, true).unwrap(), [0xb0, 7, 127]);
+        assert_eq!(led_message(&cc, false).unwrap(), [0xb0, 7, 0]);
+    }
+
+    #[test]
+    fn led_feedback_rejects_out_of_range_addresses() {
+        assert!(led_message(
+            &MidiLedBinding {
+                kind: MidiMessageKind::Note,
+                channel: 0,
+                number: 60,
+            },
+            true
+        )
+        .is_err());
+    }
 
     fn test_input() -> MidiInputInfo {
         MidiInputInfo {

@@ -33,6 +33,7 @@ import {
   type Track,
 } from "../tauri";
 import { recordTempoTap } from "../tapTempo";
+import { IMPORTED_AUDIO_GROUP_KEY, libraryGroupKey, libraryGroupName } from "../libraryGroups";
 
 interface Props {
   libraryReady: boolean;
@@ -45,7 +46,11 @@ interface Props {
 }
 
 function groupName(track: Track): string {
-  return track.looper_name;
+  return libraryGroupName(track);
+}
+
+function groupKey(track: Track): string {
+  return libraryGroupKey(track);
 }
 
 const FAVORITES_GROUP = "__olooper_favorites__";
@@ -94,6 +99,7 @@ export default function Sidebar({ libraryReady, libraryGeneration, refreshKey, a
   const [contextMenu, setContextMenu] = useState<number | null>(null);
   const [groupMenu, setGroupMenu] = useState<string | null>(null);
   const [groupDeletePrompt, setGroupDeletePrompt] = useState<{ sourceHash: string; name: string } | null>(null);
+  const [missingSourcePrompt, setMissingSourcePrompt] = useState<{ sourceHash: string; name: string; path: string } | null>(null);
   const [playlistMenu, setPlaylistMenu] = useState<number | null>(null);
   const [dropTarget, setDropTarget] = useState<LibraryDropTarget>(null);
   const [draggingTrackIds, setDraggingTrackIds] = useState<number[]>([]);
@@ -201,7 +207,7 @@ export default function Sidebar({ libraryReady, libraryGeneration, refreshKey, a
       setActiveId(activeTrackId);
       const currentCollection = selectedGroupRef.current;
       if (currentCollection !== ALL_GROUP && currentCollection !== FAVORITES_GROUP && !currentCollection.startsWith(PLAYLIST_PREFIX)) {
-        setSelectedGroup(activeTrack.source_hash);
+        setSelectedGroup(groupKey(activeTrack));
       }
     }
   }, [activeTrackId, tracks]);
@@ -212,7 +218,8 @@ export default function Sidebar({ libraryReady, libraryGeneration, refreshKey, a
       if (!Number.isSafeInteger(trackId) || typeof sourceHash !== "string") return;
       const reveal = () => {
         setActiveId(trackId);
-        setSelectedGroup(sourceHash);
+        const track = tracks.find((item) => item.id === trackId);
+        setSelectedGroup(track ? groupKey(track) : sourceHash);
         setLibraryRevealGeneration((generation) => generation + 1);
       };
       if (tracks.some((track) => track.id === trackId)) reveal();
@@ -276,11 +283,13 @@ export default function Sidebar({ libraryReady, libraryGeneration, refreshKey, a
   useEffect(() => { localStorage.setItem("olooper.library.selectedGroup", selectedGroup); }, [selectedGroup]);
 
   const looperGroups = Object.values(tracks.reduce<Record<string, Track[]>>((result, track) => {
-    (result[track.source_hash] ??= []).push(track);
+    (result[groupKey(track)] ??= []).push(track);
     return result;
   }, {})).sort((left, right) => {
-    const leftHash = left[0].source_hash;
-    const rightHash = right[0].source_hash;
+    const leftHash = groupKey(left[0]);
+    const rightHash = groupKey(right[0]);
+    if (leftHash === IMPORTED_AUDIO_GROUP_KEY) return rightHash === IMPORTED_AUDIO_GROUP_KEY ? 0 : 1;
+    if (rightHash === IMPORTED_AUDIO_GROUP_KEY) return -1;
     const leftPosition = looperOrder.indexOf(leftHash);
     const rightPosition = looperOrder.indexOf(rightHash);
     if (leftPosition < 0 && rightPosition < 0) return left[0].id - right[0].id;
@@ -317,10 +326,10 @@ export default function Sidebar({ libraryReady, libraryGeneration, refreshKey, a
       return track ? [track] : [];
     })
     : sorted.filter((track) => selectedGroup === ALL_GROUP
-      || (selectedGroup === FAVORITES_GROUP ? track.favorite : track.source_hash === selectedGroup));
+      || (selectedGroup === FAVORITES_GROUP ? track.favorite : groupKey(track) === selectedGroup));
   const hasPlayableTracks = selectedTracks.some((track) => track.exists);
   const favoritesCount = tracks.filter((track) => track.favorite).length;
-  const selectedLooper = looperGroups.find((group) => group[0].source_hash === selectedGroup)?.[0];
+  const selectedLooper = looperGroups.find((group) => groupKey(group[0]) === selectedGroup)?.[0];
 
   useEffect(() => {
     if (
@@ -338,6 +347,14 @@ export default function Sidebar({ libraryReady, libraryGeneration, refreshKey, a
   }, [catalogLoaded, selectedGroup, selectedLooper, selectedPlaylist, tracks.length]);
 
   const playTrack = async (track: Track, resumeAfterLoad = true) => {
+    if (!track.exists) {
+      if ((track.source_type === "swf" || track.source_type === "exe") && track.audio_storage === "embedded") {
+        setMissingSourcePrompt({ sourceHash: track.source_hash, name: groupName(track), path: track.file_path });
+      } else {
+        setError(`Audio file is missing: ${track.file_path}`);
+      }
+      return;
+    }
     onTrackLoading();
     const my = loadSeq.current + 1;
     loadSeq.current = my;
@@ -538,7 +555,9 @@ export default function Sidebar({ libraryReady, libraryGeneration, refreshKey, a
   };
 
   const moveLooperGroup = (sourceHash: string, targetHash: string, insertAfterTarget: boolean) => {
-    const hashes = looperGroups.map((group) => group[0].source_hash);
+    const hashes = looperGroups.flatMap((group) => group[0].source_type === "custom"
+      ? [...new Set(group.map((track) => track.source_hash))]
+      : [group[0].source_hash]);
     const sourceIndex = hashes.indexOf(sourceHash);
     const targetIndex = hashes.indexOf(targetHash);
     if (sourceIndex < 0 || targetIndex < 0 || sourceIndex === targetIndex) return;
@@ -847,6 +866,13 @@ export default function Sidebar({ libraryReady, libraryGeneration, refreshKey, a
     libraryRemoveLooper(sourceHash).then(refresh).catch((e) => { refresh(); setError(String(e)); });
   };
 
+  const confirmRemoveMissingSource = () => {
+    if (!missingSourcePrompt) return;
+    const { sourceHash } = missingSourcePrompt;
+    setMissingSourcePrompt(null);
+    libraryRemoveLooper(sourceHash).then(refresh).catch((cause) => { refresh(); setError(String(cause)); });
+  };
+
   const openTrackMenu = (event: React.MouseEvent, trackId: number) => {
     event.preventDefault();
     setPlaylistMenu(null);
@@ -937,16 +963,17 @@ export default function Sidebar({ libraryReady, libraryGeneration, refreshKey, a
             })}
             <div className="px-2 pb-1 pt-3 text-[9px] font-semibold uppercase tracking-wider text-text-secondary">Loopers</div>
             {looperGroups.map((entries) => {
-              const sourceHash = entries[0].source_hash;
+              const sourceHash = groupKey(entries[0]);
+              const customAudio = entries[0].source_type === "custom";
               const isSelected = selectedGroup === sourceHash;
               return (
                 <div
                   key={sourceHash}
-                  data-drop-looper={sourceHash}
-                  onPointerDown={(event) => beginLooperPointerDrag(event, sourceHash)}
-                  onPointerMove={movePointerDrag}
-                  onPointerUp={dropPointerDrag}
-                  onPointerCancel={cancelPointerDrag}
+                  data-drop-looper={customAudio ? undefined : sourceHash}
+                  onPointerDown={customAudio ? undefined : (event) => beginLooperPointerDrag(event, sourceHash)}
+                  onPointerMove={customAudio ? undefined : movePointerDrag}
+                  onPointerUp={customAudio ? undefined : dropPointerDrag}
+                  onPointerCancel={customAudio ? undefined : cancelPointerDrag}
                   onClick={(event) => {
                     // Pointer capture during reorder can retarget the click to
                     // this wrapper instead of the nested selection button.
@@ -970,7 +997,7 @@ export default function Sidebar({ libraryReady, libraryGeneration, refreshKey, a
                       : <span aria-hidden="true" className="flex h-8 w-8 shrink-0 items-center justify-center rounded bg-border text-sm text-text-secondary">♫</span>}
                     <span className="min-w-0 flex-1">
                       <span className="block truncate text-xs font-medium">{groupName(entries[0])}</span>
-                      <span className="block truncate text-[9px] uppercase opacity-70">{entries[0].source_type}</span>
+                      <span className="block truncate text-[9px] uppercase opacity-70">{customAudio ? "Audio" : entries[0].source_type}</span>
                     </span>
                     <span className="text-[10px] tabular-nums">{entries.length}</span>
                   </button>
@@ -1089,7 +1116,7 @@ export default function Sidebar({ libraryReady, libraryGeneration, refreshKey, a
                 onDoubleClick={() => void playTrack(track)}
                 onContextMenu={(event) => openTrackMenu(event, track.id)}
                 role="button"
-                tabIndex={track.exists ? 0 : -1}
+                tabIndex={0}
                 onKeyDown={(event) => {
                   // The row is keyboard-activatable, but its child buttons and
                   // checkbox must keep their own Enter/Space behavior.
@@ -1097,7 +1124,7 @@ export default function Sidebar({ libraryReady, libraryGeneration, refreshKey, a
                   if (event.key === "Enter") void playTrack(track);
                   if (event.key === " ") setActiveId(track.id);
                 }}
-                className={`grid w-full select-none grid-cols-[minmax(0,1fr)_4.5rem_4rem_4.5rem] items-center gap-2 border-b border-border/50 px-3 py-2 text-left text-xs transition-colors ${track.exists ? "cursor-grab active:cursor-grabbing" : ""} sm:grid-cols-[minmax(0,1fr)_5rem_5rem_5rem] ${draggingTrackIds.includes(track.id) ? "opacity-60" : activeId === track.id ? "bg-accent/10 text-accent" : "text-text hover:bg-surface-hover"} ${!track.exists ? "pointer-events-none opacity-40" : ""}`}
+                className={`grid w-full select-none grid-cols-[minmax(0,1fr)_4.5rem_4rem_4.5rem] items-center gap-2 border-b border-border/50 px-3 py-2 text-left text-xs transition-colors ${track.exists ? "cursor-grab active:cursor-grabbing" : "cursor-pointer opacity-50"} sm:grid-cols-[minmax(0,1fr)_5rem_5rem_5rem] ${draggingTrackIds.includes(track.id) ? "opacity-60" : activeId === track.id ? "bg-accent/10 text-accent" : "text-text hover:bg-surface-hover"}`}
               >
                 <span className="flex min-w-0 items-center gap-2">
                   <input type="checkbox" checked={selectedIds.includes(track.id)} onClick={(event) => event.stopPropagation()} onChange={() => setSelectedIds((ids) => ids.includes(track.id) ? ids.filter((id) => id !== track.id) : [...ids, track.id])} aria-label={`Select ${track.title}`} />
@@ -1234,6 +1261,20 @@ export default function Sidebar({ libraryReady, libraryGeneration, refreshKey, a
           </div>
         );
       })()}
+      {missingSourcePrompt && (
+        <div className="fixed inset-0 z-[125] flex items-center justify-center bg-black/65 p-4 backdrop-blur-sm" onMouseDown={(event) => { if (event.target === event.currentTarget) setMissingSourcePrompt(null); }}>
+          <section role="dialog" aria-modal="true" aria-labelledby="missing-looper-title" className="w-full max-w-md rounded-lg border border-border bg-surface p-5 shadow-2xl">
+            <h2 id="missing-looper-title" className="text-sm font-semibold text-text">Looper not found</h2>
+            <p className="mt-3 text-xs leading-relaxed text-text-secondary">“{missingSourcePrompt.name}” may have been moved, deleted, or be on a disconnected drive.</p>
+            <p className="mt-2 break-all rounded bg-elevated p-2 font-mono text-[10px] text-text-secondary">{missingSourcePrompt.path}</p>
+            <p className="mt-3 text-xs leading-relaxed text-text-secondary">Would you like to remove this looper and its tracks from the library? The original file will never be deleted.</p>
+            <div className="mt-5 flex justify-end gap-2">
+              <button autoFocus onClick={() => setMissingSourcePrompt(null)} className="rounded border border-border px-3 py-2 text-xs text-text-secondary hover:bg-surface-hover hover:text-text">Cancel</button>
+              <button onClick={confirmRemoveMissingSource} className="rounded bg-danger px-3 py-2 text-xs font-medium text-white hover:bg-danger/85">Remove from library</button>
+            </div>
+          </section>
+        </div>
+      )}
       {playlistMenu !== null && (() => {
         const playlist = playlists.find((item) => item.id === playlistMenu);
         if (!playlist) return null;
