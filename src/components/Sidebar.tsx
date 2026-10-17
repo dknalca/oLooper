@@ -94,7 +94,14 @@ export default function Sidebar({ libraryReady, libraryGeneration, refreshKey, a
       ? Math.max(MIN_LOOPER_PANE_WIDTH, Math.min(MAX_LOOPER_PANE_WIDTH, saved))
       : DEFAULT_LOOPER_PANE_WIDTH;
   });
-  const [selectedGroup, setSelectedGroup] = useState(() => localStorage.getItem("olooper.library.selectedGroup") ?? FAVORITES_GROUP);
+  const [selectedGroup, setSelectedGroup] = useState(() => localStorage.getItem("olooper.library.selectedGroup") ?? ALL_GROUP);
+  const hasFilters = search !== "" || sourceFilter !== "all" || bpmFilter !== "all" || durationFilter !== "all";
+  const clearFilters = () => {
+    setSearch("");
+    setSourceFilter("all");
+    setBpmFilter("all");
+    setDurationFilter("all");
+  };
   const [activeId, setActiveId] = useState<number | null>(null);
   const [contextMenu, setContextMenu] = useState<number | null>(null);
   const [groupMenu, setGroupMenu] = useState<string | null>(null);
@@ -926,7 +933,7 @@ export default function Sidebar({ libraryReady, libraryGeneration, refreshKey, a
               className={`mb-1 flex w-full items-center gap-2 rounded px-2 py-2 text-left transition-colors ${selectedGroup === ALL_GROUP ? "bg-accent/15 text-accent" : "text-text-secondary hover:bg-surface-hover hover:text-text"}`}
             >
               <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded bg-accent/10 text-sm text-accent">▦</span>
-              <span className="min-w-0 flex-1 truncate text-xs font-medium">ALL</span>
+              <span className="min-w-0 flex-1 truncate text-xs font-medium">All tracks</span>
               <span className="text-[10px] tabular-nums">{tracks.length}</span>
             </button>
             <button
@@ -936,7 +943,7 @@ export default function Sidebar({ libraryReady, libraryGeneration, refreshKey, a
               className={`mb-1 flex w-full items-center gap-2 rounded px-2 py-2 text-left transition-colors ${dropTarget?.kind === "favorites" ? "bg-accent/25 ring-1 ring-accent" : selectedGroup === FAVORITES_GROUP ? "bg-accent/15 text-accent" : "text-text-secondary hover:bg-surface-hover hover:text-text"}`}
             >
               <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded bg-danger/10 text-sm text-danger">♥</span>
-              <span className="min-w-0 flex-1 truncate text-xs font-medium">Favoritos</span>
+              <span className="min-w-0 flex-1 truncate text-xs font-medium">Favorites</span>
               <span className="text-[10px] tabular-nums">{favoritesCount}</span>
             </button>
             <div className="flex items-center justify-between px-2 pb-1 pt-3">
@@ -1057,9 +1064,10 @@ export default function Sidebar({ libraryReady, libraryGeneration, refreshKey, a
         <section className="flex min-w-0 flex-1 flex-col">
           <div className="flex flex-wrap items-center gap-2 border-b border-border px-3 py-2">
             <h2 className="mr-auto min-w-0 truncate text-xs font-semibold text-text">
-              {selectedGroup === ALL_GROUP ? "ALL" : selectedPlaylist ? selectedPlaylist.name : selectedGroup === FAVORITES_GROUP ? "Favoritos" : selectedLooper ? groupName(selectedLooper) : "Library"}
+              {selectedGroup === ALL_GROUP ? "All tracks" : selectedPlaylist ? selectedPlaylist.name : selectedGroup === FAVORITES_GROUP ? "Favorites" : selectedLooper ? groupName(selectedLooper) : "Library"}
             </h2>
-            <input aria-label="Search tracks" placeholder="Search loops…" value={search} onChange={(e) => setSearch(e.target.value)} className="min-w-24 flex-1 rounded border border-border bg-elevated px-2.5 py-1 text-xs text-text placeholder:text-text-secondary/50 focus:border-accent" />
+            <input type="search" aria-label="Search tracks" placeholder="Search tracks, loopers or tags…" value={search} onChange={(e) => setSearch(e.target.value)} className="min-w-24 flex-1 rounded-lg border border-border bg-app px-3 py-2 text-xs text-text placeholder:text-text-secondary focus:border-accent" />
+            {hasFilters && <button onClick={clearFilters} className="toolbar-button">Clear filters</button>}
             <select value={sourceFilter} onChange={(e) => setSourceFilter(e.target.value)} aria-label="Filter source" className="rounded border border-border bg-elevated px-2 py-1 text-[10px] text-text"><option value="all">Source</option><option value="swf">SWF</option><option value="exe">EXE</option><option value="custom">Audio</option><option value="tablist">Tablist</option></select>
             <select value={bpmFilter} onChange={(e) => setBpmFilter(e.target.value)} aria-label="Filter BPM" className="rounded border border-border bg-elevated px-2 py-1 text-[10px] text-text"><option value="all">BPM</option><option value="low">&lt;100</option><option value="mid">100–130</option><option value="high">&gt;130</option></select>
             <select value={durationFilter} onChange={(e) => setDurationFilter(e.target.value)} aria-label="Filter duration" className="rounded border border-border bg-elevated px-2 py-1 text-[10px] text-text"><option value="all">Length</option><option value="short">&lt;10s</option><option value="mid">10–30s</option><option value="long">&gt;30s</option></select>
@@ -1089,17 +1097,22 @@ export default function Sidebar({ libraryReady, libraryGeneration, refreshKey, a
             <span className="text-right">Actions</span>
           </div>
           <div className="min-h-0 flex-1 overflow-y-auto">
-            {!libraryReady && <p className="px-3 py-4 text-center text-xs text-text-secondary">Choose a library folder to begin</p>}
-            {libraryReady && selectedTracks.length === 0 && (
-              <p className="px-3 py-4 text-center text-xs text-text-secondary">
+            {!libraryReady && <div className="empty-state">
+              <h3 className="text-base font-semibold text-text">Your practice space starts here</h3>
+              <p>Choose a folder for your library, then bring in your favorite loops.</p>
+              <button className="toolbar-button" onClick={() => window.dispatchEvent(new Event("olooper:choose-library"))}>Choose library folder</button>
+            </div>}
+            {libraryReady && !catalogLoaded && <p className="empty-state" role="status">Loading your library…</p>}
+            {libraryReady && catalogLoaded && selectedTracks.length === 0 && (
+              <div className="empty-state">
+                <h3 className="text-base font-semibold text-text">{tracks.length === 0 ? "Bring your first loop" : hasFilters ? "No matching tracks" : selectedGroup === FAVORITES_GROUP ? "Your favorites belong here" : "This collection is empty"}</h3>
+                <p>{tracks.length === 0 ? "Import SWF, EXE or audio files, or drop them into this window." : hasFilters ? "Try another search or clear your filters to see more tracks." : selectedGroup === FAVORITES_GROUP ? "Use the heart beside any track to keep it close for your next session." : "Add tracks from their context menu, or drag them onto a playlist."}</p>
                 {tracks.length === 0
-                  ? "No tracks imported"
-                  : selectedGroup === FAVORITES_GROUP && favoritesCount === 0
-                    ? "No favorite loops yet"
-                    : selectedPlaylist && selectedPlaylist.track_ids.length === 0
-                      ? "This playlist is empty. Add loops from a track's context menu."
-                    : "No matches"}
-              </p>
+                  ? <button className="toolbar-button" onClick={() => window.dispatchEvent(new CustomEvent("olooper:import-command", { detail: "import-files" }))}>Import files</button>
+                  : hasFilters
+                    ? <button className="toolbar-button" onClick={clearFilters}>Clear filters</button>
+                    : <button className="toolbar-button" onClick={() => setSelectedGroup(ALL_GROUP)}>Browse all tracks</button>}
+              </div>
             )}
             {selectedTracks.map((track) => (
               <div
@@ -1122,7 +1135,7 @@ export default function Sidebar({ libraryReady, libraryGeneration, refreshKey, a
                   // checkbox must keep their own Enter/Space behavior.
                   if (event.target !== event.currentTarget) return;
                   if (event.key === "Enter") void playTrack(track);
-                  if (event.key === " ") setActiveId(track.id);
+                  if (event.key === " ") { event.preventDefault(); setActiveId(track.id); }
                 }}
                 className={`grid w-full select-none grid-cols-[minmax(0,1fr)_4.5rem_4rem_4.5rem] items-center gap-2 border-b border-border/50 px-3 py-2 text-left text-xs transition-colors ${track.exists ? "cursor-grab active:cursor-grabbing" : "cursor-pointer opacity-50"} sm:grid-cols-[minmax(0,1fr)_5rem_5rem_5rem] ${draggingTrackIds.includes(track.id) ? "opacity-60" : activeId === track.id ? "bg-accent/10 text-accent" : "text-text hover:bg-surface-hover"}`}
               >
@@ -1254,7 +1267,7 @@ export default function Sidebar({ libraryReady, libraryGeneration, refreshKey, a
                 <p>This cannot be undone. Confirm to continue.</p>
               </div>
               <div className="mt-5 flex justify-end gap-2">
-                <button autoFocus onClick={() => setGroupDeletePrompt(null)} className="rounded border border-border px-3 py-2 text-xs text-text-secondary hover:bg-surface-hover hover:text-text">Cancel</button>
+                <button autoFocus onClick={() => setGroupDeletePrompt(null)} className="dialog-close">Cancel</button>
                 <button onClick={confirmRemoveGroup} className="rounded bg-danger px-3 py-2 text-xs font-medium text-white hover:bg-danger/85">Delete looper</button>
               </div>
             </section>
@@ -1269,7 +1282,7 @@ export default function Sidebar({ libraryReady, libraryGeneration, refreshKey, a
             <p className="mt-2 break-all rounded bg-elevated p-2 font-mono text-[10px] text-text-secondary">{missingSourcePrompt.path}</p>
             <p className="mt-3 text-xs leading-relaxed text-text-secondary">Would you like to remove this looper and its tracks from the library? The original file will never be deleted.</p>
             <div className="mt-5 flex justify-end gap-2">
-              <button autoFocus onClick={() => setMissingSourcePrompt(null)} className="rounded border border-border px-3 py-2 text-xs text-text-secondary hover:bg-surface-hover hover:text-text">Cancel</button>
+              <button autoFocus onClick={() => setMissingSourcePrompt(null)} className="dialog-close">Cancel</button>
               <button onClick={confirmRemoveMissingSource} className="rounded bg-danger px-3 py-2 text-xs font-medium text-white hover:bg-danger/85">Remove from library</button>
             </div>
           </section>
@@ -1296,7 +1309,7 @@ export default function Sidebar({ libraryReady, libraryGeneration, refreshKey, a
                   <h2 id="playlist-membership-title" className="text-sm font-semibold text-text">Add to playlist</h2>
                   <p className="mt-1 truncate text-[10px] text-text-secondary" title={track.title}>{track.title}</p>
                 </div>
-                <button onClick={() => setPlaylistTrackId(null)} aria-label="Close" className="rounded px-2 py-1 text-text-secondary hover:bg-border">×</button>
+                <button onClick={() => setPlaylistTrackId(null)} className="dialog-close"><span aria-hidden="true">×</span> Close</button>
               </div>
               {playlists.length === 0
                 ? <p className="py-3 text-xs text-text-secondary">Create a playlist to collect this loop.</p>
@@ -1325,7 +1338,7 @@ export default function Sidebar({ libraryReady, libraryGeneration, refreshKey, a
             </label>
             {createPlaylistError && <p className="mt-2 text-xs text-danger" role="alert">{createPlaylistError}</p>}
             <div className="mt-4 flex justify-end gap-2">
-              <button type="button" onClick={() => { setCreatePlaylistOpen(false); setCreatePlaylistTrackId(null); }} disabled={createPlaylistBusy} className="rounded bg-border px-3 py-2 text-xs text-text-secondary hover:text-text disabled:opacity-40">Cancel</button>
+              <button type="button" onClick={() => { setCreatePlaylistOpen(false); setCreatePlaylistTrackId(null); }} disabled={createPlaylistBusy} className="dialog-close">Cancel</button>
               <button type="submit" disabled={createPlaylistBusy || !createPlaylistName.trim()} className="rounded bg-accent px-3 py-2 text-xs font-medium text-white disabled:opacity-40">{createPlaylistBusy ? "Saving…" : playlistFormMode === "rename" ? "Save" : "Create"}</button>
             </div>
           </form>
@@ -1408,7 +1421,7 @@ export default function Sidebar({ libraryReady, libraryGeneration, refreshKey, a
                 type="button"
                 onClick={() => setEditingTrack(null)}
                 disabled={metadataBusy}
-                className="rounded bg-border px-3 py-2 text-xs text-text-secondary hover:text-text disabled:opacity-40"
+                className="dialog-close"
               >Cancel</button>
               <button
                 type="submit"

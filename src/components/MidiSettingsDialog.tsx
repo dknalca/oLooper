@@ -186,7 +186,7 @@ export default function MidiSettingsDialog({
             <h2 id="midi-options-title" className="text-base font-semibold text-text">MIDI Options</h2>
             <p className="mt-1 text-[10px] text-text-secondary">Assign Note On and discrete CC buttons to oLooper actions.</p>
           </div>
-          <button onClick={onClose} className="rounded px-2 py-1 text-xs text-text-secondary hover:bg-border hover:text-text">Close</button>
+          <button onClick={onClose} className="dialog-close"><span aria-hidden="true">×</span> Close</button>
         </header>
 
         <section className="mb-4 rounded border border-border bg-elevated/50 p-3">

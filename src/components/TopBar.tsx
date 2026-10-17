@@ -15,11 +15,13 @@ interface Props {
   onLibraryReady: (root: string) => void;
   playing: boolean;
   onAudioOptions: () => void;
+  onMidiOptions: () => void;
+  onShortcuts: () => void;
   trackBpm: number | null;
   children?: ReactNode;
 }
 
-export default function TopBar({ onLibraryReady, playing, onAudioOptions, trackBpm, children }: Props) {
+export default function TopBar({ onLibraryReady, playing, onAudioOptions, onMidiOptions, onShortcuts, trackBpm, children }: Props) {
   const [status, setStatus] = useState<AppStatus | null>(null);
   const [root, setRoot] = useState("");
   const [setupOpen, setSetupOpen] = useState(false);
@@ -168,7 +170,7 @@ export default function TopBar({ onLibraryReady, playing, onAudioOptions, trackB
 
   return (
     <>
-      <header className="relative flex items-center gap-3 px-4 h-10 border-b border-border bg-surface shrink-0 select-none">
+      <header className="workspace-header">
         <div className="flex items-center gap-2">
           <div data-app-logo className="h-6 w-6 shrink-0">
             <Logo className="h-6 w-6" />
@@ -178,12 +180,11 @@ export default function TopBar({ onLibraryReady, playing, onAudioOptions, trackB
         {status && (
           <>
             <span className="text-[10px] px-1.5 py-0.5 rounded bg-border text-text-secondary">v{status.version}</span>
-            <span className="text-[10px] px-1.5 py-0.5 rounded bg-border text-text-secondary">{status.platform}</span>
             <button
               onClick={() => setSetupOpen(true)}
-              className={`text-[10px] px-1.5 py-0.5 rounded ${status.library_set ? "bg-success/20 text-success" : "bg-danger/20 text-danger"}`}
+              className="toolbar-button"
             >
-              {status.library_set ? "change library" : "set library"}
+              {status.library_set ? "Library folder" : "Set up library"}
             </button>
           </>
         )}
@@ -193,13 +194,13 @@ export default function TopBar({ onLibraryReady, playing, onAudioOptions, trackB
           aria-expanded={metronomeOpen}
           aria-label="Metronome settings"
           title={metronomeEnabled ? `Metronome running at ${metronomeBpm} BPM` : "Metronome"}
-          className={`rounded px-2 py-1 text-[10px] ${metronomeEnabled ? "bg-accent/20 text-accent" : "text-text-secondary hover:bg-border hover:text-text"}`}
+          className={`toolbar-button ${metronomeEnabled ? "text-accent" : ""}`}
         >♩ {metronomeEnabled ? metronomeBpm : "Metronome"}</button>
         {metronomeOpen && (
-          <section aria-label="Metronome controls" className="absolute right-3 top-10 z-[100] w-64 rounded-lg border border-border bg-surface p-3 shadow-2xl">
+          <section aria-label="Metronome controls" className="absolute right-3 top-full z-[100] w-64 rounded-lg border border-border bg-surface p-3 shadow-2xl">
             <div className="mb-3 flex items-center justify-between">
               <h2 className="text-xs font-semibold text-text">Metronome</h2>
-              <button onClick={() => setMetronomeOpen(false)} aria-label="Close metronome controls" className="rounded px-1.5 text-text-secondary hover:bg-border">×</button>
+              <button onClick={() => setMetronomeOpen(false)} aria-label="Close metronome controls" className="dialog-close"><span aria-hidden="true">×</span> Close</button>
             </div>
             <label className="block text-[10px] text-text-secondary">
               Tempo (BPM)
@@ -230,12 +231,15 @@ export default function TopBar({ onLibraryReady, playing, onAudioOptions, trackB
           onClick={onAudioOptions}
           aria-label="Audio output settings"
           title="Choose audio output device and stereo pair"
-          className="rounded px-2 py-1 text-[10px] text-text-secondary hover:bg-border hover:text-text"
+          className="toolbar-button"
         >
           ♫ Audio
         </button>
-        {root && <span className="ml-auto truncate max-w-64 text-[10px] text-text-secondary" title={displayLibraryPath(root)}>{displayLibraryPath(root)}</span>}
-        <div className="flex shrink-0 items-center gap-1.5 rounded bg-elevated px-2 py-1" title="Practice time while audio is playing">
+        <button onClick={onMidiOptions} className="toolbar-button" title="Connect and map a MIDI controller">MIDI</button>
+        <button onClick={onShortcuts} className="toolbar-button" title="Keyboard shortcuts">Shortcuts</button>
+        {root && <span className="hidden min-w-0 flex-1 truncate text-[10px] text-text-secondary xl:block" title={displayLibraryPath(root)}>{displayLibraryPath(root)}</span>}
+        <div className="ml-auto flex shrink-0 items-center gap-2 rounded-lg border border-border/60 bg-app px-3 py-2" title="Practice time while audio is playing">
+          <span aria-hidden="true" className={`h-1.5 w-1.5 rounded-full ${playing ? "bg-success" : "bg-text-secondary/40"}`} />
           <span className="text-[9px] uppercase tracking-wide text-text-secondary">Practice</span>
           <span className="font-mono text-[11px] tabular-nums text-text" aria-live="off">
             {String(Math.floor(practiceSeconds / 3600)).padStart(2, "0")}:
@@ -257,7 +261,10 @@ export default function TopBar({ onLibraryReady, playing, onAudioOptions, trackB
       {setupOpen && (
         <div className="fixed inset-0 z-[70] flex items-center justify-center bg-app/80 backdrop-blur-sm">
           <div className="w-[28rem] rounded-lg border border-border bg-surface p-5 shadow-2xl">
-            <h2 className="text-base font-semibold text-text">Choose your library folder</h2>
+            <div className="flex items-center justify-between gap-3">
+              <h2 className="text-base font-semibold text-text">Choose your library folder</h2>
+              <button onClick={() => setSetupOpen(false)} disabled={initializing} className="dialog-close"><span aria-hidden="true">×</span> Close</button>
+            </div>
             <p className="mt-1 text-xs text-text-secondary">Audio will be stored here. The suggested location is the Documents folder inside `oLooper_data`; you can choose another folder.</p>
             <div className="mt-4 flex gap-2">
               <input

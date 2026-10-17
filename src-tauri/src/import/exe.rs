@@ -146,7 +146,7 @@ pub fn locate(data: &[u8]) -> Result<EmbeddedSwf, ExeError> {
             saw_zws = true;
             continue;
         }
-        if super::swf::parse(&data[c.offset..c.offset + c.length]).is_ok() {
+        if super::swf::validate(&data[c.offset..c.offset + c.length]).is_ok() {
             return Ok(*c);
         }
     }

@@ -326,18 +326,18 @@ export default function Player({ status: st, trackId, audioStorage, trackOpenGen
   const shownError = error ?? st?.pitch_error ?? null;
 
   return (
-    <div className="flex flex-col gap-2 px-4 py-3 bg-surface border-t border-border">
+    <div className="mx-3 mb-3 flex shrink-0 flex-col gap-3 rounded-xl border border-border/70 bg-surface px-4 py-3 shadow-lg">
       {/* Scrub bar */}
       <div
         ref={scrubRef}
         onMouseDown={onScrubDown}
-        className={`relative h-2 rounded-full cursor-pointer group ${loaded ? "bg-border" : "bg-border/50"}`}
+        className={`relative h-2 overflow-hidden rounded-full cursor-pointer group ${loaded ? "bg-border" : "bg-border/50"}`}
       >
         {loaded && (
           <svg
             viewBox="0 0 100 10"
             preserveAspectRatio="none"
-            className="absolute inset-0 h-full w-full overflow-visible pointer-events-none"
+            className="absolute inset-0 h-full w-full overflow-hidden pointer-events-none"
             aria-hidden="true"
           >
             <line
@@ -360,7 +360,7 @@ export default function Player({ status: st, trackId, audioStorage, trackOpenGen
       </div>
 
       {/* Transport row */}
-      <div className="flex items-center gap-2">
+      <div className="flex flex-wrap items-center gap-3">
         {/* Transport buttons */}
         <div className="flex items-center gap-1">
           <TransportBtn onClick={() => run(playerPlay())} disabled={!loaded} active={playing} title="Play (Space)">

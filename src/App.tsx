@@ -41,6 +41,7 @@ import {
 } from "./tauri";
 import { firstMidiStartTrack } from "./midiPlayback";
 import { normalizeStereoPair } from "./audioOutputPreferences";
+import { copySourcePreference } from "./importFlow";
 
 type TrackNavigator = (direction: -1 | 1) => void;
 type MidiBindings = Partial<Record<MidiAction, MidiBinding>>;
@@ -116,7 +117,7 @@ export default function App() {
   const [loopEditing, setLoopEditing] = useState(false);
   const [midiOptionsOpen, setMidiOptionsOpen] = useState(false);
   const [audioOptionsOpen, setAudioOptionsOpen] = useState(false);
-  const [copySourceOnImport, setCopySourceOnImport] = useState(() => localStorage.getItem("olooper.import.copy-source") !== "false");
+  const [copySourceOnImport, setCopySourceOnImport] = useState(() => copySourcePreference(localStorage.getItem("olooper.import.copy-source")));
   const [audioSelection, setAudioSelection] = useState<AudioOutputSelection>(readAudioSelection);
   const [audioStartupError, setAudioStartupError] = useState<string | null>(null);
   const [midiInputId, setMidiInputId] = useState<string | null>(() => localStorage.getItem("olooper.midi.input"));
@@ -472,8 +473,8 @@ export default function App() {
   }, [shortcutsOpen]);
 
   return (
-    <div className="h-screen flex flex-col bg-app text-text overflow-hidden">
-      <TopBar onLibraryReady={onLibraryReady} playing={playerStatus?.playing ?? false} trackBpm={activeTrack?.bpm ?? null} onAudioOptions={() => setAudioOptionsOpen(true)}>
+    <div className="workspace h-screen flex flex-col text-text overflow-hidden">
+      <TopBar onLibraryReady={onLibraryReady} playing={playerStatus?.playing ?? false} trackBpm={activeTrack?.bpm ?? null} onAudioOptions={() => setAudioOptionsOpen(true)} onMidiOptions={() => setMidiOptionsOpen(true)} onShortcuts={() => setShortcutsOpen(true)}>
         <ImportBar onImported={onImported} />
       </TopBar>
 
@@ -495,26 +496,38 @@ export default function App() {
           onToggleLoopEditing={() => setLoopEditing((editing) => !editing)}
           onStatusChange={setPlayerStatus}
         />
-        <section className="flex min-h-0 flex-1 flex-col border-t border-border">
-          <div className="flex shrink-0 items-center gap-1 border-b border-border bg-surface px-3 pt-1.5" role="tablist" aria-label="Library views">
+        <section className="library-workspace">
+          <div className="flex shrink-0 items-center gap-2 border-b border-border/60 p-2" role="tablist" aria-label="Library views" onKeyDown={(event) => {
+            if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+            event.preventDefault();
+            const next = event.key === "Home" ? "local" : event.key === "End" ? "tablist" : libraryView === "local" ? "tablist" : "local";
+            setLibraryView(next);
+            document.getElementById(`view-${next}`)?.focus();
+          }}>
             <button
               role="tab"
+              id="view-local"
+              aria-controls="library-panel"
+              tabIndex={libraryView === "local" ? 0 : -1}
               aria-selected={libraryView === "local"}
               onClick={() => setLibraryView("local")}
-              className={`rounded-t px-3 py-1.5 text-[11px] ${libraryView === "local" ? "border border-border border-b-surface bg-surface text-text" : "text-text-secondary hover:text-text"}`}
+              className="view-tab"
             >
               My Library
             </button>
             <button
               role="tab"
+              id="view-tablist"
+              aria-controls="library-panel"
+              tabIndex={libraryView === "tablist" ? 0 : -1}
               aria-selected={libraryView === "tablist"}
               onClick={() => setLibraryView("tablist")}
-              className={`rounded-t px-3 py-1.5 text-[11px] ${libraryView === "tablist" ? "border border-border border-b-surface bg-surface text-text" : "text-text-secondary hover:text-text"}`}
+              className="view-tab"
             >
-              Download new Loopers
+              Discover loopers
             </button>
           </div>
-          <div className="flex min-h-0 flex-1 flex-col">
+          <div id="library-panel" role="tabpanel" aria-labelledby={`view-${libraryView}`} className="flex min-h-0 flex-1 flex-col">
             {libraryView === "local" ? (
               <Sidebar
                 libraryReady={libraryReady}
@@ -548,8 +561,8 @@ export default function App() {
               <button
                 onClick={() => setShortcutsOpen(false)}
                 aria-label="Close keyboard shortcuts"
-                className="rounded px-2 py-1 text-xs text-text-secondary hover:bg-border hover:text-text"
-              >Close</button>
+                className="dialog-close"
+              ><span aria-hidden="true">×</span> Close</button>
             </header>
             <div className="space-y-4 text-xs">
               <section aria-label="Playback shortcuts">

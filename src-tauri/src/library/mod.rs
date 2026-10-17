@@ -6,7 +6,7 @@
 //! but never its original source file.
 
 use std::collections::{BTreeMap, HashSet};
-use std::io::Cursor;
+use std::io::{Cursor, Read as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -2042,6 +2042,16 @@ impl Library {
         seek_samples: u16,
         sample_count: u32,
     ) -> Option<(crate::player::LoopBuffer, Vec<u8>)> {
+        let trimmed = Self::trim_mp3_buffer(buf, seek_samples, sample_count)?;
+        let wav = Self::loop_buffer_to_wav(&trimmed);
+        Some((trimmed, wav))
+    }
+
+    fn trim_mp3_buffer(
+        buf: &crate::player::LoopBuffer,
+        seek_samples: u16,
+        sample_count: u32,
+    ) -> Option<crate::player::LoopBuffer> {
         if seek_samples == 0 && sample_count == 0 {
             return None;
         }
@@ -2063,8 +2073,7 @@ impl Library {
             channels: buf.channels,
             rate: buf.rate,
         };
-        let wav = Self::loop_buffer_to_wav(&trimmed);
-        Some((trimmed, wav))
+        Some(trimmed)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2159,7 +2168,7 @@ impl Library {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn import_sounds_with_cover_and_progress_mode<F>(
+    pub(crate) fn import_sounds_with_cover_and_progress_mode<F>(
         &self,
         looper: &str,
         source_type: &str,
@@ -2878,14 +2887,22 @@ pub(crate) fn decode_embedded_sound_file(
     expected_hash: &str,
 ) -> Result<crate::player::LoopBuffer, String> {
     const MAX_SOURCE_BYTES: u64 = 512 * 1024 * 1024;
-    let metadata =
-        std::fs::metadata(path).map_err(|error| format!("cannot open source: {error}"))?;
+    let file = std::fs::File::open(path).map_err(|error| format!("cannot open source: {error}"))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("cannot inspect source: {error}"))?;
     if metadata.len() > MAX_SOURCE_BYTES {
         return Err("source exceeds the 512 MiB limit".to_string());
     }
-    let data = std::fs::read(path).map_err(|error| format!("cannot read source: {error}"))?;
+    let mut data = Vec::new();
+    file.take(MAX_SOURCE_BYTES + 1)
+        .read_to_end(&mut data)
+        .map_err(|error| format!("cannot read source: {error}"))?;
+    if data.len() as u64 > MAX_SOURCE_BYTES {
+        return Err("source exceeds the 512 MiB limit".to_string());
+    }
     if sha256_hex(&data) != expected_hash {
-        return Err("the copied SWF/EXE source changed after import".to_string());
+        return Err("the SWF/EXE source changed after import".to_string());
     }
     let swf_data = match source_type {
         "swf" => data.as_slice(),
@@ -2896,14 +2913,24 @@ pub(crate) fn decode_embedded_sound_file(
         }
         _ => return Err("unsupported source-backed audio type".to_string()),
     };
-    let parsed = crate::import::swf::parse(swf_data)
+    let parsed = crate::import::swf::parse_sound(swf_data, sound_id)
         .map_err(|error| crate::import::swf::user_message(&error))?;
     let sound = parsed
         .sounds
         .iter()
         .find(|sound| sound.id == sound_id)
         .ok_or_else(|| format!("embedded sound {sound_id} was not found in the source"))?;
-    prepare_sound(sound).map(|prepared| prepared.buffer)
+    // BPM is already persisted at import time. Playback only needs PCM, not
+    // another analysis pass, a WAV encoding, or copies of compressed audio.
+    let buffer = crate::player::decode_bytes(&sound.frames)?;
+    if sound.codec == "mp3" {
+        if let Some(trimmed) =
+            Library::trim_mp3_buffer(&buffer, sound.seek_samples, sound.sample_count)
+        {
+            return Ok(trimmed);
+        }
+    }
+    Ok(buffer)
 }
 
 fn prepare_sound(sound: &Sound) -> Result<PreparedSound, String> {

@@ -22,8 +22,11 @@ fn import_unmark_cancelled(job_id: &str) {
     }
 }
 
-fn should_copy_container(extract_audio: bool, copy_source: bool) -> bool {
-    extract_audio || copy_source
+#[tauri::command]
+async fn scan_looper_folder(path: String) -> Result<Vec<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || import_folder::scan(std::path::Path::new(&path)))
+        .await
+        .map_err(|error| format!("Folder scan failed: {error}"))?
 }
 
 pub mod analysis;
@@ -32,6 +35,7 @@ pub mod audio_log;
 pub mod autoloop;
 pub mod drag_out;
 pub mod import;
+mod import_folder;
 pub mod library;
 pub mod midi;
 pub mod player;
@@ -354,9 +358,20 @@ pub fn run() {
                 true,
                 Some("CmdOrCtrl+O"),
             )?;
-            let open_swf = MenuItem::with_id(app, "open-swf", "Open SWF…", true, None::<&str>)?;
-            let open_exe =
-                MenuItem::with_id(app, "open-exe", "Open Projector (EXE)…", true, None::<&str>)?;
+            let open_loopers = MenuItem::with_id(
+                app,
+                "import-loopers",
+                "Import SWF/EXE Loopers…",
+                true,
+                None::<&str>,
+            )?;
+            let import_folder = MenuItem::with_id(
+                app,
+                "import-folder",
+                "Import Looper Folder…",
+                true,
+                None::<&str>,
+            )?;
             let import_audio =
                 MenuItem::with_id(app, "import-audio", "Import Audio…", true, None::<&str>)?;
             let choose_library = MenuItem::with_id(
@@ -371,7 +386,7 @@ pub fn run() {
             let audio_options =
                 MenuItem::with_id(app, "audio-options", "Audio Output…", true, None::<&str>)?;
             let file_menu = SubmenuBuilder::new(app, "File")
-                .items(&[&open_files, &open_swf, &open_exe, &import_audio])
+                .items(&[&open_files, &open_loopers, &import_folder, &import_audio])
                 .separator()
                 .item(&choose_library)
                 .separator()
@@ -423,8 +438,8 @@ pub fn run() {
                 if matches!(
                     command,
                     "import-files"
-                        | "open-swf"
-                        | "open-exe"
+                        | "import-loopers"
+                        | "import-folder"
                         | "import-audio"
                         | "choose-library"
                         | "show-shortcuts"
@@ -448,6 +463,7 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            scan_looper_folder,
             get_app_status,
             greet,
             inspect_swf,
@@ -1253,7 +1269,7 @@ fn run_container_job(app: &tauri::AppHandle, job: &ImportJob, exe: bool) {
     emit_import_progress(
         app,
         &job.job_id,
-        if should_copy_container(job.extract_audio, job.copy_source) {
+        if job.copy_source {
             "copying source"
         } else {
             "reading source"
@@ -1271,7 +1287,7 @@ fn run_container_job(app: &tauri::AppHandle, job: &ImportJob, exe: bool) {
             return;
         }
     };
-    let copied_path = if should_copy_container(job.extract_audio, job.copy_source) {
+    let copied_path = if job.copy_source {
         match copy_dropped_source(&job.root, path, &data) {
             Ok(path) => path,
             Err(e) => {
@@ -1318,6 +1334,33 @@ fn run_container_job(app: &tauri::AppHandle, job: &ImportJob, exe: bool) {
             }
         }
     };
+    crate::audio_log::write(&format!(
+        "container_import_parsed source_type={source_type} bytes={} sounds={} skipped={} extract_audio={} copy_source={}",
+        data.len(), sounds.sounds.len(), sounds.skipped.len(), job.extract_audio, job.copy_source,
+    ));
+    if sounds.sounds.is_empty() {
+        let reasons = sounds
+            .skipped
+            .iter()
+            .take(3)
+            .map(|sound| {
+                format!(
+                    "sound {} (codec {}): {}",
+                    sound.id, sound.format, sound.reason
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        fail(if reasons.is_empty() {
+            "No supported audio found in this SWF/EXE.".to_string()
+        } else {
+            format!(
+                "No supported audio found. {} sound(s) skipped: {reasons}",
+                sounds.skipped.len()
+            )
+        });
+        return;
+    }
     // Own connection: the main one already migrated at `library_init`, so
     // this open is a no-op migration plus WAL setup. Never touches `Db`.
     let lib = match library::Library::open(&job.root) {
@@ -1345,7 +1388,7 @@ fn run_container_job(app: &tauri::AppHandle, job: &ImportJob, exe: bool) {
         Ok(())
     };
     let report = if job.extract_audio {
-        lib.import_sounds_with_cover_and_progress(
+        lib.import_sounds_with_cover_and_progress_mode(
             &looper_name(&copied_path),
             source_type,
             &copied_path,
@@ -1354,6 +1397,8 @@ fn run_container_job(app: &tauri::AppHandle, job: &ImportJob, exe: bool) {
             exe_length,
             &sounds.sounds,
             sounds.cover_image.as_deref(),
+            true,
+            job.copy_source,
             &mut report_progress,
         )
     } else {
@@ -1741,13 +1786,6 @@ async fn tablist_search(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn source_copy_preference_only_skips_copy_for_source_backed_imports() {
-        assert!(should_copy_container(true, false));
-        assert!(should_copy_container(false, true));
-        assert!(!should_copy_container(false, false));
-    }
 
     #[test]
     fn status_reports_crate_version_and_os() {

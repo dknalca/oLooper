@@ -326,16 +326,17 @@ export default function Waveform({ refreshKey, status, trackTitle, trackCover, t
             {trackTitle && <span className="pointer-events-none absolute inset-x-0 bottom-0 truncate bg-app/75 px-2 py-1 text-[9px] font-medium text-text" title={trackTitle}>{trackTitle}</span>}
           </div>
         )}
-        <div ref={wrapRef} className="relative min-h-0 min-w-0 flex-1 overflow-hidden rounded bg-[#0e0e0e]">
+        <div ref={wrapRef} className="relative min-h-0 min-w-0 flex-1 overflow-hidden rounded-lg bg-app">
           <div className="absolute right-2 top-2 z-10 flex gap-1">
-            <button onClick={() => setZoom((value) => Math.max(1, value / 2))} className="rounded bg-elevated px-2 py-1 text-xs text-text">-</button>
-            <button onClick={() => setZoom((value) => Math.min(32, value * 2))} className="rounded bg-elevated px-2 py-1 text-xs text-text">+</button>
-            <button onClick={() => setZoom(1)} className="rounded bg-elevated px-2 py-1 text-[10px] text-text">Fit</button>
+            <button aria-label="Zoom out waveform" disabled={!loadedPath || zoom <= 1} onClick={() => setZoom((value) => Math.max(1, value / 2))} className="rounded bg-elevated px-2 py-1 text-xs text-text disabled:opacity-40">−</button>
+            <button aria-label="Zoom in waveform" disabled={!loadedPath || zoom >= 32} onClick={() => setZoom((value) => Math.min(32, value * 2))} className="rounded bg-elevated px-2 py-1 text-xs text-text disabled:opacity-40">+</button>
+            <button aria-label="Fit waveform to view" disabled={!loadedPath} onClick={() => setZoom(1)} className="rounded bg-elevated px-2 py-1 text-[10px] text-text disabled:opacity-40">Fit</button>
           </div>
           {!loadedPath && (
-            <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 text-xs text-text-secondary/50 pointer-events-none">
-              <Logo className="h-12 w-12 opacity-50" />
-              <span>Double-click a track to see its waveform</span>
+            <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 text-xs text-text-secondary pointer-events-none">
+              <Logo className="h-9 w-9 opacity-70" />
+              <span className="text-sm font-medium text-text">Find your next groove</span>
+              <span>Play a track below or drag one here to start practicing.</span>
             </div>
           )}
           {status?.loaded && trackTitle && (

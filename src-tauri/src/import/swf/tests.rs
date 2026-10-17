@@ -197,6 +197,31 @@ fn streaming_mp3_blocks_are_assembled() {
 }
 
 #[test]
+fn bit_reader_matches_msb_first_reference_at_every_width_and_offset() {
+    let data: Vec<u8> = (0..64).map(|index| (index * 37 + 11) as u8).collect();
+    for offset in 0..8 {
+        for width in 0..=32 {
+            let mut reader = BitReader {
+                data: &data,
+                bit: offset,
+            };
+            let expected = (offset..offset + width).fold(0u32, |value, bit| {
+                (value << 1) | u32::from((data[bit / 8] >> (7 - bit % 8)) & 1)
+            });
+            assert_eq!(reader.read_bits(width).unwrap(), expected);
+            assert_eq!(reader.bit, offset + width);
+        }
+    }
+    let mut reader = BitReader {
+        data: &data,
+        bit: data.len() * 8 - 1,
+    };
+    assert!(reader.read_bits(2).is_err());
+    assert_eq!(reader.bit, data.len() * 8 - 1);
+    assert!(reader.read_bits(33).is_err());
+}
+
+#[test]
 fn adpcm_sound_is_decoded_to_wav() {
     let mut bits = Vec::new();
     let mut current = 0u8;
@@ -204,35 +229,113 @@ fn adpcm_sound_is_decoded_to_wav() {
     push_bits(0, 2, &mut bits, &mut current, &mut count); // 2-bit ADPCM codes
     push_bits(0, 16, &mut bits, &mut current, &mut count); // initial sample
     push_bits(0, 6, &mut bits, &mut current, &mut count); // initial index
-    push_bits(0, 2, &mut bits, &mut current, &mut count); // one delta sample
+    push_bits(0, 2, &mut bits, &mut current, &mut count); // one delta after the predictor
     finish_bits(&mut bits, current, count);
     let mut tag = define_sound_tag(9, FORMAT_ADPCM, &bits);
     tag[5..9].copy_from_slice(&2u32.to_le_bytes());
     let parsed = parse(&fws_file(10, &tag)).unwrap();
     assert_eq!(parsed.sounds[0].codec, "wav");
     assert_eq!(&parsed.sounds[0].frames[..4], b"RIFF");
+    assert_eq!(&parsed.sounds[0].frames[44..48], &[0, 0, 3, 0]);
 }
 
 #[test]
-fn adpcm_resets_its_predictor_every_4095_samples() {
+fn adpcm_resets_its_predictor_every_4096_output_frames() {
     let mut bits = Vec::new();
     let mut current = 0u8;
     let mut count = 0usize;
     push_bits(0, 2, &mut bits, &mut current, &mut count);
     push_bits(1_000, 16, &mut bits, &mut current, &mut count);
     push_bits(0, 6, &mut bits, &mut current, &mut count);
-    for _ in 1..4095 {
+    for _ in 0..4095 {
         push_bits(0, 2, &mut bits, &mut current, &mut count);
     }
     push_bits(2_000, 16, &mut bits, &mut current, &mut count);
     push_bits(0, 6, &mut bits, &mut current, &mut count);
     finish_bits(&mut bits, current, count);
-    let wav = wav_from_adpcm(&bits, 0x1E, 4096).expect("valid ADPCM");
-    let offset = 44 + 4095 * 2;
+    let wav = wav_from_adpcm(&bits, 0x1E, 4097).expect("valid ADPCM");
+    let offset = 44 + 4096 * 2;
     assert_eq!(
         i16::from_le_bytes(wav[offset..offset + 2].try_into().unwrap()),
         2_000
     );
+}
+
+#[test]
+fn adpcm_stereo_blocks_consume_every_delta_at_all_code_widths() {
+    for width in 2..=5 {
+        let mut bits = Vec::new();
+        let mut current = 0;
+        let mut count = 0;
+        push_bits((width - 2) as u32, 2, &mut bits, &mut current, &mut count);
+        for (left, right, frames) in [(1000i16, -1000i16, 4095), (2000, -2000, 1)] {
+            for sample in [left, right] {
+                push_bits(
+                    sample as u16 as u32,
+                    16,
+                    &mut bits,
+                    &mut current,
+                    &mut count,
+                );
+                push_bits(0, 6, &mut bits, &mut current, &mut count);
+            }
+            for _ in 0..frames {
+                push_bits(0, width, &mut bits, &mut current, &mut count);
+                push_bits(1 << (width - 1), width, &mut bits, &mut current, &mut count);
+            }
+        }
+        finish_bits(&mut bits, current, count);
+        let wav = wav_from_adpcm(&bits, 0x1F, 4098).unwrap();
+        assert_eq!(wav.len(), 44 + 4098 * 4);
+        let delta = 7i16 >> (width - 1);
+        for (frame, left, right) in [
+            (0, 1000, -1000),
+            (1, 1000 + delta, -1000 - delta),
+            (4096, 2000, -2000),
+            (4097, 2000 + delta, -2000 - delta),
+        ] {
+            let offset = 44 + frame * 4;
+            assert_eq!(
+                i16::from_le_bytes(wav[offset..offset + 2].try_into().unwrap()),
+                left
+            );
+            assert_eq!(
+                i16::from_le_bytes(wav[offset + 2..offset + 4].try_into().unwrap()),
+                right
+            );
+        }
+        // Removing enough payload must reject the sound rather than fabricate samples.
+        assert!(wav_from_adpcm(&bits[..bits.len() - 4], 0x1F, 4098).is_none());
+    }
+}
+
+#[test]
+fn selective_playback_matches_full_parse_without_unrelated_sounds_or_cover() {
+    let jpeg = jpeg_fixture(8, 8);
+    let mut cover = 1u16.to_le_bytes().to_vec();
+    cover.extend(jpeg);
+    let mut tags = define_sound_tag(7, FORMAT_MP3, &fake_mp3(0));
+    tags.extend(define_sound_tag(3, FORMAT_MP3, &fake_mp3(2112)));
+    tags.extend(swf_tag(TAG_DEFINE_BITS_JPEG2, &cover));
+    tags.extend(swf_tag(TAG_SOUND_STREAM_HEAD, &[0x0F, 0x2F, 0, 0, 0, 0]));
+    let mut block = vec![4, 0, 0, 0];
+    block.extend_from_slice(&fake_mp3(0)[2..]);
+    tags.extend(swf_tag(TAG_SOUND_STREAM_BLOCK, &block));
+    for file in [fws_file(10, &tags), cws_file(10, &tags)] {
+        let all = parse(&file).unwrap();
+        assert!(all.cover_image.is_some());
+        for expected in &all.sounds {
+            let selected = parse_sound(&file, expected.id).unwrap();
+            assert_eq!(selected.sounds, vec![expected.clone()]);
+            assert!(selected.cover_image.is_none());
+        }
+        assert!(parse_sound(&file, 123).unwrap().sounds.is_empty());
+        assert!(validate(&file).is_ok());
+        let mut malformed = file;
+        malformed.truncate(malformed.len() - 4);
+        assert!(parse_sound(&malformed, 7).is_err());
+        assert!(validate(&malformed).is_err());
+    }
 }
 #[test]
 fn unsupported_codec_is_skipped_not_fatal() {
@@ -289,10 +392,22 @@ fn tag_overrun_rejected() {
 #[test]
 #[ignore]
 fn turntable_fixture_extracts_sounds() {
+    let started = std::time::Instant::now();
     let path = std::env::var("OLOOPER_TURNTABLE_FIXTURE")
         .expect("set OLOOPER_TURNTABLE_FIXTURE to the SWF fixture path");
     let data = std::fs::read(path).unwrap();
+    eprintln!(
+        "fixture read: {} bytes in {:?}",
+        data.len(),
+        started.elapsed()
+    );
     let parsed = parse(&data).unwrap();
+    eprintln!(
+        "fixture parsed: {} sounds, {} skipped in {:?}",
+        parsed.sounds.len(),
+        parsed.skipped.len(),
+        started.elapsed()
+    );
     if parsed.sounds.is_empty() {
         let (_, body) = body_bytes(&data).unwrap();
         let mut off = rect_len(&body).unwrap() + 4;
@@ -322,6 +437,15 @@ fn turntable_fixture_extracts_sounds() {
         );
     }
     for sound in &parsed.sounds {
+        let decoding = std::time::Instant::now();
+        eprintln!(
+            "decoding sound {}: {} ({} bytes, {} declared samples)",
+            sound.id,
+            sound.codec,
+            sound.frames.len(),
+            sound.sample_count
+        );
         crate::player::decode_bytes(&sound.frames).expect("extracted sound must decode");
+        eprintln!("decoded sound {} in {:?}", sound.id, decoding.elapsed());
     }
 }

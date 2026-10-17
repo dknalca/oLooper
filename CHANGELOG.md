@@ -1,5 +1,19 @@
 # Release notes
 
+## 0.7.0
+
+- Refresh the practice workspace with clearer visual hierarchy, accessible tab
+  navigation, direct Audio/MIDI/shortcut controls, and helpful library empty states.
+- Import SWF and EXE loopers from one mixed-file selector or recursively scan a
+  folder; show the number of loopers before importing.
+- Make copying a looper source into the library optional for both extracted and
+  source-backed imports. Copying defaults off and can be overridden per import.
+- Fix Flash ADPCM decoding for 4096-frame blocks, restoring extraction of the
+  70 tracks in the turntable training looper.
+- Speed up source-backed playback by parsing only the requested sound and
+  skipping repeated BPM analysis, unrelated audio, and cover decoding.
+- Preserve MP3 gapless sample trimming and validate large sources with bounded reads.
+
 ## 0.6.4
 
 - Fix the Pitch speed control so tempo and pitch change immediately during

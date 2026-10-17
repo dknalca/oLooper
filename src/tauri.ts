@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { copySourcePreference } from "./importFlow";
 
 // Typed Tauri command contracts. All backend access goes through here;
 // components must not import @tauri-apps/api directly.
@@ -379,7 +380,11 @@ export function libraryRandomTrack(excludeId: number | null): Promise<Track | nu
 }
 
 function copyContainerOnImport(): boolean {
-  return localStorage.getItem("olooper.import.copy-source") !== "false";
+  return copySourcePreference(localStorage.getItem("olooper.import.copy-source"));
+}
+
+export function scanLooperFolder(path: string): Promise<string[]> {
+  return invoke<string[]>("scan_looper_folder", { path });
 }
 
 export function importSwf(path: string, jobId = importJobId(), extractAudio = true, copySource = copyContainerOnImport()): Promise<string> {
@@ -499,8 +504,8 @@ export function listenImportProgress(
 
 export type AppMenuCommand =
   | "import-files"
-  | "open-swf"
-  | "open-exe"
+  | "import-loopers"
+  | "import-folder"
   | "import-audio"
   | "choose-library"
   | "show-shortcuts"

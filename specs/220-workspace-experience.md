@@ -1,0 +1,31 @@
+# 220 — Modern workspace experience
+
+## Scope
+
+Refresh the desktop practice workspace with a consistent dark slate palette,
+clearer surface hierarchy, readable secondary text, and visible focus states.
+
+## Behavior
+
+- Keep waveform, transport, and library in that order; use distinct rounded
+  panels and allow toolbar and transport controls to wrap in narrower windows.
+- Expose Audio, MIDI, and keyboard shortcuts directly in the header alongside
+  import, library folder, metronome, and practice timer controls.
+- Label library views “My Library” and “Discover loopers”. Support Left/Right,
+  Home/End, roving tab focus, and a labelled tab panel.
+- Default new sessions without a saved collection to All tracks. Preserve
+  existing collection preferences.
+- Distinguish library loading, initial setup, empty collections, and filtered
+  searches. Provide contextual setup/import/browse/clear-filter actions.
+- Clear filters resets search, source, BPM, and duration together, preserving
+  collection, sort, playlists, and track data.
+- Give waveform zoom controls accessible names and disable unavailable zoom
+  actions. Respect reduced-motion preferences for CSS transitions.
+
+## Verification
+
+- Run frontend typecheck, tests, and production build.
+- In Tauri, check setup and an empty library; import a track and verify playback,
+  waveform, filters, favorites, playlists, and the Discover view.
+- Check header and transport wrapping in a smaller window, keyboard navigation
+  between tabs, focus indicators, and direct access to Audio/MIDI/Shortcuts.

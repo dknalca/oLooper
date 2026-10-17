@@ -1,5 +1,14 @@
 export type ImportKind = "swf" | "exe" | "audio";
 
+export interface ContainerImportOptions {
+  mode: "extract" | "embedded";
+  copySource: boolean;
+}
+
+export function copySourcePreference(value: string | null): boolean {
+  return value === "true";
+}
+
 export function importKindForPath(path: string): ImportKind {
   const extension = path.split(".").pop()?.toLowerCase();
   if (extension === "swf") return "swf";

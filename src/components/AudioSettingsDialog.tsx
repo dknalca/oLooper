@@ -232,7 +232,7 @@ export default function AudioSettingsDialog({
             <h2 id="audio-options-title" className="text-base font-semibold text-text">Audio Output</h2>
             <p className="mt-1 text-[10px] text-text-secondary">System default follows the operating system when its default output changes. Playback stops while choosing an output; closing resumes from the start of the loop.</p>
           </div>
-          <button onClick={onClose} disabled={busy} className="rounded px-2 py-1 text-xs text-text-secondary hover:bg-border hover:text-text disabled:opacity-40">Close</button>
+          <button onClick={onClose} disabled={busy} className="dialog-close"><span aria-hidden="true">×</span> Close</button>
         </header>
 
         <label className="block text-xs text-text-secondary">
@@ -274,8 +274,8 @@ export default function AudioSettingsDialog({
             className="mt-0.5"
           />
           <span>
-            <span className="block font-medium">Copy SWF/EXE sources when playing from source</span>
-            <span className="mt-1 block text-[10px] text-text-secondary">When disabled, “Play from source” keeps a reference to the original file instead of copying it. Extracted-audio imports still copy their source. The original must remain available for playback.</span>
+            <span className="block font-medium">Copy SWF/EXE loopers to the library by default</span>
+            <span className="mt-1 block text-[10px] text-text-secondary">Sets the default for the import checkbox, for both extracted audio and source playback. Without a copy, source playback requires the original file to stay available.</span>
           </span>
         </label>
 

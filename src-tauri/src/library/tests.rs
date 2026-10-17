@@ -1378,6 +1378,123 @@ fn long_sanitized_group_names_keep_distinct_source_audio_separate() {
 }
 
 #[test]
+#[ignore = "requires OLOOPER_TURNTABLE_FIXTURE; imports the large real looper into a temporary library"]
+fn turntable_fixture_imports_without_copying_source() {
+    let path = std::env::var("OLOOPER_TURNTABLE_FIXTURE").expect("set OLOOPER_TURNTABLE_FIXTURE");
+    let data = std::fs::read(&path).unwrap();
+    let hash = sha256_hex(&data);
+    let parsed = crate::import::swf::parse(&data).unwrap();
+    assert_eq!(
+        parsed.sounds.len(),
+        70,
+        "the training looper has 70 DefineSound tracks"
+    );
+    let root = tempfile::tempdir().unwrap();
+    let library = Library::open(root.path()).unwrap();
+    let report = library
+        .import_embedded_sounds_with_cover_and_progress(
+            "Turntable training",
+            "swf",
+            &path,
+            &hash,
+            false,
+            None,
+            None,
+            &parsed.sounds,
+            parsed.cover_image.as_deref(),
+            |stage, current, total| {
+                eprintln!("source-backed import {current}/{total}: {stage}");
+                Ok(())
+            },
+        )
+        .unwrap();
+    assert_eq!(report.added, 70);
+    assert!(report.failed.is_empty());
+    let tracks = library.list_tracks().unwrap();
+    assert!(tracks.iter().all(|track| track.audio_storage == "embedded"
+        && !track.source_managed
+        && track.source_path == path
+        && track.exists));
+    assert!(!root.path().join("loopersFlash").exists());
+    let buffer = library
+        .playback_request(report.track_ids[0])
+        .unwrap()
+        .decode()
+        .unwrap();
+    assert_eq!(buffer.frames(), parsed.sounds[0].sample_count as usize);
+    assert_eq!(library.remove_looper(&hash).unwrap(), 70);
+    assert!(Path::new(&path).is_file());
+
+    // Also exercise Extract audio with copying disabled on a real track.
+    let extracted = library
+        .import_sounds_with_cover_and_progress_mode(
+            "Turntable training",
+            "swf",
+            &path,
+            &hash,
+            None,
+            None,
+            &parsed.sounds[..1],
+            parsed.cover_image.as_deref(),
+            true,
+            false,
+            |_, _, _| Ok(()),
+        )
+        .unwrap();
+    assert_eq!(extracted.added, 1);
+    assert!(extracted.failed.is_empty());
+    let track = library.get_track(extracted.track_ids[0]).unwrap().unwrap();
+    assert_eq!(track.audio_storage, "extracted");
+    assert!(!track.source_managed);
+    assert!(Path::new(&track.file_path).is_file());
+    assert!(!root.path().join("loopersFlash").exists());
+    assert_eq!(library.remove_looper(&hash).unwrap(), 1);
+    assert_eq!(
+        sha256_hex(&std::fs::read(&path).unwrap()),
+        hash,
+        "original SWF must remain unchanged"
+    );
+}
+
+#[test]
+fn source_playback_matches_import_pcm_for_compressed_swf_and_projector_mp3() {
+    let root = tempfile::tempdir().unwrap();
+    let encoded = crate::audio_conversion::wav_pcm_to_mp3_320(&wav_buf()).unwrap();
+    let mut tag = 42u16.to_le_bytes().to_vec();
+    tag.push(0x2f); // MP3, 44.1 kHz, 16-bit stereo flags
+    tag.extend_from_slice(&400u32.to_le_bytes());
+    tag.extend_from_slice(&100u16.to_le_bytes());
+    tag.extend_from_slice(&encoded);
+    let swf = cws_file(10, &swf_tag(14, &tag));
+    let parsed = crate::import::swf::parse(&swf).unwrap();
+    let expected = prepare_sound(&parsed.sounds[0]).unwrap().buffer;
+    assert_eq!(expected.frames(), 400);
+    let mut exe = vec![0; 128];
+    exe[..2].copy_from_slice(b"MZ");
+    exe.extend_from_slice(&swf);
+    for (source_type, data) in [("swf", swf), ("exe", exe)] {
+        let path = root.path().join(format!("external.{source_type}"));
+        std::fs::write(&path, &data).unwrap();
+        let hash = sha256_hex(&data);
+        let decoded =
+            decode_embedded_sound_file(path.to_str().unwrap(), source_type, 42, &hash).unwrap();
+        assert_eq!(decoded.rate, expected.rate);
+        assert_eq!(decoded.channels, expected.channels);
+        assert_eq!(decoded.samples, expected.samples);
+        assert_eq!(std::fs::read(&path).unwrap(), data);
+        assert!(
+            decode_embedded_sound_file(path.to_str().unwrap(), source_type, 43, &hash).is_err()
+        );
+        std::fs::write(&path, b"changed source").unwrap();
+        assert!(
+            decode_embedded_sound_file(path.to_str().unwrap(), source_type, 42, &hash)
+                .unwrap_err()
+                .contains("changed after import")
+        );
+    }
+}
+
+#[test]
 fn embedded_import_lists_tracks_and_decodes_from_the_managed_source_without_audio_copies() {
     fn push_bits(
         value: u32,
@@ -1405,7 +1522,7 @@ fn embedded_import_lists_tracks_and_decodes_from_the_managed_source_without_audi
     push_bits(0, 2, &mut adpcm, &mut current, &mut bit_count); // two-bit ADPCM code width
     push_bits(0, 16, &mut adpcm, &mut current, &mut bit_count); // initial sample
     push_bits(0, 6, &mut adpcm, &mut current, &mut bit_count); // initial step index
-    push_bits(0, 2, &mut adpcm, &mut current, &mut bit_count); // one delta sample
+    push_bits(0, 2, &mut adpcm, &mut current, &mut bit_count); // one delta after the predictor
     if bit_count != 0 {
         adpcm.push(current << (8 - bit_count));
     }
@@ -1561,6 +1678,43 @@ fn embedded_import_lists_tracks_and_decodes_from_the_managed_source_without_audi
         external_source.is_file(),
         "removing a catalog group must preserve an external source"
     );
+    let extracted_report = external_lib
+        .import_sounds_with_cover_and_progress_mode(
+            "Extracted without source copy",
+            "swf",
+            &external_source_text,
+            &hash,
+            None,
+            None,
+            &parsed.sounds,
+            None,
+            true,
+            false,
+            |_, _, _| Ok(()),
+        )
+        .unwrap();
+    let extracted_track = external_lib
+        .get_track(extracted_report.track_ids[0])
+        .unwrap()
+        .unwrap();
+    assert_eq!(extracted_track.audio_storage, "extracted");
+    assert!(!extracted_track.source_managed);
+    assert!(Path::new(&extracted_track.file_path).is_file());
+    // Extracted audio remains playable even without the original container.
+    let moved_source = external_source.with_extension("moved");
+    std::fs::rename(&external_source, &moved_source).unwrap();
+    assert!(external_lib
+        .playback_request(extracted_track.id)
+        .unwrap()
+        .decode()
+        .is_ok());
+    std::fs::rename(&moved_source, &external_source).unwrap();
+    assert_eq!(external_lib.remove_looper(&hash).unwrap(), 1);
+    assert!(
+        external_source.is_file(),
+        "extraction without copying must never take ownership of the input"
+    );
+    assert!(!Path::new(&extracted_track.file_path).exists());
     std::fs::remove_file(external_source).unwrap();
     std::fs::remove_dir_all(&root).ok();
 }

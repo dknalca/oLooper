@@ -122,14 +122,25 @@ impl<'a> BitReader<'a> {
     }
 
     fn read_bits(&mut self, n: usize) -> Result<u32, SwfError> {
-        let mut out: u32 = 0;
-        for _ in 0..n {
-            let byte = *self.data.get(self.bit / 8).ok_or(SwfError::BadRect)?;
-            let b = (byte >> (7 - (self.bit % 8))) & 1;
-            out = (out << 1) | u32::from(b);
-            self.bit += 1;
+        if n == 0 {
+            return Ok(0);
         }
-        Ok(out)
+        if n > 32 {
+            return Err(SwfError::BadRect);
+        }
+        let end = self.bit.checked_add(n).ok_or(SwfError::BadRect)?;
+        let offset = self.bit % 8;
+        let bytes = self
+            .data
+            .get(self.bit / 8..end.div_ceil(8))
+            .ok_or(SwfError::BadRect)?;
+        let mut value = 0u64;
+        for byte in bytes {
+            value = (value << 8) | u64::from(*byte);
+        }
+        let result = ((value >> (bytes.len() * 8 - offset - n)) & ((1u64 << n) - 1)) as u32;
+        self.bit = end;
+        Ok(result)
     }
 
     fn read_signed(&mut self, n: usize) -> Result<i32, SwfError> {
@@ -259,6 +270,14 @@ fn wav_from_adpcm(payload: &[u8], flags: u8, sample_count: u32) -> Option<Vec<u8
     let channels = if flags & 0x01 != 0 { 2usize } else { 1usize };
     let mut bits = BitReader::new(payload);
     let code_bits = bits.read_bits(2).ok()? as usize + 2;
+    // Each 4096-frame block emits its initial predictor, then up to 4095
+    // delta frames. Reject truncated payloads before spending time decoding.
+    let total = sample_count as usize;
+    let blocks = total.div_ceil(4096);
+    let required_bits = 2 + channels * (blocks * 22 + (total - blocks) * code_bits);
+    if payload.len().checked_mul(8)? < required_bits {
+        return None;
+    }
     let steps: [i32; 89] = [
         7, 8, 9, 10, 11, 12, 13, 14, 16, 17, 19, 21, 23, 25, 28, 31, 34, 37, 41, 45, 50, 55, 60,
         66, 73, 80, 88, 97, 107, 118, 130, 143, 157, 173, 190, 209, 230, 253, 279, 307, 337, 371,
@@ -276,12 +295,11 @@ fn wav_from_adpcm(payload: &[u8], flags: u8, sample_count: u32) -> Option<Vec<u8
     };
     let mut sample = Vec::with_capacity(channels);
     let mut index = Vec::with_capacity(channels);
-    let total = sample_count as usize;
     let mut pcm = Vec::with_capacity(total.checked_mul(channels)?.checked_mul(2)?);
     for frame in 0..total {
-        // Flash ADPCM stores a fresh predictor and step index every 4095
-        // samples. ADPCMCodeSize is only present once at the stream start.
-        if frame % 4095 == 0 {
+        // SWF ADPCM emits the predictor as the first frame of each block,
+        // followed by 4095 delta frames (4096 output frames in total).
+        if frame % 4096 == 0 {
             sample.clear();
             index.clear();
             for _ in 0..channels {
@@ -290,25 +308,26 @@ fn wav_from_adpcm(payload: &[u8], flags: u8, sample_count: u32) -> Option<Vec<u8
             }
         }
         for channel in 0..channels {
-            if frame % 4095 != 0 {
-                let code = bits.read_bits(code_bits).ok()? as usize;
-                let step = steps[index[channel]];
-                let mut diff = step >> (code_bits - 1);
-                for bit in 0..code_bits - 1 {
-                    if code & (1 << bit) != 0 {
-                        diff += step >> (code_bits - 2 - bit);
-                    }
-                }
-                if code & (1 << (code_bits - 1)) != 0 {
-                    sample[channel] -= diff;
-                } else {
-                    sample[channel] += diff;
-                }
-                sample[channel] = sample[channel].clamp(i16::MIN as i32, i16::MAX as i32);
-                index[channel] = (index[channel] as i32
-                    + index_adjust[code & (index_adjust.len() - 1)])
-                    .clamp(0, 88) as usize;
+            if frame % 4096 == 0 {
+                pcm.extend_from_slice(&(sample[channel] as i16).to_le_bytes());
+                continue;
             }
+            let code = bits.read_bits(code_bits).ok()? as usize;
+            let step = steps[index[channel]];
+            let mut diff = step >> (code_bits - 1);
+            for bit in 0..code_bits - 1 {
+                if code & (1 << bit) != 0 {
+                    diff += step >> (code_bits - 2 - bit);
+                }
+            }
+            if code & (1 << (code_bits - 1)) != 0 {
+                sample[channel] -= diff;
+            } else {
+                sample[channel] += diff;
+            }
+            sample[channel] = sample[channel].clamp(i16::MIN as i32, i16::MAX as i32);
+            index[channel] = (index[channel] as i32 + index_adjust[code & (index_adjust.len() - 1)])
+                .clamp(0, 88) as usize;
             pcm.extend_from_slice(&(sample[channel] as i16).to_le_bytes());
         }
     }
@@ -423,6 +442,37 @@ fn finish_stream(stream: StreamSound, sounds: &mut Vec<Sound>, skipped: &mut Vec
 
 /// Parse a SWF file image, extracting MP3 `DefineSound`s in file order.
 pub fn parse(data: &[u8]) -> Result<SwfSounds, SwfError> {
+    parse_mode(data, ParseMode::All)
+}
+
+/// Playback must not decode unrelated ADPCM sounds or embedded covers.
+pub(crate) fn parse_sound(data: &[u8], id: u16) -> Result<SwfSounds, SwfError> {
+    parse_mode(data, ParseMode::Sound(id))
+}
+
+/// Validate container/tag bounds without materializing audio or images.
+pub(crate) fn validate(data: &[u8]) -> Result<(), SwfError> {
+    parse_mode(data, ParseMode::Validate).map(|_| ())
+}
+
+#[derive(Clone, Copy)]
+enum ParseMode {
+    All,
+    Sound(u16),
+    Validate,
+}
+
+impl ParseMode {
+    fn includes(self, id: u16) -> bool {
+        match self {
+            Self::All => true,
+            Self::Sound(wanted) => wanted == id,
+            Self::Validate => false,
+        }
+    }
+}
+
+fn parse_mode(data: &[u8], mode: ParseMode) -> Result<SwfSounds, SwfError> {
     let (version, body) = body_bytes(data)?;
 
     // Skip FrameSize RECT + FrameRate (2) + FrameCount (2).
@@ -457,26 +507,32 @@ pub fn parse(data: &[u8]) -> Result<SwfSounds, SwfError> {
             ended = true;
             break; // End tag
         }
-        if code == TAG_JPEG_TABLES && tag.len() <= MAX_COVER_IMAGE_BYTES {
-            jpeg_tables = Some(tag.to_vec());
-        }
-        if let Some(image) = jpeg_from_tag(code, tag, jpeg_tables.as_deref()) {
-            cover_candidates.push(image);
-            cover_candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.len()));
-            cover_candidates.truncate(MAX_COVER_CANDIDATES);
+        if matches!(mode, ParseMode::All) {
+            if code == TAG_JPEG_TABLES && tag.len() <= MAX_COVER_IMAGE_BYTES {
+                jpeg_tables = Some(tag.to_vec());
+            }
+            if let Some(image) = jpeg_from_tag(code, tag, jpeg_tables.as_deref()) {
+                cover_candidates.push(image);
+                cover_candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.len()));
+                cover_candidates.truncate(MAX_COVER_CANDIDATES);
+            }
         }
         match code {
-            TAG_DEFINE_SOUND => match parse_define_sound(tag) {
-                Ok(s) => sounds.push(s),
-                Err(sk) => skipped.push(sk),
-            },
+            TAG_DEFINE_SOUND if mode.includes(u16le_at(tag, 0).unwrap_or(0)) => {
+                match parse_define_sound(tag) {
+                    Ok(s) => sounds.push(s),
+                    Err(sk) => skipped.push(sk),
+                }
+            }
             TAG_SOUND_STREAM_HEAD | TAG_SOUND_STREAM_HEAD2 => {
                 if let Some(previous) = stream.take() {
                     finish_stream(previous, &mut sounds, &mut skipped);
                 }
                 // StreamSoundCompression is the upper nibble of byte 1.
                 let format = tag.get(1).copied().unwrap_or(0) >> 4;
-                if format == FORMAT_MP3 && tag.len() >= 6 {
+                if !mode.includes(next_stream_id) {
+                    next_stream_id = next_stream_id.wrapping_add(1);
+                } else if format == FORMAT_MP3 && tag.len() >= 6 {
                     stream = Some(StreamSound {
                         id: next_stream_id,
                         sample_count: 0,

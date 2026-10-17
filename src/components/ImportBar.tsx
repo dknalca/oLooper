@@ -10,9 +10,11 @@ import {
   type AppMenuCommand,
   type ImportProgress,
   pickFiles,
+  pickDirectory,
+  scanLooperFolder,
   type ImportReport,
 } from "../tauri";
-import { elapsedLabel, fileName, importKindForPath } from "../importFlow";
+import { copySourcePreference, elapsedLabel, fileName, importKindForPath, type ContainerImportOptions } from "../importFlow";
 
 interface Props {
   onImported: () => void;
@@ -25,8 +27,16 @@ interface ImportFileState {
   error: string | null;
 }
 
+function importContainer(path: string, jobId: string, options: ContainerImportOptions): Promise<ImportReport> {
+  const run = importKindForPath(path) === "exe" ? importExeAndWait : importSwfAndWait;
+  return run(path, jobId, options.mode === "extract", options.copySource);
+}
+
+const LOOPER_FILTERS = [{ name: "SWF/EXE loopers", extensions: ["swf", "exe"] }];
+
 export default function ImportBar({ onImported }: Props) {
-  const [modePrompt, setModePrompt] = useState<{ resolve: (mode: "extract" | "embedded" | null) => void } | null>(null);
+  const [modePrompt, setModePrompt] = useState<{ count: number; folder?: string; resolve: (options: ContainerImportOptions | null) => void } | null>(null);
+  const [promptCopySource, setPromptCopySource] = useState(false);
   const [busy, setBusy] = useState(false);
   const [dragging, setDragging] = useState(false);
   const [report, setReport] = useState<ImportReport | null>(null);
@@ -51,9 +61,12 @@ export default function ImportBar({ onImported }: Props) {
     return () => previousFocus?.focus();
   }, [modePrompt]);
 
-  const chooseContainerMode = (paths: string[]): Promise<"extract" | "embedded" | null> => {
-    if (!paths.some((path) => ["swf", "exe"].includes(importKindForPath(path)))) return Promise.resolve("extract");
-    return new Promise((resolve) => setModePrompt({ resolve }));
+  const chooseContainerMode = (paths: string[], folder?: string): Promise<ContainerImportOptions | null> => {
+    const count = paths.filter((path) => ["swf", "exe"].includes(importKindForPath(path))).length;
+    const copySource = copySourcePreference(localStorage.getItem("olooper.import.copy-source"));
+    if (count === 0) return Promise.resolve({ mode: "extract", copySource });
+    setPromptCopySource(copySource);
+    return new Promise((resolve) => setModePrompt({ count, folder, resolve }));
   };
 
   const setImportBusy = (value: boolean) => {
@@ -186,11 +199,11 @@ export default function ImportBar({ onImported }: Props) {
               try {
                 const kind = importKindForPath(path);
                 if (kind === "swf") {
-                  const r = await runOwnedJob(path, (jobId) => importSwfAndWait(path, jobId, containerMode === "extract"));
+                  const r = await runOwnedJob(path, (jobId) => importSwfAndWait(path, jobId, containerMode.mode === "extract", containerMode.copySource));
                   totalAdded += r.added;
                   totalExisting += r.already_there;
                 } else if (kind === "exe") {
-                  const r = await runOwnedJob(path, (jobId) => importExeAndWait(path, jobId, containerMode === "extract"));
+                  const r = await runOwnedJob(path, (jobId) => importExeAndWait(path, jobId, containerMode.mode === "extract", containerMode.copySource));
                   totalAdded += r.added;
                   totalExisting += r.already_there;
                 } else {
@@ -231,15 +244,28 @@ export default function ImportBar({ onImported }: Props) {
   }, [onImported]);
 
   const browseAndImport = async (
-    importFn: (p: string, jobId: string, mode: "extract" | "embedded") => Promise<ImportReport>,
+    importFn: (p: string, jobId: string, options: ContainerImportOptions) => Promise<ImportReport>,
     filters: { name: string; extensions: string[] }[],
+    folderImport = false,
   ) => {
     if (busyRef.current) return;
     setImportBusy(true);
     let files: string[];
+    let folder: string | undefined;
     try {
-      files = await pickFiles(filters);
+      if (folderImport) {
+        const selected = await pickDirectory();
+        if (!selected) { setImportBusy(false); return; }
+        folder = selected;
+        showNotice("Scanning folder and subfolders for SWF/EXE loopers…");
+        files = await scanLooperFolder(selected);
+        setNotice(null);
+        if (files.length === 0) showNotice("No SWF/EXE loopers found in this folder or its subfolders.");
+      } else {
+        files = await pickFiles(filters);
+      }
     } catch (cause) {
+      setNotice(null);
       setError(String(cause));
       setImportBusy(false);
       return;
@@ -248,13 +274,14 @@ export default function ImportBar({ onImported }: Props) {
       setImportBusy(false);
       return;
     }
-    const containerMode = await chooseContainerMode(files);
+    const containerMode = await chooseContainerMode(files, folder);
     if (!containerMode) { setImportBusy(false); return; }
     beginImport(files);
     setError(null);
     setReport(null);
     // Import each file sequentially, accumulate results
     let totalAdded = 0;
+    let totalExisting = 0;
     let failedSounds = 0;
     const failures: string[] = [];
     let lastReport: ImportReport | null = null;
@@ -264,6 +291,7 @@ export default function ImportBar({ onImported }: Props) {
         const r = await runOwnedJob(f, (jobId) => importFn(f, jobId, containerMode));
         lastReport = r;
         totalAdded += r.added;
+        totalExisting += r.already_there;
         failedSounds += r.failed.length;
       } catch (e) {
         if (!cancelQueue.current) failures.push(`${f}: ${String(e)}`);
@@ -281,9 +309,8 @@ export default function ImportBar({ onImported }: Props) {
       setDragCount(totalAdded);
       setTimeout(() => setDragCount(null), 3000);
     }
-    const existing = lastReport?.already_there ?? 0;
-    if (existing > 0) showNotice(`${existing} existing track${existing === 1 ? "" : "s"} already in library`);
-    finishProgress(failures.length > 0 ? failures[0] : cancelQueue.current ? "import cancelled" : null);
+    if (totalExisting > 0) showNotice(`${totalExisting} existing track${totalExisting === 1 ? "" : "s"} already in library`);
+    finishProgress(failures.length > 0 ? failures[0] : failedSounds > 0 ? `${failedSounds} embedded sound(s) skipped` : cancelQueue.current ? "import cancelled" : null);
     setImportBusy(false);
     onImported();
   };
@@ -331,12 +358,12 @@ export default function ImportBar({ onImported }: Props) {
 
   const importFromMenu = async (command: AppMenuCommand) => {
     if (busyRef.current) return;
-    if (command === "open-swf") {
-      await browseAndImport((path, jobId, mode) => importSwfAndWait(path, jobId, mode === "extract"), [{ name: "Flash files", extensions: ["swf"] }]);
+    if (command === "import-loopers") {
+      await browseAndImport(importContainer, LOOPER_FILTERS);
       return;
     }
-    if (command === "open-exe") {
-      await browseAndImport((path, jobId, mode) => importExeAndWait(path, jobId, mode === "extract"), [{ name: "Projector files", extensions: ["exe"] }]);
+    if (command === "import-folder") {
+      await browseAndImport(importContainer, LOOPER_FILTERS, true);
       return;
     }
     if (command === "import-audio") {
@@ -375,11 +402,11 @@ export default function ImportBar({ onImported }: Props) {
       try {
         const kind = importKindForPath(path);
         if (kind === "swf") {
-          const report = await runOwnedJob(path, (jobId) => importSwfAndWait(path, jobId, containerMode === "extract"));
+          const report = await runOwnedJob(path, (jobId) => importSwfAndWait(path, jobId, containerMode.mode === "extract", containerMode.copySource));
           added += report.added;
           existing += report.already_there;
         } else if (kind === "exe") {
-          const report = await runOwnedJob(path, (jobId) => importExeAndWait(path, jobId, containerMode === "extract"));
+          const report = await runOwnedJob(path, (jobId) => importExeAndWait(path, jobId, containerMode.mode === "extract", containerMode.copySource));
           added += report.added;
           existing += report.already_there;
         } else {
@@ -444,7 +471,7 @@ export default function ImportBar({ onImported }: Props) {
             modePrompt.resolve(null);
             setModePrompt(null);
           } else if (event.key === "Tab") {
-            const buttons = modeDialogRef.current?.querySelectorAll<HTMLButtonElement>("button");
+            const buttons = modeDialogRef.current?.querySelectorAll<HTMLElement>("button, input");
             if (!buttons?.length) return;
             const first = buttons[0];
             const last = buttons[buttons.length - 1];
@@ -457,13 +484,18 @@ export default function ImportBar({ onImported }: Props) {
             }
           }
         }}>
-          <div className="w-full max-w-sm rounded-lg border border-border bg-surface p-5 shadow-2xl">
+          <div className="max-h-[90vh] w-full max-w-sm overflow-y-auto rounded-lg border border-border bg-surface p-5 shadow-2xl">
             <h2 id="container-import-title" className="text-sm font-semibold text-text">Import SWF/EXE audio</h2>
-            <p className="mt-2 text-xs text-text-secondary">Choose how to handle the audio in the selected file(s).</p>
+            <p className="mt-2 text-xs text-text-secondary">You are about to import <strong className="text-text">{modePrompt.count} looper{modePrompt.count === 1 ? "" : "s"}</strong>. Choose how to handle their audio.</p>
+            {modePrompt.folder && <p className="mt-2 break-all text-[10px] text-text-secondary">Folder: {modePrompt.folder} (including subfolders)</p>}
+            <label className="mt-4 flex items-start gap-2 rounded border border-border bg-elevated p-3 text-xs text-text">
+              <input type="checkbox" checked={promptCopySource} onChange={(event) => setPromptCopySource(event.target.checked)} className="mt-0.5" />
+              <span>Copy SWF/EXE loopers to the library<span className="mt-1 block text-[10px] text-text-secondary">Applies to this import. Without a copy, source playback needs the original files to remain in place. Extracted audio is always stored in the library.</span></span>
+            </label>
             <div className="mt-4 flex flex-col gap-2">
-              <button onClick={() => { modePrompt.resolve("extract"); setModePrompt(null); }} className="rounded border border-border bg-elevated px-3 py-2 text-left text-xs text-text hover:border-accent">Extract audio</button>
-              <button onClick={() => { modePrompt.resolve("embedded"); setModePrompt(null); }} className="rounded border border-border bg-elevated px-3 py-2 text-left text-xs text-text hover:border-accent">Play from source (no extraction)</button>
-              <button onClick={() => { modePrompt.resolve(null); setModePrompt(null); }} className="self-end px-2 py-1 text-[10px] text-text-secondary hover:text-text">Cancel</button>
+              <button onClick={() => { modePrompt.resolve({ mode: "extract", copySource: promptCopySource }); setModePrompt(null); }} className="rounded border border-border bg-elevated px-3 py-2 text-left text-xs text-text hover:border-accent">Extract audio</button>
+              <button onClick={() => { modePrompt.resolve({ mode: "embedded", copySource: promptCopySource }); setModePrompt(null); }} className="rounded border border-border bg-elevated px-3 py-2 text-left text-xs text-text hover:border-accent">Play from source (no extraction)</button>
+              <button onClick={() => { modePrompt.resolve(null); setModePrompt(null); }} className="dialog-close self-end">Cancel import</button>
             </div>
           </div>
         </div>
@@ -471,18 +503,14 @@ export default function ImportBar({ onImported }: Props) {
 
       <div className="flex h-8 shrink-0 items-center gap-1 border-l border-border pl-2">
         <BrowseBtn
-          onClick={() => browseAndImport((path, jobId, mode) => importSwfAndWait(path, jobId, mode === "extract"), [
-            { name: "Flash files", extensions: ["swf"] },
-          ])}
+          onClick={() => browseAndImport(importContainer, LOOPER_FILTERS)}
           disabled={busy}
-          label="SWF"
+          label="SWF / EXE"
         />
         <BrowseBtn
-          onClick={() => browseAndImport((path, jobId, mode) => importExeAndWait(path, jobId, mode === "extract"), [
-            { name: "Projector files", extensions: ["exe"] },
-          ])}
+          onClick={() => browseAndImport(importContainer, LOOPER_FILTERS, true)}
           disabled={busy}
-          label="EXE"
+          label="Folder"
         />
         <BrowseBtn
           onClick={browseAndImportCustom}
