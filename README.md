@@ -28,21 +28,36 @@ It is designed for **scratch DJs, beat jugglers, and turntablists** who want to 
 ## Screenshots
 
 <p align="center">
-  <img src="docs/screenshots/main-library.png" alt="oLooper 0.6.4 main library with waveform, live Pitch speed control, BPM, playlists, and imported loopers" width="1000" />
+  <img src="docs/screenshots/Main.png" alt="oLooper 0.7.0 practice workspace with waveform, transport, playlists, and the looper library" width="1000" />
 </p>
-<p align="center"><em>Browse loopers and tracks, inspect waveforms, and adjust Pitch while practicing.</em></p>
+<p align="center"><em>Browse your library, inspect waveforms, and practice from the refreshed workspace.</em></p>
 
 <p align="center">
-  <img src="docs/screenshots/audio-output.png" alt="oLooper Audio Output settings with device, sample rate, buffer, stereo pair, and left/right test controls" width="850" />
+  <img src="docs/screenshots/Importar.png" alt="SWF and EXE import confirmation with the looper count, optional source copying, and extraction or source playback choices" width="850" />
 </p>
-<p align="center"><em>Choose and test the audio output device and stereo pair.</em></p>
+<p align="center"><em>Choose extraction or source playback and whether to copy loopers into the library.</em></p>
 
 <p align="center">
-  <img src="docs/screenshots/midi-setup.png" alt="oLooper MIDI Options showing transport and CUE assignments for a connected MIDI controller" width="850" />
+  <img src="docs/screenshots/Audio.png" alt="Audio Output settings with device, source-copy preference, sample rate, buffer, stereo pair, and left/right test controls" width="850" />
 </p>
-<p align="center"><em>Map MIDI controls to transport, loop, speed, and CUE actions.</em></p>
+<p align="center"><em>Choose the audio output and set the default source-copy behavior.</em></p>
 
-<p align="center"><sub>Captures from oLooper 0.6.4. The main screenshot's local library path is redacted; example library content and MIDI assignments are shown.</sub></p>
+<p align="center">
+  <img src="docs/screenshots/Metronomo.png" alt="Metronome popover with track tempo, beat indicator, and start control" width="1000" />
+</p>
+<p align="center"><em>Set the metronome tempo and follow the beat while practicing.</em></p>
+
+<p align="center">
+  <img src="docs/screenshots/Midi.png" alt="MIDI Options with connected controller, output selection, and action bindings" width="850" />
+</p>
+<p align="center"><em>Connect a controller and map pads or buttons to practice actions.</em></p>
+
+<p align="center">
+  <img src="docs/screenshots/Shorcuts.png" alt="Keyboard Shortcuts dialog listing playback and application shortcuts" width="850" />
+</p>
+<p align="center"><em>Keep playback and application shortcuts close at hand.</em></p>
+
+<p align="center"><sub>Captures from oLooper 0.7.0. Example library content, controller assignments, and audio devices are shown.</sub></p>
 
 ## What oLooper does
 
