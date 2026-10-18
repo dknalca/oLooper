@@ -1,5 +1,12 @@
 # Release notes
 
+## 0.7.1
+
+- Browse collections and loops using the keyboard arrows, a MIDI encoder, or
+  separate MIDI Up/Down buttons. Intro/Right enters and plays; Back/Left returns.
+- Keep the focused collection and loop visible; loop navigation wraps at both ends.
+- Add MIDI mappings for Random Loop, volume ±5%, and metronome toggle.
+
 ## 0.7.1-preview.2 (MIDI library navigation)
 
 - Navigate library collections and loops with keyboard arrows, MIDI encoder, or
