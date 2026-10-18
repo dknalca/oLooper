@@ -1,5 +1,15 @@
 # Release notes
 
+## 0.7.1-preview.2 (MIDI library navigation)
+
+- Navigate library collections and loops with keyboard arrows, MIDI encoder, or
+  MIDI Up/Down buttons. Right/Intro enters and plays; Left/Back returns.
+- Keep the focused collection and loop visible while browsing; loop navigation
+  wraps at both ends.
+- Add MIDI mappings for Random Loop, volume ±5%, and metronome toggle; remove
+  seek, loop toggle, AUTO, and speed mappings from MIDI Options.
+- Add a quick x64 debug executable build mode and avoid rewriting unchanged icons.
+
 ## 0.7.1-preview.1 (MIDI controller preview)
 
 - Browse library collections and loops from MIDI with a relative encoder and

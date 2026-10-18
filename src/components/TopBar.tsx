@@ -126,6 +126,12 @@ export default function TopBar({ onLibraryReady, playing, onAudioOptions, onMidi
   };
 
   useEffect(() => {
+    const handleMetronomeToggle = () => { void toggleMetronome(); };
+    window.addEventListener("olooper:metronome-toggle", handleMetronomeToggle);
+    return () => window.removeEventListener("olooper:metronome-toggle", handleMetronomeToggle);
+  }, [metronomeEnabled, metronomeBpm]);
+
+  useEffect(() => {
     let cancelled = false;
     const rememberedRoot = localStorage.getItem("olooper.library.root");
     Promise.all([getAppStatus(), libraryDefaultRoot(), libraryRestore(rememberedRoot)])

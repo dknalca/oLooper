@@ -353,6 +353,17 @@ export default function Sidebar({ libraryReady, libraryGeneration, refreshKey, a
       trackIds: sorted.filter((track) => groupKey(track) === groupKey(group[0])).map((track) => track.id),
     })),
   ];
+  const focusedMidiCollection = midiCollections[midiNavigationState.collectionIndex];
+  const focusedMidiCollectionKey = midiNavigationState.level === "collections"
+    ? focusedMidiCollection?.key
+    : null;
+  const focusedMidiTrackId = midiNavigationState.level === "tracks"
+    ? focusedMidiCollection?.trackIds[midiNavigationState.trackIndex] ?? null
+    : null;
+  useEffect(() => {
+    document.querySelector<HTMLElement>('[data-midi-navigation-selected="true"]')
+      ?.scrollIntoView({ block: "nearest", inline: "nearest" });
+  }, [focusedMidiCollectionKey, focusedMidiTrackId]);
   const selectCollection = (key: string) => {
     setSelectedGroup(key);
     const collectionIndex = midiCollections.findIndex((collection) => collection.key === key);
@@ -998,7 +1009,8 @@ export default function Sidebar({ libraryReady, libraryGeneration, refreshKey, a
             <button
               onClick={() => selectCollection(ALL_GROUP)}
               aria-current={selectedGroup === ALL_GROUP ? "page" : undefined}
-              className={`mb-1 flex w-full items-center gap-2 rounded px-2 py-2 text-left transition-colors ${selectedGroup === ALL_GROUP ? "bg-accent/15 text-accent" : "text-text-secondary hover:bg-surface-hover hover:text-text"}`}
+              data-midi-navigation-selected={focusedMidiCollectionKey === ALL_GROUP || undefined}
+              className={`mb-1 flex w-full items-center gap-2 rounded px-2 py-2 text-left transition-colors ${focusedMidiCollectionKey === ALL_GROUP ? "bg-accent/25 text-accent ring-1 ring-inset ring-accent/70" : selectedGroup === ALL_GROUP ? "bg-accent/15 text-accent" : "text-text-secondary hover:bg-surface-hover hover:text-text"}`}
             >
               <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded bg-accent/10 text-sm text-accent">▦</span>
               <span className="min-w-0 flex-1 truncate text-xs font-medium">All tracks</span>
@@ -1008,7 +1020,8 @@ export default function Sidebar({ libraryReady, libraryGeneration, refreshKey, a
               onClick={() => selectCollection(FAVORITES_GROUP)}
               data-drop-favorites=""
               aria-current={selectedGroup === FAVORITES_GROUP ? "page" : undefined}
-              className={`mb-1 flex w-full items-center gap-2 rounded px-2 py-2 text-left transition-colors ${dropTarget?.kind === "favorites" ? "bg-accent/25 ring-1 ring-accent" : selectedGroup === FAVORITES_GROUP ? "bg-accent/15 text-accent" : "text-text-secondary hover:bg-surface-hover hover:text-text"}`}
+              data-midi-navigation-selected={focusedMidiCollectionKey === FAVORITES_GROUP || undefined}
+              className={`mb-1 flex w-full items-center gap-2 rounded px-2 py-2 text-left transition-colors ${dropTarget?.kind === "favorites" ? "bg-accent/25 ring-1 ring-accent" : focusedMidiCollectionKey === FAVORITES_GROUP ? "bg-accent/25 text-accent ring-1 ring-inset ring-accent/70" : selectedGroup === FAVORITES_GROUP ? "bg-accent/15 text-accent" : "text-text-secondary hover:bg-surface-hover hover:text-text"}`}
             >
               <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded bg-danger/10 text-sm text-danger">♥</span>
               <span className="min-w-0 flex-1 truncate text-xs font-medium">Favorites</span>
@@ -1019,14 +1032,15 @@ export default function Sidebar({ libraryReady, libraryGeneration, refreshKey, a
               <button onClick={() => createPlaylist()} title="Create playlist" aria-label="Create playlist" className="rounded px-1.5 text-sm text-text-secondary hover:bg-border hover:text-text">+</button>
             </div>
             {playlists.map((playlist) => {
-              const isSelected = selectedGroup === `${PLAYLIST_PREFIX}${playlist.id}`;
-              return (
-                <div
-                  key={playlist.id}
-                  onContextMenu={(event) => openPlaylistMenu(event, playlist.id)}
-                  data-drop-playlist={playlist.id}
-                  className={`group flex items-center rounded transition-colors ${dropTarget?.kind === "playlist" && dropTarget.playlistId === playlist.id ? "bg-accent/25 ring-1 ring-accent" : isSelected ? "bg-accent/15 text-accent" : "text-text-secondary hover:bg-surface-hover hover:text-text"}`}
-                >
+                const isSelected = selectedGroup === `${PLAYLIST_PREFIX}${playlist.id}`;
+                return (
+                  <div
+                    key={playlist.id}
+                    onContextMenu={(event) => openPlaylistMenu(event, playlist.id)}
+                    data-drop-playlist={playlist.id}
+                    data-midi-navigation-selected={focusedMidiCollectionKey === `${PLAYLIST_PREFIX}${playlist.id}` || undefined}
+                    className={`group flex items-center rounded transition-colors ${dropTarget?.kind === "playlist" && dropTarget.playlistId === playlist.id ? "bg-accent/25 ring-1 ring-accent" : focusedMidiCollectionKey === `${PLAYLIST_PREFIX}${playlist.id}` ? "bg-accent/25 text-accent ring-1 ring-inset ring-accent/70" : isSelected ? "bg-accent/15 text-accent" : "text-text-secondary hover:bg-surface-hover hover:text-text"}`}
+                  >
                   <button onClick={() => selectCollection(`${PLAYLIST_PREFIX}${playlist.id}`)} aria-current={isSelected ? "page" : undefined} className="flex min-w-0 flex-1 items-center gap-2 px-2 py-2 text-left">
                     <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded bg-border text-sm">♫</span>
                     <span className="min-w-0 flex-1 truncate text-xs font-medium">{playlist.name}</span>
@@ -1057,7 +1071,8 @@ export default function Sidebar({ libraryReady, libraryGeneration, refreshKey, a
                     selectCollection(sourceHash);
                   }}
                   onContextMenu={entries[0].source_type === "custom" ? undefined : (event) => openGroupMenu(event, sourceHash)}
-                  className={`group flex select-none items-center rounded transition-colors ${dropTarget?.kind === "looper" && dropTarget.sourceHash === sourceHash ? "bg-accent/25 ring-1 ring-accent" : isSelected ? "bg-accent/15 text-accent" : "text-text-secondary hover:bg-surface-hover hover:text-text"}`}
+                  data-midi-navigation-selected={focusedMidiCollectionKey === sourceHash || undefined}
+                  className={`group flex select-none items-center rounded transition-colors ${dropTarget?.kind === "looper" && dropTarget.sourceHash === sourceHash ? "bg-accent/25 ring-1 ring-accent" : focusedMidiCollectionKey === sourceHash ? "bg-accent/25 text-accent ring-1 ring-inset ring-accent/70" : isSelected ? "bg-accent/15 text-accent" : "text-text-secondary hover:bg-surface-hover hover:text-text"}`}
                 >
                   <button
                     onClick={() => {
@@ -1205,7 +1220,8 @@ export default function Sidebar({ libraryReady, libraryGeneration, refreshKey, a
                   if (event.key === "Enter") void playTrack(track);
                   if (event.key === " ") { event.preventDefault(); setActiveId(track.id); }
                 }}
-                className={`grid w-full select-none grid-cols-[minmax(0,1fr)_4.5rem_4rem_4.5rem] items-center gap-2 border-b border-border/50 px-3 py-2 text-left text-xs transition-colors ${track.exists ? "cursor-grab active:cursor-grabbing" : "cursor-pointer opacity-50"} sm:grid-cols-[minmax(0,1fr)_5rem_5rem_5rem] ${draggingTrackIds.includes(track.id) ? "opacity-60" : activeId === track.id ? "bg-accent/10 text-accent" : "text-text hover:bg-surface-hover"}`}
+                data-midi-navigation-selected={focusedMidiTrackId === track.id || undefined}
+                className={`grid w-full select-none grid-cols-[minmax(0,1fr)_4.5rem_4rem_4.5rem] items-center gap-2 border-b border-border/50 px-3 py-2 text-left text-xs transition-colors ${track.exists ? "cursor-grab active:cursor-grabbing" : "cursor-pointer opacity-50"} sm:grid-cols-[minmax(0,1fr)_5rem_5rem_5rem] ${draggingTrackIds.includes(track.id) ? "opacity-60" : focusedMidiTrackId === track.id ? "bg-accent/25 text-accent ring-1 ring-inset ring-accent/70" : activeId === track.id ? "bg-accent/10 text-accent" : "text-text hover:bg-surface-hover"}`}
               >
                 <span className="flex min-w-0 items-center gap-2">
                   <input type="checkbox" checked={selectedIds.includes(track.id)} onClick={(event) => event.stopPropagation()} onChange={() => setSelectedIds((ids) => ids.includes(track.id) ? ids.filter((id) => id !== track.id) : [...ids, track.id])} aria-label={`Select ${track.title}`} />

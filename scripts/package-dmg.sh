@@ -8,7 +8,13 @@ OUT_DIR="$ROOT/dist"
 case "${1:-}" in
   "") APP_NAME="oLooper"; ARCH_SUFFIX="" ;;
   --arm64) APP_NAME="oLooper-arm64"; ARCH_SUFFIX="-arm64" ;;
-  --x64|--intel) APP_NAME="oLooper-x64"; ARCH_SUFFIX="-x64" ;;
+  --x64|--64|--intel) APP_NAME="oLooper-x64"; ARCH_SUFFIX="-x64" ;;
+  -h|--help)
+    echo "Usage: ./scripts/package-dmg.sh [--arm64 | --x64]"
+    echo "  --arm64  Package oLooper-arm64.app."
+    echo "  --x64    Package oLooper-x64.app (aliases: --64, --intel)."
+    exit 0
+    ;;
   *)
     echo "Usage: ./scripts/package-dmg.sh [--arm64 | --x64]" >&2
     exit 2

@@ -17,13 +17,22 @@ testing, build Intel or Apple Silicon separately:
 ./scripts/build.sh --x64       # outputs oLooper-x64.app
 ./scripts/package-dmg.sh --x64
 
+# For quicker iteration, build an x64 debug app (also accepts --64).
+./scripts/build.sh --dev --x64
+
+# Fastest compile check: build a debug executable without creating an app bundle.
+./scripts/build.sh --dev --x64 --no-bundle
+
 ./scripts/build.sh --arm64     # outputs oLooper-arm64.app
 ./scripts/package-dmg.sh --arm64
 ```
 
 The explicit target flags can cross-compile from either Mac architecture.
 `./scripts/build.sh --native` remains a single-architecture build for the host;
-`--dev` remains a native-architecture debug build.
+`--dev` uses debug optimizations and can be combined with `--native`, `--arm64`,
+or `--x64` for faster iterative testing. Add `--no-bundle` to compile only the
+executable and skip icon generation/bundling; this mode requires `--dev`. The
+release flags and package script are unchanged.
 
 The bundle declares macOS 11.0 (Big Sur) as its minimum and the build sets
 `MACOSX_DEPLOYMENT_TARGET=11.0`. Test the release on macOS 11 before claiming

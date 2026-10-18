@@ -523,10 +523,10 @@ export type MidiAction =
   | "stop"
   | "previous"
   | "next"
-  | "toggle-loop"
-  | "auto-loop"
-  | "speed-up"
-  | "speed-down"
+  | "random-loop"
+  | "volume-down"
+  | "volume-up"
+  | "metronome-toggle"
   | "cue-1"
   | "cue-2"
   | "cue-3"
@@ -535,6 +535,8 @@ export type MidiAction =
   | "clear-cue-3"
   | "clear-cue-4"
   | "library-encoder"
+  | "library-up"
+  | "library-down"
   | "library-intro"
   | "library-back";
 

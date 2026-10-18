@@ -1708,6 +1708,7 @@ fn build_markers_mp4(id3_data: &[u8]) -> Result<Vec<u8>, String> {
     Ok(output)
 }
 
+#[cfg(any(target_os = "windows", test))]
 fn recover_replacement(destination: &Path) -> Result<(), String> {
     if destination.exists() {
         return Ok(());

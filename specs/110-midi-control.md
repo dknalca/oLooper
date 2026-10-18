@@ -19,14 +19,16 @@ Options…**, with assignments remembered locally.
   zero-velocity Note On are ignored.
 - CC is discrete: a transition from 0 to nonzero triggers once; a value of 0
   re-arms that control. Continuous CC values do not drive parameters.
-- Assignable actions: Play/Pause, Stop, Previous/Next, Toggle Loop, AUTO loop,
-  Speed ±5%, CUE 1–4, and Clear CUE 2–4. CUE 1 recalls the start of the track.
-- Library navigation has a relative CC encoder and Intro/Back buttons. The encoder
-  selects All tracks, Favorites, playlists, and loopers at the collection level,
-  then loops within the selected collection. Intro enters a collection and then
-  loads/plays the selected loop; Back returns from loops to the collection level
-  and is a no-op at the collection level. Encoder values below 64 move down,
-  values above 64 move up, and 0/64 are ignored.
+- Assignable actions: Play/Pause, Stop, Previous/Next, Random Loop, Volume ±5%,
+  Toggle Metronome, CUE 1–4, and Clear CUE 2–4. CUE 1 recalls the start of the track.
+- Library navigation has a relative CC encoder or separate Up/Down buttons,
+  plus Intro/Back buttons. The encoder or buttons select All tracks, Favorites,
+  playlists, and loopers at the collection level, then loops within the selected
+  collection. Intro enters a collection and then loads/plays the selected loop;
+  Back returns from loops to the collection level and is a no-op at the
+  collection level. Loop navigation wraps: moving up from the first loop selects
+  the last, and moving down from the last selects the first. Encoder values below
+  64 move down, values above 64 move up, and 0/64 are ignored.
 - Assignments and the selected input/output IDs persist in local application storage;
   no SQLite migration is required.
 - A separately selected MIDI output sends Note On/Off or CC 127/0 feedback for
@@ -48,6 +50,10 @@ Options…**, with assignments remembered locally.
   encoder direction and Intro/Back commands to the sidebar.
 - App gates button CC actions on 0→nonzero edges while forwarding every nonzero
   value from the relative library encoder.
+- Random Loop uses the same library-random playback flow as the player control;
+  Library Up/Down call the sidebar navigation directly.
+- Volume bindings use the player controls' bounded operations; metronome toggle
+  is routed to the TopBar-owned metronome state.
 - MIDI Learn temporarily captures the next supported Note On or discrete CC
   press, then saves the binding locally.
 
@@ -66,6 +72,10 @@ Options…**, with assignments remembered locally.
 - [x] Duplicate control assignments move to the most recently learned action.
 - [x] MIDI encoder navigates library collections and loops; Intro loads/plays and
   Back returns to collections.
+- [x] Loop navigation wraps at both ends of a collection.
+- [x] Library Up/Down can be mapped as individual buttons instead of an encoder;
+  Random Loop is a mappable action.
+- [x] Volume ±5% and metronome toggle are mappable.
 - [x] Consecutive relative encoder turns are received even when the controller
   sends no zero value between detents; button CCs still trigger once per press.
 - [x] MIDI input parsing is unit-tested without physical hardware.

@@ -19,10 +19,10 @@ export const MIDI_ACTIONS: { id: MidiAction; label: string; group: string }[] = 
   { id: "stop", label: "Stop", group: "Transport" },
   { id: "previous", label: "Previous loop", group: "Transport" },
   { id: "next", label: "Next loop", group: "Transport" },
-  { id: "toggle-loop", label: "Toggle loop", group: "Transport" },
-  { id: "auto-loop", label: "Auto-detect loop", group: "Transport" },
-  { id: "speed-down", label: "Slower (5%)", group: "Transport" },
-  { id: "speed-up", label: "Faster (5%)", group: "Transport" },
+  { id: "random-loop", label: "Random Loop", group: "Transport" },
+  { id: "volume-down", label: "Volume down (5%)", group: "Audio" },
+  { id: "volume-up", label: "Volume up (5%)", group: "Audio" },
+  { id: "metronome-toggle", label: "Toggle metronome", group: "Practice" },
   ...Array.from({ length: 4 }, (_, index) => ({
     id: `cue-${index + 1}` as MidiAction,
     label: `CUE ${index + 1}`,
@@ -34,6 +34,8 @@ export const MIDI_ACTIONS: { id: MidiAction; label: string; group: string }[] = 
     group: "Cues",
   })),
   { id: "library-encoder", label: "Library encoder (relative CC)", group: "Library" },
+  { id: "library-up", label: "Library Up", group: "Library" },
+  { id: "library-down", label: "Library Down", group: "Library" },
   { id: "library-intro", label: "Library Intro", group: "Library" },
   { id: "library-back", label: "Library Back", group: "Library" },
 ];
@@ -250,7 +252,7 @@ export default function MidiSettingsDialog({
         )}
 
         <div className="min-h-0 flex-1 overflow-y-auto">
-          {(["Transport", "Cues", "Library"] as const).map((group) => (
+          {(["Transport", "Cues", "Library", "Audio", "Practice"] as const).map((group) => (
             <section key={group} className="mb-4">
               <h3 className="mb-2 text-[10px] font-semibold uppercase tracking-wider text-text-secondary">{group}</h3>
               <div className="divide-y divide-border/60 rounded border border-border px-3">

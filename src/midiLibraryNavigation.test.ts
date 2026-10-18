@@ -15,11 +15,15 @@ describe("MIDI library navigation", () => {
       .toEqual({ level: "collections", collectionIndex: 1 });
   });
 
-  it("enters a collection, selects loops, plays on Intro, and backs out", () => {
+  it("enters a collection, wraps loop selection, plays on Intro, and backs out", () => {
     const entered = navigateMidiLibrary({ level: "collections", collectionIndex: 0 }, "intro", collections);
     expect(entered).toEqual({ state: { level: "tracks", collectionIndex: 0, trackIndex: 0 }, playTrackId: null });
+    expect(navigateMidiLibrary(entered.state, "up", collections).state)
+      .toEqual({ level: "tracks", collectionIndex: 0, trackIndex: 1 });
     const secondTrack = navigateMidiLibrary(entered.state, "down", collections);
     expect(secondTrack.state).toEqual({ level: "tracks", collectionIndex: 0, trackIndex: 1 });
+    expect(navigateMidiLibrary(secondTrack.state, "down", collections).state)
+      .toEqual({ level: "tracks", collectionIndex: 0, trackIndex: 0 });
     expect(navigateMidiLibrary(secondTrack.state, "intro", collections).playTrackId).toBe(12);
     expect(navigateMidiLibrary(secondTrack.state, "back", collections).state)
       .toEqual({ level: "collections", collectionIndex: 0 });

@@ -2,7 +2,7 @@
 // Build a multi-size Windows ICO with classic 32-bit DIB frames. Using DIB
 // frames keeps the icon readable by Explorer, shortcuts, and older Win32 APIs.
 
-import { writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -10,6 +10,14 @@ const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const source = join(root, "src-tauri", "icons", "icon.png");
 const destination = join(root, "src-tauri", "icons", "icon.ico");
 const sharp = (await import("sharp")).default;
+
+function writeIfChanged(path, content) {
+  try {
+    if (readFileSync(path).equals(content)) return false;
+  } catch { /* The generated asset does not exist yet. */ }
+  writeFileSync(path, content);
+  return true;
+}
 
 async function dibFrame(size) {
   const rgba = await sharp(source)
@@ -67,5 +75,8 @@ const entries = frames.map((frame, index) => {
   return entry;
 });
 
-writeFileSync(destination, Buffer.concat([header, ...entries, ...frames]));
-console.log(`Generated Windows icon with ${sizes.join(", ")} px DIB frames: ${destination}`);
+if (writeIfChanged(destination, Buffer.concat([header, ...entries, ...frames]))) {
+  console.log(`Generated Windows icon with ${sizes.join(", ")} px DIB frames: ${destination}`);
+} else {
+  console.log(`Windows icon unchanged: ${destination}`);
+}

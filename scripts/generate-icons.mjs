@@ -2,7 +2,7 @@
 // Generate oLooper icon source SVG and all Tauri-required PNG sizes.
 // Run: node scripts/generate-icons.mjs
 
-import { writeFileSync, mkdirSync } from "node:fs";
+import { readFileSync, writeFileSync, mkdirSync, rmSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -10,36 +10,16 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(__dirname, "..");
 const ICONS_DIR = join(ROOT, "src-tauri", "icons");
 
-// --- Waveform ring path generation ---
+function writeIfChanged(path, content) {
+  try {
+    if (readFileSync(path).equals(Buffer.isBuffer(content) ? content : Buffer.from(content))) return false;
+  } catch { /* The generated asset does not exist yet. */ }
+  writeFileSync(path, content);
+  return true;
+}
+
 const CX = 512, CY = 512, R = 290;
 const NUM_PEAKS = 80;
-
-function generateWaveformPath() {
-  const points = [];
-  for (let i = 0; i <= NUM_PEAKS; i++) {
-    const angle = (i / NUM_PEAKS) * Math.PI * 2 - Math.PI / 2;
-    // Combine 3 sine waves for organic waveform shape
-    const wave =
-      0.5 * Math.sin(i * 0.8) +
-      0.3 * Math.sin(i * 1.7 + 1.2) +
-      0.2 * Math.sin(i * 3.1 + 0.5);
-    const amplitude = 25 + Math.abs(wave) * 65; // 25–90px
-    const innerR = R - amplitude;
-    const outerR = R + amplitude;
-    const xi = CX + innerR * Math.cos(angle);
-    const yi = CY + innerR * Math.sin(angle);
-    const xo = CX + outerR * Math.cos(angle);
-    const yo = CY + outerR * Math.sin(angle);
-    points.push({ xi, yi, xo, yo });
-  }
-
-  // Build SVG path: draw each peak as a line from inner to outer
-  let d = "";
-  for (const p of points) {
-    d += `M${p.xi.toFixed(1)},${p.yi.toFixed(1)}L${p.xo.toFixed(1)},${p.yo.toFixed(1)} `;
-  }
-  return d;
-}
 
 // Loop gap: remove peaks between ~330° and ~360° (gap at 2 o'clock)
 const GAP_START = 0.92; // fraction of full circle (~331°)
@@ -119,8 +99,7 @@ const svg = `<?xml version="1.0" encoding="UTF-8"?>
 const svgPath = join(ROOT, ".dev", "icon-source.svg");
 mkdirSync(dirname(svgPath), { recursive: true });
 mkdirSync(ICONS_DIR, { recursive: true });
-writeFileSync(svgPath, svg);
-console.log(`✓ SVG written to ${svgPath}`);
+if (writeIfChanged(svgPath, svg)) console.log(`✓ SVG written to ${svgPath}`);
 
 // --- Now generate PNGs using sharp ---
 let sharp;
@@ -141,11 +120,11 @@ const sizes = [
 
 for (const { name, size } of sizes) {
   const outPath = join(ICONS_DIR, name);
-  await sharp(svgPath)
+  const png = await sharp(svgPath)
     .resize(size, size)
     .png()
-    .toFile(outPath);
-  console.log(`✓ ${name} (${size}x${size})`);
+    .toBuffer();
+  if (writeIfChanged(outPath, png)) console.log(`✓ ${name} (${size}x${size})`);
 }
 
 // Generate icns for macOS. The Windows build uses the committed icon.ico;
@@ -168,8 +147,10 @@ if (process.platform === "darwin") {
       }
     }
 
-    execSync(`iconutil -c icns "${tmpDir}" -o "${icnsPath}"`);
-    console.log(`✓ icon.icns (macOS)`);
+    const generatedIcnsPath = join(ROOT, ".dev", "icon.generated.icns");
+    execSync(`iconutil -c icns "${tmpDir}" -o "${generatedIcnsPath}"`);
+    if (writeIfChanged(icnsPath, readFileSync(generatedIcnsPath))) console.log(`✓ icon.icns (macOS)`);
+    rmSync(generatedIcnsPath, { force: true });
   } catch (e) {
     console.error(`icns generation failed: ${e.message}`);
     process.exit(1);

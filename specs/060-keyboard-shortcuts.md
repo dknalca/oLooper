@@ -2,15 +2,16 @@
 
 ## Scope
 
-Frontend keyboard shortcuts for hands-free transport, loop toggle, and cue slots.
+Frontend keyboard shortcuts for hands-free library browsing, transport, loop
+toggle, and cue slots.
 No global shortcuts plugin; listener runs only while the app window is focused.
 
 ## User-visible behavior
 
-1. When the app window is focused and no text input is active, keyboard
-   shortcuts control playback and toggle looping.
-2. Shortcuts are disabled when the user is typing in any `<input>` or
-   `<textarea>` element (checked via `document.activeElement`).
+1. When the app window is focused and no text input is active, arrow keys browse
+   library collections and loops; transport shortcuts control playback.
+2. Shortcuts are disabled when the user is typing in an `<input>`, `<textarea>`,
+   `<select>`, or contenteditable element (checked via `document.activeElement`).
 3. Modifier keys (Cmd/Ctrl/Alt) are ignored to preserve system shortcuts
    (Cmd+C, Cmd+V, etc.).
 4. `Cmd+O` opens the native **File → Import Files…** picker.
@@ -23,8 +24,10 @@ No global shortcuts plugin; listener runs only while the app window is focused.
 |-----|--------|------------|
 | `Space` | Play / Pause toggle | Track loaded |
 | `S` | Stop (return to loop start) | Track loaded |
-| `←` (Left arrow) | Seek -5 seconds | Track loaded |
-| `→` (Right arrow) | Seek +5 seconds | Track loaded |
+| `↑` / `↓` | Move through collections or loops | Local library view |
+| `→` (Right arrow) | Enter collection / load and play selected loop | Local library view |
+| `←` (Left arrow) | Return to collections; no-op at collection level | Local library view |
+| `Shift+←` / `Shift+→` | Seek -/+5 seconds | Track loaded |
 | `L` | Toggle loop on/off | Track loaded |
 | `1` | Recall CUE 1 / track start | Track loaded |
 | `2`–`4` | Recall CUE, or save it if empty | Track loaded |
@@ -35,8 +38,11 @@ No global shortcuts plugin; listener runs only while the app window is focused.
 
 ## Architecture
 
-- `src/hooks/useKeyboardShortcuts.ts` — transport shortcuts use a focused-window
-  key listener. File-import shortcut is provided by the native application menu.
+- `src/hooks/useKeyboardShortcuts.ts` — transport and library shortcuts use a
+  focused-window key listener. File-import shortcut is provided by the native
+  application menu.
+- Library arrow shortcuts dispatch the same navigation commands as MIDI and are
+  active only in the local library view.
 - CUE shortcuts dispatch `olooper:cue-shortcut`; Player reads/writes cue markers
   in the current track's audio file.
 - The native Edit menu exposes platform text-editing actions; File menu actions
@@ -51,7 +57,7 @@ No global shortcuts plugin; listener runs only while the app window is focused.
 
 - **Rapid key repeats**: async player calls are chained via a promise
   ref (`pendingRef`) to avoid races.
-- **No track loaded**: all transport shortcuts are no-ops.
+- **No track loaded**: transport shortcuts are no-ops; library navigation remains available.
 - **Seek bounds**: clamped to `[0, duration_ms]`.
 
 ## Persistence behavior
@@ -63,7 +69,10 @@ No global shortcuts plugin; listener runs only while the app window is focused.
 
 - [x] Space toggles play/pause when a track is loaded.
 - [x] S stops playback and returns to loop start.
-- [x] Arrow keys seek ±5s, clamped to track bounds.
+- [x] Arrow keys navigate library collections and loops; Right enters/plays and
+  Left returns to collections.
+- [x] Loop selection wraps between the first and last loop in a collection.
+- [x] Shift+Left/Right seek ±5s, clamped to track bounds.
 - [x] L toggles loop enabled flag.
 - [x] `1` recalls CUE 1; `2`–`4` recall or save cues; Shift+`2`–`4` clears them.
 - [x] `+` and `-` change playback speed in 5% steps (50–200%).

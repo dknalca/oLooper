@@ -46,9 +46,10 @@ export function navigateMidiLibrary(
     return { state: { level: "collections", collectionIndex }, playTrackId: null };
   }
   if (action === "up" || action === "down") {
+    const direction = action === "up" ? -1 : 1;
     const trackIndex = trackCount === 0
       ? 0
-      : Math.max(0, Math.min(trackCount - 1, state.trackIndex + (action === "up" ? -1 : 1)));
+      : ((state.trackIndex % trackCount) + trackCount + direction) % trackCount;
     return { state: { level: "tracks", collectionIndex, trackIndex }, playTrackId: null };
   }
   const trackId = collection.trackIds[state.trackIndex];

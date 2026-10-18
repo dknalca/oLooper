@@ -22,14 +22,11 @@ import {
   midiDisconnectOutput,
   midiDisconnect,
   midiSetLed,
-  playerAutoLoop,
   playerLoadTrack,
   playerUnload,
   playerPause,
   playerPlay,
-  playerSetLoopEnabled,
-  playerSetLoopSnapped,
-  playerSetSpeed,
+  playerSetVolume,
   playerSetDiagnostics,
   playerStatus as getPlayerStatus,
   playerStop,
@@ -104,7 +101,6 @@ function sameMidiBinding(left: MidiBinding, right: MidiBinding): boolean {
 }
 
 export default function App() {
-  useKeyboardShortcuts();
   const [libraryReady, setLibraryReady] = useState(false);
   const [libraryGeneration, setLibraryGeneration] = useState(0);
   const [startupIntroDone, setStartupIntroDone] = useState(false);
@@ -116,6 +112,9 @@ export default function App() {
   const [activeCover, setActiveCover] = useState<string | null>(null);
   const [trackNavigator, setTrackNavigator] = useState<TrackNavigator | null>(null);
   const [libraryView, setLibraryView] = useState<"local" | "tablist">("local");
+  const libraryViewRef = useRef(libraryView);
+  libraryViewRef.current = libraryView;
+  useKeyboardShortcuts(libraryView === "local");
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
   const [loopEditing, setLoopEditing] = useState(false);
   const [midiOptionsOpen, setMidiOptionsOpen] = useState(false);
@@ -304,12 +303,34 @@ export default function App() {
       if (direction !== 0) midiLibraryNavigatorRef.current(direction > 0 ? "down" : "up");
       return;
     }
+    if (action === "library-up") {
+      midiLibraryNavigatorRef.current("up");
+      return;
+    }
+    if (action === "library-down") {
+      midiLibraryNavigatorRef.current("down");
+      return;
+    }
     if (action === "library-intro") {
       midiLibraryNavigatorRef.current("intro");
       return;
     }
     if (action === "library-back") {
       midiLibraryNavigatorRef.current("back");
+      return;
+    }
+    if (action === "metronome-toggle") {
+      window.dispatchEvent(new Event("olooper:metronome-toggle"));
+      return;
+    }
+    if (action === "volume-down" || action === "volume-up") {
+      const currentVolume = playerStatus?.volume_pct ?? 80;
+      const volume = action === "volume-down" ? Math.max(0, currentVolume - 5) : Math.min(100, currentVolume + 5);
+      playerSetVolume(volume).then(setPlayerStatus).catch(() => {});
+      return;
+    }
+    if (action === "random-loop") {
+      playRandomTrack().catch(() => {});
       return;
     }
     if (action === "play-pause" && !playerStatus?.loaded) {
@@ -328,23 +349,6 @@ export default function App() {
       trackNavigator?.(-1);
     } else if (action === "next") {
       trackNavigator?.(1);
-    } else if (action === "toggle-loop") {
-      publishStatus(playerSetLoopEnabled(!playerStatus.loop_enabled));
-    } else if (action === "speed-down") {
-      publishStatus(playerSetSpeed(Math.max(50, playerStatus.speed_pct - 5)));
-    } else if (action === "speed-up") {
-      publishStatus(playerSetSpeed(Math.min(200, playerStatus.speed_pct + 5)));
-    } else if (action === "auto-loop") {
-      playerAutoLoop()
-        .then((result) => {
-          if (!result.candidate) throw new Error("No suitable loop found");
-          return playerSetLoopSnapped(
-            Math.round(result.candidate.start_frame * 1000 / result.sample_rate),
-            Math.round(result.candidate.end_frame * 1000 / result.sample_rate),
-          );
-        })
-        .then(setPlayerStatus)
-        .catch(() => {});
     } else if (action.startsWith("clear-cue-")) {
       const slot = Number(action.slice("clear-cue-".length));
       window.dispatchEvent(new CustomEvent("olooper:cue-shortcut", { detail: { slot, clear: true } }));
@@ -486,6 +490,16 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    const handleLibraryNavigation = (event: Event) => {
+      if (libraryViewRef.current !== "local") return;
+      const command = (event as CustomEvent<MidiLibraryCommand>).detail;
+      midiLibraryNavigatorRef.current(command);
+    };
+    window.addEventListener("olooper:library-navigation", handleLibraryNavigation);
+    return () => window.removeEventListener("olooper:library-navigation", handleLibraryNavigation);
+  }, []);
+
+  useEffect(() => {
     let unlisten: (() => void) | undefined;
     listenAppMenuCommand((command) => {
       if (command === "show-shortcuts") {
@@ -610,7 +624,9 @@ export default function App() {
                 <h3 className="mb-2 text-[10px] font-semibold uppercase tracking-wider text-text-secondary">Playback</h3>
                 <ShortcutRow keys="Space" action="Play / pause" />
                 <ShortcutRow keys="S" action="Stop at loop start" />
-                <ShortcutRow keys="← / →" action="Seek 5 seconds" />
+                <ShortcutRow keys="↑ / ↓" action="Browse library collections and loops" />
+                <ShortcutRow keys="→ / ←" action="Enter / play selection or go back" />
+                <ShortcutRow keys="⇧ + ← / →" action="Seek 5 seconds" />
                 <ShortcutRow keys="L" action="Toggle looping" />
                 <ShortcutRow keys="1–4" action="Recall a cue; save an empty cue at the current position" />
                 <ShortcutRow keys="Shift + 2–4" action="Clear a saved cue" />
@@ -626,7 +642,7 @@ export default function App() {
                 <ShortcutRow keys="⌘ / Ctrl + X / C / V / A" action="Cut / copy / paste / select all" />
               </section>
             </div>
-            <p className="mt-4 text-[10px] text-text-secondary">Transport shortcuts are disabled while typing in text fields.</p>
+            <p className="mt-4 text-[10px] text-text-secondary">Keyboard controls are disabled while typing or using a dialog. Hold Shift with Left/Right to seek.</p>
           </section>
         </div>
       )}

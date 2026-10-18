@@ -33,10 +33,10 @@ export function exposePlayerState(state: {
 function isTextInput(el: Element | null): boolean {
   if (!el) return false;
   const tag = el.tagName.toLowerCase();
-  return tag === "input" || tag === "textarea" || (el as HTMLElement).isContentEditable;
+  return tag === "input" || tag === "textarea" || tag === "select" || (el as HTMLElement).isContentEditable;
 }
 
-export default function useKeyboardShortcuts() {
+export default function useKeyboardShortcuts(libraryNavigationEnabled = true) {
   const pendingRef = useRef<Promise<void>>(Promise.resolve());
 
   // Chain async player calls to avoid races.
@@ -62,6 +62,8 @@ export default function useKeyboardShortcuts() {
       if (isTextInput(document.activeElement)) return;
       // Dialog controls own Space/Enter; tapping tempo must not toggle playback.
       if (document.activeElement?.closest('[role="dialog"]')) return;
+      // The library-view tabs already own left/right arrow navigation.
+      if (e.target instanceof Element && e.target.closest('[role="tablist"]')) return;
       // Skip other modified shortcuts (allow Cmd+C, Cmd+V, etc.).
       if (e.metaKey || e.ctrlKey || e.altKey) return;
 
@@ -93,7 +95,9 @@ export default function useKeyboardShortcuts() {
         }
         case "ArrowLeft": {
           e.preventDefault();
-          if (isLoaded) {
+          if (libraryNavigationEnabled && !e.shiftKey) {
+            window.dispatchEvent(new CustomEvent("olooper:library-navigation", { detail: "back" }));
+          } else if (isLoaded) {
             const target = Math.max(0, currentPositionMs - 5000);
             chain(() => playerSeek(target));
           }
@@ -101,10 +105,21 @@ export default function useKeyboardShortcuts() {
         }
         case "ArrowRight": {
           e.preventDefault();
-          if (isLoaded) {
+          if (libraryNavigationEnabled && !e.shiftKey) {
+            window.dispatchEvent(new CustomEvent("olooper:library-navigation", { detail: "intro" }));
+          } else if (isLoaded) {
             const target = Math.min(durationMs, currentPositionMs + 5000);
             chain(() => playerSeek(target));
           }
+          break;
+        }
+        case "ArrowUp":
+        case "ArrowDown": {
+          if (!libraryNavigationEnabled) break;
+          e.preventDefault();
+          window.dispatchEvent(new CustomEvent("olooper:library-navigation", {
+            detail: e.code === "ArrowUp" ? "up" : "down",
+          }));
           break;
         }
         case "KeyL": {
@@ -119,5 +134,5 @@ export default function useKeyboardShortcuts() {
 
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, []);
+  }, [libraryNavigationEnabled]);
 }
