@@ -33,6 +33,9 @@ export const MIDI_ACTIONS: { id: MidiAction; label: string; group: string }[] = 
     label: `Clear CUE ${index + 2}`,
     group: "Cues",
   })),
+  { id: "library-encoder", label: "Library encoder (relative CC)", group: "Library" },
+  { id: "library-intro", label: "Library Intro", group: "Library" },
+  { id: "library-back", label: "Library Back", group: "Library" },
 ];
 
 interface Props {
@@ -247,7 +250,7 @@ export default function MidiSettingsDialog({
         )}
 
         <div className="min-h-0 flex-1 overflow-y-auto">
-          {(["Transport", "Cues"] as const).map((group) => (
+          {(["Transport", "Cues", "Library"] as const).map((group) => (
             <section key={group} className="mb-4">
               <h3 className="mb-2 text-[10px] font-semibold uppercase tracking-wider text-text-secondary">{group}</h3>
               <div className="divide-y divide-border/60 rounded border border-border px-3">
@@ -258,7 +261,7 @@ export default function MidiSettingsDialog({
                     <div key={id} className="flex min-h-10 items-center gap-3 py-1.5">
                       <span className="min-w-0 flex-1 truncate text-xs text-text">{label}</span>
                       <span className="min-w-0 truncate text-right text-[10px] text-text-secondary">
-                        {learning ? "Press a pad or CC button…" : binding ? bindingLabel(binding) : "Unassigned"}
+                        {learning ? id === "library-encoder" ? "Turn the encoder…" : "Press a pad or CC button…" : binding ? bindingLabel(binding) : "Unassigned"}
                       </span>
                       <button
                         onClick={() => onLearningChange(learning ? null : id)}
@@ -273,7 +276,7 @@ export default function MidiSettingsDialog({
             </section>
           ))}
         </div>
-        <p className="mt-2 text-[10px] text-text-secondary">Note On triggers on press. CC controls are treated as buttons: one action on 0→nonzero, re-armed at 0. Assignments are stored locally per input.</p>
+        <p className="mt-2 text-[10px] text-text-secondary">Note On triggers on press. Button CCs trigger on 0→nonzero. The library encoder uses relative CC values below 64 for down and above 64 for up; 0 and 64 are ignored. Assignments are stored locally per input.</p>
       </section>
     </div>
   );

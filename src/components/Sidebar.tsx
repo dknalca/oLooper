@@ -34,6 +34,7 @@ import {
 } from "../tauri";
 import { recordTempoTap } from "../tapTempo";
 import { IMPORTED_AUDIO_GROUP_KEY, libraryGroupKey, libraryGroupName } from "../libraryGroups";
+import { navigateMidiLibrary, type MidiLibraryNavigationAction, type MidiLibraryNavigationState } from "../midiLibraryNavigation";
 
 interface Props {
   libraryReady: boolean;
@@ -41,6 +42,7 @@ interface Props {
   refreshKey: number;
   activeTrackId: number | null;
   onRegisterTrackNavigation: (navigate: ((direction: -1 | 1) => void) | null) => void;
+  onRegisterMidiLibraryNavigation: (navigate: ((command: MidiLibraryNavigationAction) => void) | null) => void;
   onTrackLoading: () => void;
   onTrackSelected: (track: Track, status: Awaited<ReturnType<typeof playerPlay>>) => void;
 }
@@ -76,7 +78,7 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-export default function Sidebar({ libraryReady, libraryGeneration, refreshKey, activeTrackId, onRegisterTrackNavigation, onTrackLoading, onTrackSelected }: Props) {
+export default function Sidebar({ libraryReady, libraryGeneration, refreshKey, activeTrackId, onRegisterTrackNavigation, onRegisterMidiLibraryNavigation, onTrackLoading, onTrackSelected }: Props) {
   const [tracks, setTracks] = useState<Track[]>([]);
   const [playlists, setPlaylists] = useState<Playlist[]>([]);
   const [looperOrder, setLooperOrder] = useState<string[]>([]);
@@ -95,6 +97,7 @@ export default function Sidebar({ libraryReady, libraryGeneration, refreshKey, a
       : DEFAULT_LOOPER_PANE_WIDTH;
   });
   const [selectedGroup, setSelectedGroup] = useState(() => localStorage.getItem("olooper.library.selectedGroup") ?? ALL_GROUP);
+  const [midiNavigationState, setMidiNavigationState] = useState<MidiLibraryNavigationState>({ level: "collections", collectionIndex: 0 });
   const hasFilters = search !== "" || sourceFilter !== "all" || bpmFilter !== "all" || durationFilter !== "all";
   const clearFilters = () => {
     setSearch("");
@@ -174,6 +177,9 @@ export default function Sidebar({ libraryReady, libraryGeneration, refreshKey, a
     setPlaylists([]);
     setLooperOrder([]);
     setSelectedGroup(FAVORITES_GROUP);
+    const initialMidiNavigation: MidiLibraryNavigationState = { level: "collections", collectionIndex: 1 };
+    midiNavigationStateRef.current = initialMidiNavigation;
+    setMidiNavigationState(initialMidiNavigation);
     setActiveId(null);
     setSelectedIds([]);
     setContextMenu(null);
@@ -334,6 +340,68 @@ export default function Sidebar({ libraryReady, libraryGeneration, refreshKey, a
     })
     : sorted.filter((track) => selectedGroup === ALL_GROUP
       || (selectedGroup === FAVORITES_GROUP ? track.favorite : groupKey(track) === selectedGroup));
+  const tracksById = new Map(tracks.map((track) => [track.id, track]));
+  const midiCollections = [
+    { key: ALL_GROUP, trackIds: sorted.map((track) => track.id) },
+    { key: FAVORITES_GROUP, trackIds: sorted.filter((track) => track.favorite).map((track) => track.id) },
+    ...playlists.map((playlist) => ({
+      key: `${PLAYLIST_PREFIX}${playlist.id}`,
+      trackIds: playlist.track_ids.flatMap((id) => filteredById.has(id) ? [id] : []),
+    })),
+    ...looperGroups.map((group) => ({
+      key: groupKey(group[0]),
+      trackIds: sorted.filter((track) => groupKey(track) === groupKey(group[0])).map((track) => track.id),
+    })),
+  ];
+  const selectCollection = (key: string) => {
+    setSelectedGroup(key);
+    const collectionIndex = midiCollections.findIndex((collection) => collection.key === key);
+    if (collectionIndex < 0) return;
+    const nextState: MidiLibraryNavigationState = { level: "collections", collectionIndex };
+    midiNavigationStateRef.current = nextState;
+    setMidiNavigationState(nextState);
+  };
+  const midiNavigationStateRef = useRef(midiNavigationState);
+  midiNavigationStateRef.current = midiNavigationState;
+  const midiNavigationActionRef = useRef<(action: MidiLibraryNavigationAction) => void>(() => {});
+  midiNavigationActionRef.current = (action) => {
+    const result = navigateMidiLibrary(midiNavigationStateRef.current, action, midiCollections);
+    midiNavigationStateRef.current = result.state;
+    setMidiNavigationState(result.state);
+    const collection = midiCollections[result.state.collectionIndex];
+    if (!collection) return;
+    setSelectedGroup(collection.key);
+    if (result.state.level === "tracks") {
+      const trackId = collection.trackIds[result.state.trackIndex] ?? null;
+      setActiveId(trackId);
+      if (result.playTrackId !== null) {
+        const track = tracksById.get(result.playTrackId);
+        if (track) void playTrack(track);
+      }
+    }
+  };
+
+  useEffect(() => {
+    if (!libraryReady) {
+      onRegisterMidiLibraryNavigation(null);
+      return;
+    }
+    const navigate = (action: MidiLibraryNavigationAction) => midiNavigationActionRef.current(action);
+    onRegisterMidiLibraryNavigation(navigate);
+    return () => onRegisterMidiLibraryNavigation(null);
+  }, [libraryReady, onRegisterMidiLibraryNavigation]);
+
+  useEffect(() => {
+    if (!catalogLoaded || midiNavigationState.level !== "collections") return;
+    const collectionIndex = midiCollections.findIndex((collection) => collection.key === selectedGroup);
+    if (collectionIndex < 0 || collectionIndex === midiNavigationState.collectionIndex) return;
+    const nextState: MidiLibraryNavigationState = { level: "collections", collectionIndex };
+    midiNavigationStateRef.current = nextState;
+    setMidiNavigationState(nextState);
+    // Initialize the hardware cursor from the currently selected collection once
+    // the library data has arrived.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [catalogLoaded]);
   const hasPlayableTracks = selectedTracks.some((track) => track.exists);
   const favoritesCount = tracks.filter((track) => track.favorite).length;
   const selectedLooper = looperGroups.find((group) => groupKey(group[0]) === selectedGroup)?.[0];
@@ -346,10 +414,10 @@ export default function Sidebar({ libraryReady, libraryGeneration, refreshKey, a
       && tracks.length > 0
       && !selectedLooper
     ) {
-      setSelectedGroup(FAVORITES_GROUP);
+      selectCollection(FAVORITES_GROUP);
     }
     if (catalogLoaded && selectedGroup.startsWith(PLAYLIST_PREFIX) && !selectedPlaylist) {
-      setSelectedGroup(FAVORITES_GROUP);
+      selectCollection(FAVORITES_GROUP);
     }
   }, [catalogLoaded, selectedGroup, selectedLooper, selectedPlaylist, tracks.length]);
 
@@ -928,7 +996,7 @@ export default function Sidebar({ libraryReady, libraryGeneration, refreshKey, a
           </div>
           <div className="min-h-0 flex-1 overflow-y-auto p-1.5">
             <button
-              onClick={() => setSelectedGroup(ALL_GROUP)}
+              onClick={() => selectCollection(ALL_GROUP)}
               aria-current={selectedGroup === ALL_GROUP ? "page" : undefined}
               className={`mb-1 flex w-full items-center gap-2 rounded px-2 py-2 text-left transition-colors ${selectedGroup === ALL_GROUP ? "bg-accent/15 text-accent" : "text-text-secondary hover:bg-surface-hover hover:text-text"}`}
             >
@@ -937,7 +1005,7 @@ export default function Sidebar({ libraryReady, libraryGeneration, refreshKey, a
               <span className="text-[10px] tabular-nums">{tracks.length}</span>
             </button>
             <button
-              onClick={() => setSelectedGroup(FAVORITES_GROUP)}
+              onClick={() => selectCollection(FAVORITES_GROUP)}
               data-drop-favorites=""
               aria-current={selectedGroup === FAVORITES_GROUP ? "page" : undefined}
               className={`mb-1 flex w-full items-center gap-2 rounded px-2 py-2 text-left transition-colors ${dropTarget?.kind === "favorites" ? "bg-accent/25 ring-1 ring-accent" : selectedGroup === FAVORITES_GROUP ? "bg-accent/15 text-accent" : "text-text-secondary hover:bg-surface-hover hover:text-text"}`}
@@ -959,7 +1027,7 @@ export default function Sidebar({ libraryReady, libraryGeneration, refreshKey, a
                   data-drop-playlist={playlist.id}
                   className={`group flex items-center rounded transition-colors ${dropTarget?.kind === "playlist" && dropTarget.playlistId === playlist.id ? "bg-accent/25 ring-1 ring-accent" : isSelected ? "bg-accent/15 text-accent" : "text-text-secondary hover:bg-surface-hover hover:text-text"}`}
                 >
-                  <button onClick={() => setSelectedGroup(`${PLAYLIST_PREFIX}${playlist.id}`)} aria-current={isSelected ? "page" : undefined} className="flex min-w-0 flex-1 items-center gap-2 px-2 py-2 text-left">
+                  <button onClick={() => selectCollection(`${PLAYLIST_PREFIX}${playlist.id}`)} aria-current={isSelected ? "page" : undefined} className="flex min-w-0 flex-1 items-center gap-2 px-2 py-2 text-left">
                     <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded bg-border text-sm">♫</span>
                     <span className="min-w-0 flex-1 truncate text-xs font-medium">{playlist.name}</span>
                     <span className="text-[10px] tabular-nums">{playlist.track_ids.length}</span>
@@ -986,7 +1054,7 @@ export default function Sidebar({ libraryReady, libraryGeneration, refreshKey, a
                     // this wrapper instead of the nested selection button.
                     if (event.target !== event.currentTarget) return;
                     if (suppressRowClick.current) { suppressRowClick.current = false; return; }
-                    setSelectedGroup(sourceHash);
+                    selectCollection(sourceHash);
                   }}
                   onContextMenu={entries[0].source_type === "custom" ? undefined : (event) => openGroupMenu(event, sourceHash)}
                   className={`group flex select-none items-center rounded transition-colors ${dropTarget?.kind === "looper" && dropTarget.sourceHash === sourceHash ? "bg-accent/25 ring-1 ring-accent" : isSelected ? "bg-accent/15 text-accent" : "text-text-secondary hover:bg-surface-hover hover:text-text"}`}
@@ -994,7 +1062,7 @@ export default function Sidebar({ libraryReady, libraryGeneration, refreshKey, a
                   <button
                     onClick={() => {
                       if (suppressRowClick.current) { suppressRowClick.current = false; return; }
-                      setSelectedGroup(sourceHash);
+                      selectCollection(sourceHash);
                     }}
                     aria-current={isSelected ? "page" : undefined}
                     className="flex min-w-0 flex-1 items-center gap-2 px-2 py-2 text-left"

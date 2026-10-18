@@ -533,7 +533,10 @@ export type MidiAction =
   | "cue-4"
   | "clear-cue-2"
   | "clear-cue-3"
-  | "clear-cue-4";
+  | "clear-cue-4"
+  | "library-encoder"
+  | "library-intro"
+  | "library-back";
 
 export interface MidiInputInfo {
   id: string;

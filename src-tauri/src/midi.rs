@@ -1,6 +1,6 @@
 //! MIDI input discovery and discrete Note On / Control Change events.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use midir::{
     Ignore, MidiInput, MidiInputConnection, MidiInputPort, MidiOutput, MidiOutputConnection,
@@ -22,7 +22,7 @@ pub type MidiOutputInfo = MidiInputInfo;
 pub struct MidiMessage {
     pub input_id: String,
     pub input_name: String,
-    /// "note" or "cc". CC is emitted only on a discrete 0 -> nonzero press.
+    /// "note" or "cc". CC messages include their raw value, including zero releases.
     pub kind: MidiMessageKind,
     /// One-based MIDI channel (1–16).
     pub channel: u8,
@@ -48,7 +48,7 @@ pub enum MidiMessageKind {
 
 enum ParsedMidiMessage {
     Press(MidiMessage),
-    CcRelease { channel: u8, number: u8 },
+    CcRelease(MidiMessage),
 }
 
 fn parse_message(input: &MidiInputInfo, bytes: &[u8]) -> Option<ParsedMidiMessage> {
@@ -63,7 +63,16 @@ fn parse_message(input: &MidiInputInfo, bytes: &[u8]) -> Option<ParsedMidiMessag
         // Note On with velocity zero is a MIDI Note Off.
         0x90 if value > 0 => MidiMessageKind::Note,
         0xb0 if value > 0 => MidiMessageKind::Cc,
-        0xb0 => return Some(ParsedMidiMessage::CcRelease { channel, number }),
+        0xb0 => {
+            return Some(ParsedMidiMessage::CcRelease(MidiMessage {
+                input_id: input.id.clone(),
+                input_name: input.name.clone(),
+                kind: MidiMessageKind::Cc,
+                channel,
+                number,
+                value,
+            }))
+        }
         _ => return None,
     };
     Some(ParsedMidiMessage::Press(MidiMessage {
@@ -76,23 +85,9 @@ fn parse_message(input: &MidiInputInfo, bytes: &[u8]) -> Option<ParsedMidiMessag
     }))
 }
 
-fn take_discrete_press(
-    parsed: Option<ParsedMidiMessage>,
-    active_cc: &mut HashSet<(u8, u8)>,
-) -> Option<MidiMessage> {
+fn parsed_message(parsed: Option<ParsedMidiMessage>) -> Option<MidiMessage> {
     match parsed? {
-        ParsedMidiMessage::CcRelease { channel, number } => {
-            active_cc.remove(&(channel, number));
-            None
-        }
-        ParsedMidiMessage::Press(message) => {
-            if message.kind == MidiMessageKind::Cc
-                && !active_cc.insert((message.channel, message.number))
-            {
-                return None;
-            }
-            Some(message)
-        }
+        ParsedMidiMessage::CcRelease(message) | ParsedMidiMessage::Press(message) => Some(message),
     }
 }
 
@@ -264,16 +259,13 @@ impl MidiManager {
 
         let app = app.clone();
         let callback_info = info.clone();
-        let mut active_cc = HashSet::<(u8, u8)>::new();
         let connection = input
             .connect(
                 &port,
                 "olooper-midi-input",
-                move |_timestamp, bytes, _| match parse_message(&callback_info, bytes) {
-                    parsed => {
-                        if let Some(message) = take_discrete_press(parsed, &mut active_cc) {
-                            let _ = app.emit("olooper:midi-message", message);
-                        }
+                move |_timestamp, bytes, _| {
+                    if let Some(message) = parsed_message(parse_message(&callback_info, bytes)) {
+                        let _ = app.emit("olooper:midi-message", message);
                     }
                 },
                 (),
@@ -360,30 +352,22 @@ mod tests {
         );
         assert!(matches!(
             parse_message(&test_input(), &[0xb4, 7, 0]),
-            Some(ParsedMidiMessage::CcRelease {
+            Some(ParsedMidiMessage::CcRelease(MidiMessage {
                 channel: 5,
-                number: 7
-            })
+                number: 7,
+                value: 0,
+                ..
+            }))
         ));
     }
 
     #[test]
-    fn cc_repeated_nonzero_values_emit_once_until_zero_rearms() {
+    fn repeated_cc_values_and_zero_release_are_forwarded() {
         let input = test_input();
-        let mut active_cc = HashSet::new();
-
-        assert!(
-            take_discrete_press(parse_message(&input, &[0xb4, 7, 127]), &mut active_cc).is_some()
-        );
-        assert!(
-            take_discrete_press(parse_message(&input, &[0xb4, 7, 64]), &mut active_cc).is_none()
-        );
-        assert!(
-            take_discrete_press(parse_message(&input, &[0xb4, 7, 0]), &mut active_cc).is_none()
-        );
-        assert!(
-            take_discrete_press(parse_message(&input, &[0xb4, 7, 1]), &mut active_cc).is_some()
-        );
+        for value in [127, 127, 64, 0, 1] {
+            let message = parsed_message(parse_message(&input, &[0xb4, 7, value])).unwrap();
+            assert_eq!(message.value, value);
+        }
     }
 
     #[test]

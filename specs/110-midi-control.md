@@ -21,6 +21,12 @@ Options…**, with assignments remembered locally.
   re-arms that control. Continuous CC values do not drive parameters.
 - Assignable actions: Play/Pause, Stop, Previous/Next, Toggle Loop, AUTO loop,
   Speed ±5%, CUE 1–4, and Clear CUE 2–4. CUE 1 recalls the start of the track.
+- Library navigation has a relative CC encoder and Intro/Back buttons. The encoder
+  selects All tracks, Favorites, playlists, and loopers at the collection level,
+  then loops within the selected collection. Intro enters a collection and then
+  loads/plays the selected loop; Back returns from loops to the collection level
+  and is a no-op at the collection level. Encoder values below 64 move down,
+  values above 64 move up, and 0/64 are ignored.
 - Assignments and the selected input/output IDs persist in local application storage;
   no SQLite migration is required.
 - A separately selected MIDI output sends Note On/Off or CC 127/0 feedback for
@@ -31,12 +37,17 @@ Options…**, with assignments remembered locally.
 ## Architecture
 
 - `src-tauri/src/midi.rs` owns MIDI input/output enumeration and connection and
-  parses incoming channel messages. The input callback emits data only; it never
-  calls player or library commands directly.
+  parses incoming channel messages. CC values, including zero releases, are
+  forwarded to the frontend; the input callback never calls player or library
+  commands directly.
 - Tauri MIDI commands and the `olooper:midi-message` event are bridged through
   `src/tauri.ts`.
 - App maps one-to-one bindings to an explicit `MidiAction` allowlist and invokes
   the same transport/cue operations as the UI.
+- The library sidebar owns navigation state and playback selection; App routes
+  encoder direction and Intro/Back commands to the sidebar.
+- App gates button CC actions on 0→nonzero edges while forwarding every nonzero
+  value from the relative library encoder.
 - MIDI Learn temporarily captures the next supported Note On or discrete CC
   press, then saves the binding locally.
 
@@ -53,6 +64,10 @@ Options…**, with assignments remembered locally.
 - [x] MIDI Learn binds Note On and CC controls to supported app actions.
 - [x] CC assignments trigger only on a zero-to-nonzero transition.
 - [x] Duplicate control assignments move to the most recently learned action.
+- [x] MIDI encoder navigates library collections and loops; Intro loads/plays and
+  Back returns to collections.
+- [x] Consecutive relative encoder turns are received even when the controller
+  sends no zero value between detents; button CCs still trigger once per press.
 - [x] MIDI input parsing is unit-tested without physical hardware.
 - [ ] Assignments send discrete output feedback and clear their LEDs when removed.
 

@@ -1,5 +1,13 @@
 # Release notes
 
+## 0.7.1-preview.1 (MIDI controller preview)
+
+- Browse library collections and loops from MIDI with a relative encoder and
+  Intro/Back buttons. Intro enters a collection, then loads and plays the
+  selected loop; Back returns to the collection list.
+- Support repeated relative encoder CC values while keeping button CC actions
+  edge-triggered.
+
 ## 0.7.0
 
 - Refresh the practice workspace with clearer visual hierarchy, accessible tab

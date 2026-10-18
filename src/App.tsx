@@ -35,6 +35,7 @@ import {
   playerStop,
   type MidiAction,
   type MidiBinding,
+  type MidiMessage,
   type AudioOutputSelection,
   type PlayerStatus,
   type Track,
@@ -42,8 +43,10 @@ import {
 import { firstMidiStartTrack } from "./midiPlayback";
 import { normalizeStereoPair } from "./audioOutputPreferences";
 import { copySourcePreference } from "./importFlow";
+import { midiEncoderDirection } from "./midiLibraryNavigation";
 
 type TrackNavigator = (direction: -1 | 1) => void;
+type MidiLibraryCommand = "up" | "down" | "intro" | "back";
 type MidiBindings = Partial<Record<MidiAction, MidiBinding>>;
 
 function readAudioSelection(): AudioOutputSelection {
@@ -130,7 +133,9 @@ export default function App() {
   const midiBindingsRef = useRef(midiBindings);
   const previousLedBindingsRef = useRef(midiBindings);
   const midiLearningActionRef = useRef(midiLearningAction);
-  const midiActionHandlerRef = useRef<(action: MidiAction) => void>(() => {});
+  const midiActionHandlerRef = useRef<(action: MidiAction, message?: MidiMessage) => void>(() => {});
+  const midiLibraryNavigatorRef = useRef<(command: MidiLibraryCommand) => void>(() => {});
+  const activeMidiCcControlsRef = useRef(new Set<string>());
   midiBindingsRef.current = midiBindings;
   midiLearningActionRef.current = midiLearningAction;
 
@@ -229,6 +234,10 @@ export default function App() {
     setTrackNavigator(() => navigate);
   }, []);
 
+  const registerMidiLibraryNavigator = useCallback((navigate: ((command: MidiLibraryCommand) => void) | null) => {
+    midiLibraryNavigatorRef.current = navigate ?? (() => {});
+  }, []);
+
   const onTrackLoading = useCallback(() => {
     randomLoadGeneration.current += 1;
   }, []);
@@ -288,7 +297,21 @@ export default function App() {
     libraryMarkPlayed(track.id).then(onImported).catch(() => {});
   }, [onImported, onTrackSelected]);
 
-  const executeMidiAction = useCallback((action: MidiAction) => {
+  const executeMidiAction = useCallback((action: MidiAction, message?: MidiMessage) => {
+    if (action === "library-encoder") {
+      if (message?.kind !== "cc") return;
+      const direction = midiEncoderDirection(message.value);
+      if (direction !== 0) midiLibraryNavigatorRef.current(direction > 0 ? "down" : "up");
+      return;
+    }
+    if (action === "library-intro") {
+      midiLibraryNavigatorRef.current("intro");
+      return;
+    }
+    if (action === "library-back") {
+      midiLibraryNavigatorRef.current("back");
+      return;
+    }
     if (action === "play-pause" && !playerStatus?.loaded) {
       playFirstLibraryTrack().catch(() => {});
       return;
@@ -344,6 +367,7 @@ export default function App() {
   }, [midiBindings]);
 
   useEffect(() => {
+    activeMidiCcControlsRef.current.clear();
     if (midiInputId) localStorage.setItem("olooper.midi.input", midiInputId);
     else localStorage.removeItem("olooper.midi.input");
   }, [midiInputId]);
@@ -397,6 +421,7 @@ export default function App() {
     listenMidiMessage((message) => {
       const learning = midiLearningActionRef.current;
       if (learning) {
+        if (message.kind === "cc" && message.value === 0) return;
         const binding: MidiBinding = {
           inputId: message.inputId,
           inputName: message.inputName,
@@ -428,7 +453,22 @@ export default function App() {
           && binding.channel === message.channel
           && binding.number === message.number,
       );
-      if (assignment) midiActionHandlerRef.current(assignment[0] as MidiAction);
+      if (!assignment) return;
+      const action = assignment[0] as MidiAction;
+      if (message.kind === "cc") {
+        const controlKey = `${message.inputId}:${message.channel}:${message.number}`;
+        if (action === "library-encoder") {
+          if (message.value > 0) midiActionHandlerRef.current(action, message);
+          return;
+        }
+        if (message.value === 0) {
+          activeMidiCcControlsRef.current.delete(controlKey);
+          return;
+        }
+        if (activeMidiCcControlsRef.current.has(controlKey)) return;
+        activeMidiCcControlsRef.current.add(controlKey);
+      }
+      midiActionHandlerRef.current(action, message);
     }).then((dispose) => {
       if (cancelled) {
         dispose();
@@ -535,6 +575,7 @@ export default function App() {
                 refreshKey={refreshKey}
                 activeTrackId={activeTrackId}
                 onRegisterTrackNavigation={registerTrackNavigator}
+                onRegisterMidiLibraryNavigation={registerMidiLibraryNavigator}
                 onTrackLoading={onTrackLoading}
                 onTrackSelected={onTrackSelected}
               />
