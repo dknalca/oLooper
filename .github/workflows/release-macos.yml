@@ -47,9 +47,13 @@ jobs:
         shell: bash
         env:
           RELEASE_TAG: ${{ inputs.tag }}
+          MACOSX_DEPLOYMENT_TARGET: "11.0"
         run: |
           set -euo pipefail
-          ./scripts/build.sh
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+          node scripts/generate-icons.mjs
+          pnpm run tauri build --target universal-apple-darwin --bundles app
+          ditto src-tauri/target/universal-apple-darwin/release/bundle/macos/oLooper.app oLooper.app
           lipo -archs oLooper.app/Contents/MacOS/oLooper | grep -q x86_64
           lipo -archs oLooper.app/Contents/MacOS/oLooper | grep -q arm64
           plutil -extract LSMinimumSystemVersion raw -o - oLooper.app/Contents/Info.plist | grep -qx '11.0'
