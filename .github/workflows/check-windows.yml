@@ -45,6 +45,13 @@ jobs:
             if ($LASTEXITCODE -ne 0) { throw "NSIS installation failed." }
           }
           .\scripts\build.ps1
+      - name: Diagnose Windows loader failure
+        if: failure()
+        shell: pwsh
+        run: |
+          Get-ChildItem "src-tauri/target/x86_64-pc-windows-msvc/debug/deps/olooper-*.exe" | ForEach-Object {
+            python scripts/check-windows-imports.py $_.FullName
+          }
       - uses: actions/upload-artifact@v4
         with:
           name: windows-x64-installer
