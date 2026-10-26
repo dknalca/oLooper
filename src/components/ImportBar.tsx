@@ -1,5 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
+import { ownSubscription } from "../subscription";
+import { libraryLinkFolder, libraryLinkedFolders, librarySourceFolders, libraryRescanFolder, importLinkedFileAndWait, type LinkedFolder } from "../tauri";
+import { partialImportCounts } from "../tauri";
 import {
   importCustomAndWait,
   cancelImport,
@@ -37,6 +40,7 @@ const LOOPER_FILTERS = [{ name: "SWF/EXE loopers", extensions: ["swf", "exe"] }]
 export default function ImportBar({ onImported }: Props) {
   const [modePrompt, setModePrompt] = useState<{ count: number; folder?: string; resolve: (options: ContainerImportOptions | null) => void } | null>(null);
   const [promptCopySource, setPromptCopySource] = useState(false);
+  const [folders, setFolders] = useState<LinkedFolder[] | null>(null);
   const [busy, setBusy] = useState(false);
   const [dragging, setDragging] = useState(false);
   const [report, setReport] = useState<ImportReport | null>(null);
@@ -128,16 +132,14 @@ export default function ImportBar({ onImported }: Props) {
   };
 
   useEffect(() => {
-    let off: (() => void) | undefined;
-    listenImportProgress((next) => {
+    return ownSubscription(listenImportProgress((next) => {
       if (activeJobIdRef.current !== next.job_id) return;
       setProgress(next);
       const activePath = activePathRef.current;
       setFiles((current) => current.map((file) => file.path === next.detail || file.path === activePath
         ? { ...file, stage: next.stage, done: next.done, error: next.error }
         : file));
-    }).then((unlisten) => { off = unlisten; }).catch((e) => setError(`Import progress unavailable: ${String(e)}`));
-    return () => off?.();
+    }), (e) => setError(`Import progress unavailable: ${String(e)}`));
   }, []);
 
   useEffect(() => {
@@ -168,8 +170,7 @@ export default function ImportBar({ onImported }: Props) {
 
   // Webview drag&drop
   useEffect(() => {
-    let off: (() => void) | undefined;
-    getCurrentWebview()
+    return ownSubscription(getCurrentWebview()
       .onDragDropEvent((event) => {
         if (internalTrackDrag.current) return;
         if (event.payload.type === "over") {
@@ -202,10 +203,12 @@ export default function ImportBar({ onImported }: Props) {
                   const r = await runOwnedJob(path, (jobId) => importSwfAndWait(path, jobId, containerMode.mode === "extract", containerMode.copySource));
                   totalAdded += r.added;
                   totalExisting += r.already_there;
+                  if (r.failed.length) { totalFailed++; firstError ??= r.failed[0].reason; }
                 } else if (kind === "exe") {
                   const r = await runOwnedJob(path, (jobId) => importExeAndWait(path, jobId, containerMode.mode === "extract", containerMode.copySource));
                   totalAdded += r.added;
                   totalExisting += r.already_there;
+                  if (r.failed.length) { totalFailed++; firstError ??= r.failed[0].reason; }
                 } else {
                   const rs = await runOwnedJob(path, (jobId) => importCustomAndWait([path], jobId));
                   totalAdded += rs.filter((r) => r.added).length;
@@ -214,6 +217,9 @@ export default function ImportBar({ onImported }: Props) {
                   if (bad.length > 0) { totalFailed++; firstError ??= bad[0].error ?? "import failed"; }
                 }
               } catch (reason) {
+                const partial = partialImportCounts(reason);
+                totalAdded += partial.added;
+                totalExisting += partial.existing;
                 if (!cancelQueue.current) {
                   totalFailed++;
                   firstError ??= String(reason);
@@ -238,9 +244,7 @@ export default function ImportBar({ onImported }: Props) {
           setDragging(false);
         }
       })
-      .then((f) => { off = f; })
-      .catch((e) => setError(`Drag and drop unavailable: ${String(e)}`));
-    return () => off?.();
+      , (e) => setError(`Drag and drop unavailable: ${String(e)}`));
   }, [onImported]);
 
   const browseAndImport = async (
@@ -270,12 +274,22 @@ export default function ImportBar({ onImported }: Props) {
       setImportBusy(false);
       return;
     }
-    if (files.length === 0) {
+    if (files.length === 0 && !folder) {
       setImportBusy(false);
       return;
     }
     const containerMode = await chooseContainerMode(files, folder);
     if (!containerMode) { setImportBusy(false); return; }
+    let linked: LinkedFolder | undefined;
+    if (folder) {
+      try {
+        linked = await libraryLinkFolder(folder, containerMode.mode === "extract", containerMode.copySource);
+      } catch (cause) {
+        setError(String(cause));
+        setImportBusy(false);
+        return;
+      }
+    }
     beginImport(files);
     setError(null);
     setReport(null);
@@ -288,13 +302,20 @@ export default function ImportBar({ onImported }: Props) {
     for (const f of files) {
       if (cancelQueue.current) break;
       try {
-        const r = await runOwnedJob(f, (jobId) => importFn(f, jobId, containerMode));
+        const r = await runOwnedJob(f, (jobId) => linked
+          ? importLinkedFileAndWait(linked, f, jobId)
+          : importFn(f, jobId, containerMode));
         lastReport = r;
         totalAdded += r.added;
         totalExisting += r.already_there;
         failedSounds += r.failed.length;
       } catch (e) {
+        const partial = partialImportCounts(e);
+        totalAdded += partial.added;
+        totalExisting += partial.existing;
+        failedSounds += partial.failed;
         if (!cancelQueue.current) failures.push(`${f}: ${String(e)}`);
+        if (linked && String(e).includes("Library changed")) break;
       }
     }
     if (lastReport) setReport(lastReport);
@@ -314,6 +335,60 @@ export default function ImportBar({ onImported }: Props) {
     setImportBusy(false);
     onImported();
   };
+
+  const openFolders = async (sourceHash?: string) => {
+    if (busyRef.current) return;
+    try {
+      setFolders(await (sourceHash ? librarySourceFolders(sourceHash) : libraryLinkedFolders()));
+    } catch (cause) { setError(String(cause)); }
+  };
+
+  const rescanFolder = async (folder: LinkedFolder) => {
+    if (busyRef.current) return;
+    setFolders(null);
+    setImportBusy(true);
+    setError(null);
+    setReport(null);
+    cancelQueue.current = false;
+    setNotice(`Scanning ${folder.path}…`);
+    try {
+      const scan = await libraryRescanFolder(folder);
+      onImported();
+      beginImport(scan.paths);
+      let added = 0;
+      let failed = 0;
+      const errors: string[] = [];
+      for (const path of scan.paths) {
+        if (cancelQueue.current) break;
+        try {
+          const report = await runOwnedJob(path, (jobId) => importLinkedFileAndWait(folder, path, jobId));
+          added += report.added;
+          failed += report.failed.length;
+        } catch (cause) {
+          added += partialImportCounts(cause).added;
+          if (!cancelQueue.current) { failed++; errors.push(String(cause)); }
+          if (String(cause).includes("Library changed")) break;
+        }
+      }
+      const failure = errors[0] ?? (failed ? `${failed} sound(s) failed` : null);
+      setError(failure);
+      finishProgress(cancelQueue.current ? "import cancelled" : failure);
+      showNotice(`${cancelQueue.current ? "Rescan cancelled" : "Rescan complete"}: ${added} added, ${scan.removed} missing track(s) removed, ${scan.unchanged} unchanged looper(s)${failed ? `, ${failed} failed` : ""}.`);
+    } catch (cause) {
+      setNotice(null);
+      setError(String(cause));
+      finishProgress(String(cause));
+    } finally {
+      setImportBusy(false);
+      onImported();
+    }
+  };
+
+  useEffect(() => {
+    const handle = (event: Event) => { void openFolders((event as CustomEvent<string>).detail); };
+    window.addEventListener("olooper:rescan-source-folder", handle);
+    return () => window.removeEventListener("olooper:rescan-source-folder", handle);
+  }, []);
 
   const browseAndImportCustom = async () => {
     if (busyRef.current) return;
@@ -405,10 +480,12 @@ export default function ImportBar({ onImported }: Props) {
           const report = await runOwnedJob(path, (jobId) => importSwfAndWait(path, jobId, containerMode.mode === "extract", containerMode.copySource));
           added += report.added;
           existing += report.already_there;
+          if (report.failed.length) { failed++; firstError ??= report.failed[0].reason; }
         } else if (kind === "exe") {
           const report = await runOwnedJob(path, (jobId) => importExeAndWait(path, jobId, containerMode.mode === "extract", containerMode.copySource));
           added += report.added;
           existing += report.already_there;
+          if (report.failed.length) { failed++; firstError ??= report.failed[0].reason; }
         } else {
           const reports = await runOwnedJob(path, (jobId) => importCustomAndWait([path], jobId));
           added += reports.filter((report) => report.added).length;
@@ -420,6 +497,9 @@ export default function ImportBar({ onImported }: Props) {
           }
         }
       } catch (reason) {
+        const partial = partialImportCounts(reason);
+        added += partial.added;
+        existing += partial.existing;
         if (!cancelQueue.current) {
           failed++;
           firstError ??= String(reason);
@@ -462,6 +542,26 @@ export default function ImportBar({ onImported }: Props) {
       )}
 
       {notice && <div className="fixed left-1/2 top-12 z-[80] -translate-x-1/2 rounded border border-success/40 bg-surface px-4 py-3 text-xs text-success shadow-xl" role="status">{notice}</div>}
+
+      {folders !== null && (
+        <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/60 p-4" role="dialog" aria-modal="true" aria-labelledby="linked-folders-title" onKeyDown={(event) => { if (event.key === "Escape") setFolders(null); }}>
+          <div className="max-h-[80vh] w-full max-w-lg overflow-y-auto rounded-lg border border-border bg-surface p-5 shadow-2xl">
+            <h2 id="linked-folders-title" className="text-sm font-semibold text-text">Source folders</h2>
+            <p className="mt-2 text-xs text-text-secondary">Rescan for new or changed SWF/EXE loopers. Existing extracted audio is kept; only tracks whose required audio is missing are removed. Unavailable folders leave the library untouched.</p>
+            {folders.length === 0 && <p className="mt-4 text-xs text-text-secondary">No linked folder found. Import the original folder once to remember its path.</p>}
+            <div className="mt-4 space-y-3">
+              {folders.map((folder) => <div key={folder.id} className="flex items-center gap-3 rounded border border-border p-3">
+                <div className="min-w-0 flex-1"><p className="break-all text-xs text-text">{folder.path}</p><p className="mt-1 text-[10px] text-text-secondary">Including subfolders · {folder.extract_audio ? "Extract audio" : "Play from source"}{folder.copy_source ? " · Copy source" : ""}</p></div>
+                <button onClick={() => void rescanFolder(folder)} className="toolbar-button shrink-0">Rescan</button>
+              </div>)}
+            </div>
+            <div className="mt-4 flex justify-end gap-3">
+              <button onClick={() => { setFolders(null); void browseAndImport(importContainer, LOOPER_FILTERS, true); }} className="toolbar-button">Import folder…</button>
+              <button onClick={() => setFolders(null)} className="dialog-close">Close</button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {modePrompt && (
         <div ref={modeDialogRef} className="fixed inset-0 z-[100] flex items-center justify-center bg-black/60 p-4" role="dialog" aria-modal="true" aria-labelledby="container-import-title" onKeyDown={(event) => {
@@ -508,7 +608,7 @@ export default function ImportBar({ onImported }: Props) {
           label="SWF / EXE"
         />
         <BrowseBtn
-          onClick={() => browseAndImport(importContainer, LOOPER_FILTERS, true)}
+          onClick={() => void openFolders()}
           disabled={busy}
           label="Folder"
         />

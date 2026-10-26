@@ -74,6 +74,9 @@ pub fn scan(data: &[u8]) -> Vec<EmbeddedSwf> {
         return out;
     }
     for off in 0..data.len() - 7 {
+        if off % 65536 == 0 && crate::check_cancelled().is_err() {
+            break;
+        }
         let Some((_, version, length)) = is_magic_at(data, off) else {
             continue;
         };
@@ -141,7 +144,25 @@ pub fn locate(data: &[u8]) -> Result<EmbeddedSwf, ExeError> {
     });
 
     let mut saw_zws = false;
+    let mut validation_bytes = 0usize;
     for c in &cands {
+        if crate::check_cancelled().is_err() {
+            return Err(ExeError::UnsupportedExe {
+                candidates: cands.len(),
+                detail: "import cancelled",
+            });
+        }
+        let declared = declared_len(data, c.offset);
+        if declared > super::swf::MAX_SWF_LEN as usize {
+            continue;
+        }
+        validation_bytes = validation_bytes.saturating_add(declared);
+        if validation_bytes > 4 * super::swf::MAX_SWF_LEN as usize {
+            return Err(ExeError::UnsupportedExe {
+                candidates: cands.len(),
+                detail: "candidate validation budget exceeded",
+            });
+        }
         if &data[c.offset..c.offset + 3] == b"ZWS" {
             saw_zws = true;
             continue;

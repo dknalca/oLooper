@@ -1,5 +1,10 @@
 # 000 — Product Foundation
 
+> Historical MVP baseline. This document records the original scope, not the
+> current feature list: Serato metadata writing and many practice/library tools
+> were added later. Use current release/features in `README.md` and `CHANGELOG.md`,
+> and current BPM contracts in specs 010/130/260/270.
+
 ## Scope
 
 Cross-platform desktop app for DJs/turntablists, targeting macOS 11+ and Windows 11 x64:
@@ -34,7 +39,7 @@ practice with a persistent local library, prepare cue/loop metadata
 
 ## Persistence behavior
 
-- SQLite is catalog + derived metadata (migrations explicit); audio files are the canonical audio. Re-imports dedup by hash; user edits (BPM/cue/loop) never overwritten by re-analysis.
+- SQLite is catalog + derived metadata (migrations explicit); audio files are the canonical audio. Re-imports dedup by hash; manually confirmed BPM and cue/loop edits are intended not to be overwritten by automatic reanalysis. The current audit follow-up documents an open tag/provenance exception.
 
 ## Platform considerations
 

@@ -4,6 +4,26 @@
 use super::super::fixture::*;
 use super::*;
 
+#[test]
+fn negative_seek_samples_survive_container_parsing() {
+    let tag = define_sound_tag(42, FORMAT_MP3, &fake_mp3((-3i16) as u16));
+    for file in [fws_file(10, &tag), cws_file(10, &tag)] {
+        assert_eq!(parse(&file).unwrap().sounds[0].seek_samples, -3);
+    }
+}
+
+#[test]
+fn sound_materialization_checks_remaining_budget_before_decoding() {
+    let mut tag = 42u16.to_le_bytes().to_vec();
+    tag.push((FORMAT_ADPCM << 4) | 1);
+    tag.extend_from_slice(&4096u32.to_le_bytes());
+    tag.extend_from_slice(&[0; 2048]);
+    assert!(parse_define_sound(&tag, 8)
+        .unwrap_err()
+        .reason
+        .contains("budget"));
+}
+
 fn push_bits(value: u32, width: usize, bits: &mut Vec<u8>, current: &mut u8, count: &mut usize) {
     for shift in (0..width).rev() {
         *current = (*current << 1) | ((value >> shift) & 1) as u8;

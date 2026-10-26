@@ -1,5 +1,10 @@
 # Windows compatibility audit — 2026-10-07
 
+> Snapshot histórico: las comprobaciones de este informe se hicieron desde macOS
+> y no validan el Windows actual. El estado reciente está en
+> [la matriz de validación](audit-validation-2026-10-25.md) y el
+> [follow-up de auditoría](documentation-review-2026-10-26.md).
+
 ## Scope and environment
 
 Reviewed source-backed SWF/EXE playback, import-mode prompting, looper deletion,

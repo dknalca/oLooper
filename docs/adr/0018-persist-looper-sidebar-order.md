@@ -19,6 +19,7 @@ state would be lost on restart and would be overwritten when the library reloads
 
 ## Consequences
 
-- Library schema v8 adds the order table transactionally.
+- Library schema v8 added the order table transactionally (historical version at
+  this ADR's date; the current schema is v10).
 - Removing groups can leave stale order rows; list operations ignore them and
   reorder operations rewrite only current groups.

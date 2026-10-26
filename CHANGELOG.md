@@ -1,5 +1,35 @@
 # Release notes
 
+## Unreleased
+
+## 0.8.0
+
+- Remember imported source folders and their import options. Rescan from Folder,
+  a looper menu, or a missing-audio prompt to discover new/changed containers and
+  remove only missing audio entries, retaining surviving extracted loops/copies.
+- Move My Library / Discover loopers into the library-pane header and keep BPM
+  values on one row with compact loop titles.
+
+- Add reanalysis of automatic BPMs for one looper, a playlist, or the full
+  library, with progress/cancellation and preservation of confirmed/file BPMs.
+- Estimate 4/4 looper tempo from canonical PCM duration and expose a read-only
+  per-track suggestion. Metadata editing offers stable Half/Detected/Double
+  choices; double-clicking a library BPM opens the editor without playing the row.
+- Add an optional looper-cover screensaver after a configurable period of
+  window-local inactivity (five-minute default); choose a delay from 1 to 60
+  minutes in Preferences. The app menu opens Preferences with ⌘, on macOS.
+- Fix manual BPM/tag synchronization races; CUE writes no longer turn automatic
+  estimates into protected tags. Playback metadata preserves BPM provenance and
+  confidence, and stale root/generation events cannot update another library.
+- Throttle BPM progress IPC to 150 ms while always publishing exact terminal
+  counts. Disable idle-cover observers/listeners when the feature is off.
+- Add bounded Next/Random prefetch and MIDI map presets/import/export.
+- Harden import parsing, audio-memory budgets, waveform caches, atomic metadata
+  writes and library recovery. Use one pnpm lockfile and Node 24 / Rust 1.89.
+- Fix startup quote centering during its fade transition.
+- The library schema migrates to v11. Older app versions cannot open an upgraded
+  catalog; use v0.8.0 on each machine sharing that library.
+
 ## 0.7.1
 
 - Browse collections and loops using the keyboard arrows, a MIDI encoder, or

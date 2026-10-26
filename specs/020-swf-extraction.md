@@ -31,8 +31,9 @@ Never executes ActionScript; never requires Flash.
   carried by `SoundStreamBlock` is assembled in frame order into a derived
   track. Blocks have bounded aggregate size and malformed stream headers or
   blocks are skipped without affecting independent `DefineSound` extraction.
-- Sound decoding and BPM analysis use bounded batches of up to four threads;
-  derived-file writes and SQLite rows commit serially in source order.
+- Sound decoding and BPM analysis prepare one sound at a time under the shared
+  working-memory guard (ADR 0022); derived-file writes and SQLite rows commit
+  serially in source order.
 - The largest complete embedded JPEG from `DefineBits`, `DefineBitsJPEG2`,
   `DefineBitsJPEG3`, or `DefineBitsJPEG4` is offered as the looper cover. EXE
   projectors use the cover from their validated embedded SWF. Some JPEG2 tags

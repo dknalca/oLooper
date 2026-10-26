@@ -269,7 +269,7 @@ fn routed_output_meter_tracks_left_and_right_peak_after_volume() {
 #[test]
 fn output_test_buffer_sends_left_then_right_tones() {
     let buffer = output_test_buffer();
-    let frames: Vec<_> = buffer.samples.chunks_exact(2).collect();
+    let frames = buffer.samples.as_chunks::<2>().0;
     let left_end = OUTPUT_TEST_TONE_FRAMES;
     let right_start = OUTPUT_TEST_TONE_FRAMES + OUTPUT_TEST_GAP_FRAMES;
     let right_end = right_start + OUTPUT_TEST_TONE_FRAMES;
@@ -594,12 +594,22 @@ fn library_unload_clears_audio_snapshot_and_invalidates_pending_decode() {
     });
     engine.decode_running = true;
     engine.last_load_error = Some("stale error".to_string());
+    engine.cache_decoded(
+        "embedded:1".to_string(),
+        FileIdentity {
+            size: 4,
+            modified: None,
+        },
+        mono(vec![1, 2, 3]),
+    );
 
     engine.cmd_unload().unwrap();
 
     assert_eq!(engine.generation, 3);
     assert!(engine.pending_load.is_none());
     assert!(engine.last_load_error.is_none());
+    assert!(engine.decoded_cache.is_empty());
+    assert_eq!(engine.decoded_cache_bytes, 0);
     assert!(loaded_buffer.read().unwrap().is_none());
     assert!(!load_ready_current(
         &engine.pending_load,
@@ -616,6 +626,116 @@ fn nanos() -> u128 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos()
+}
+
+#[test]
+fn memory_pressure_evicts_old_pcm_without_dropping_the_playback_snapshot() {
+    let active = mono(vec![1, 2, 3]);
+    let snapshot = Arc::new(std::sync::RwLock::new(Some((
+        "active".to_string(),
+        1,
+        active.clone(),
+    ))));
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let mut engine = Engine::new(snapshot.clone(), tx);
+    for path in ["older", "active"] {
+        engine.cache_decoded(
+            path.to_string(),
+            FileIdentity {
+                size: 4,
+                modified: None,
+            },
+            active.clone(),
+        );
+    }
+    engine.trim_decoded_cache(active.memory_bytes());
+    assert_eq!(engine.decoded_cache.len(), 1);
+    assert_eq!(engine.decoded_cache[0].path, "active");
+    engine.trim_decoded_cache(0);
+    assert!(engine.decoded_cache.is_empty());
+    assert_eq!(engine.decoded_cache_bytes, 0);
+    assert!(Arc::ptr_eq(
+        &snapshot.read().unwrap().as_ref().unwrap().2,
+        &active
+    ));
+}
+
+#[test]
+fn prefetch_decodes_a_candidate_without_changing_the_playing_track() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("next.wav");
+    std::fs::write(&path, pcm_wav(400)).unwrap();
+    let loaded_buffer = std::sync::Arc::new(std::sync::RwLock::new(None));
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut engine = Engine::new(loaded_buffer.clone(), tx);
+    let request = AudioLoadRequest::file(
+        path.to_string_lossy().to_string(),
+        path.to_string_lossy().to_string(),
+    );
+
+    assert!(engine.cmd_prefetch(request).unwrap());
+    let EngineCmd::PrefetchReady {
+        epoch,
+        request,
+        identity,
+        result,
+    } = rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("prefetch completion")
+    else {
+        panic!("expected prefetch completion");
+    };
+    assert!(result.is_ok());
+    engine.cmd_prefetch_ready(epoch, request, identity, result);
+
+    assert_eq!(engine.decoded_cache.len(), 1);
+    assert_eq!(engine.decoded_cache[0].path, path.to_string_lossy());
+    assert!(loaded_buffer.read().unwrap().is_none());
+    assert!(!engine.status().loaded);
+}
+
+#[test]
+fn unloading_discards_a_prefetch_from_the_previous_library() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("old-library.wav");
+    std::fs::write(&path, pcm_wav(200)).unwrap();
+    let loaded_buffer = std::sync::Arc::new(std::sync::RwLock::new(None));
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut engine = Engine::new(loaded_buffer, tx);
+    let request = AudioLoadRequest::file(
+        path.to_string_lossy().to_string(),
+        path.to_string_lossy().to_string(),
+    );
+    assert!(engine.cmd_prefetch(request).unwrap());
+    let EngineCmd::PrefetchReady {
+        epoch,
+        request,
+        identity,
+        result,
+    } = rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("prefetch completion")
+    else {
+        panic!("expected prefetch completion");
+    };
+
+    engine.cmd_unload().unwrap();
+    engine.cmd_prefetch_ready(epoch, request, identity, result);
+
+    assert!(engine.decoded_cache.is_empty());
+}
+
+#[test]
+fn sample_window_rejects_zero_and_oversized_parameters_without_panicking() {
+    let client = spawn();
+    *client.loaded_buffer.write().unwrap() = Some(("test".into(), 1, mono(vec![1, 2, 3, 4])));
+    assert!(client.sample_window(1, 1, 0).is_err());
+    assert!(client.sample_window(1, 1, 8193).is_err());
+    assert!(client.sample_window(1, 192001, 10).is_err());
+    assert_eq!(client.sample_window(1, 1, 1).unwrap().samples.len(), 1);
+    assert!(client.auto_loop(Some(0.0)).is_err());
+    assert!(client.auto_loop(Some(f64::INFINITY)).is_err());
+    assert_eq!(ms_to_frames(u64::MAX, 192_000), usize::MAX);
 }
 
 #[test]

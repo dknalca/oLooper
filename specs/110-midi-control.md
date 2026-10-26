@@ -31,6 +31,21 @@ Options…**, with assignments remembered locally.
   64 move down, values above 64 move up, and 0/64 are ignored.
 - Assignments and the selected input/output IDs persist in local application storage;
   no SQLite migration is required.
+- MIDI Options includes a preset selector with **Load preset**, **Save preset**,
+  and **Save as**. Initial templates are `Custom_map`, `pioneerS11_map`, and
+  `Rane72map`; all ship empty until verified hardware maps are available.
+  Existing assignments migrate into `Custom_map`. Saved snapshots and the active
+  working mapping persist independently, including edits not yet saved to a preset.
+  Loading explicitly replaces current assignments and cancels MIDI Learn.
+- **Import MIDI map** and **Export MIDI map** use native JSON file dialogs.
+  Export includes current assignments, including unsaved edits. Import creates
+  and activates a new saved preset; name collisions get a numeric suffix so
+  existing presets are preserved. Cancellation leaves the mapping unchanged.
+- Loading or importing binds all assignments to the currently connected MIDI
+  input. Offline import is supported; connect an input and load that preset to
+  activate it. Input/output connection preferences are separate from presets.
+- Bundled templates live in `src/midi-presets/*.json`, using the same portable
+  file format as exported maps, so verified maps can be integrated directly.
 - A separately selected MIDI output sends Note On/Off or CC 127/0 feedback for
   assigned pads. Feedback is cleared when an assignment is removed or the output
   disconnects. Hardware determines whether/how these messages illuminate pads;
@@ -56,6 +71,29 @@ Options…**, with assignments remembered locally.
   is routed to the TopBar-owned metronome state.
 - MIDI Learn temporarily captures the next supported Note On or discrete CC
   press, then saves the binding locally.
+- `src/midiMaps.ts` owns preset preference migration, versioned JSON validation,
+  and device rebinding. `src-tauri/src/midi_map_files.rs` owns native dialogs and
+  bounded reads/atomic writes. Reads and writes are limited to 64 KiB; import
+  rejects unsupported versions/actions, duplicate controls, invalid channel/note
+  ranges, and invalid names before changing active assignments.
+
+## Portable map format (v1)
+
+```json
+{
+  "format": "olooper-midi-map",
+  "version": 1,
+  "name": "pioneerS11_map",
+  "bindings": {
+    "play-pause": { "kind": "note", "channel": 1, "number": 60 }
+  }
+}
+```
+
+The example assignment illustrates the format, not a verified S11 control.
+Bindings use the `MidiAction` IDs from `src/tauri.ts`, channels 1–16, note/CC
+numbers 0–127, and `note` or `cc` kinds. Files omit local input IDs/names and
+output device selection. Empty `bindings` is valid. Names are 1–80 characters.
 
 ## Failure behavior
 
@@ -79,6 +117,8 @@ Options…**, with assignments remembered locally.
 - [x] Consecutive relative encoder turns are received even when the controller
   sends no zero value between detents; button CCs still trigger once per press.
 - [x] MIDI input parsing is unit-tested without physical hardware.
+- [x] Empty named templates, preset save/load, and legacy preference migration.
+- [x] Portable MIDI map import/export with validation and input rebinding.
 - [ ] Assignments send discrete output feedback and clear their LEDs when removed.
 
 ## Non-goals

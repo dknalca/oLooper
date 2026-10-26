@@ -229,15 +229,23 @@ fn evaluate_in_tablist_webview(
         .map_err(|error| format!("Could not open Tablist's public page: {error}"))?;
 
     let result = (|| {
-        loaded_rx
-            .recv_timeout(Duration::from_secs(30))
-            .map_err(|_| "Timed out loading the Tablist page for authorization".to_string())?;
+        let load_deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            crate::check_cancelled()?;
+            if loaded_rx.recv_timeout(Duration::from_millis(100)).is_ok() {
+                break;
+            }
+            if std::time::Instant::now() >= load_deadline {
+                return Err("Timed out loading the Tablist page for authorization".into());
+            }
+        }
         window
             .eval(&script)
             .map_err(|error| format!("Could not start Tablist authorization: {error}"))?;
 
         let deadline = std::time::Instant::now() + Duration::from_secs(45);
         while std::time::Instant::now() < deadline {
+            crate::check_cancelled()?;
             let (result_tx, result_rx) = std::sync::mpsc::channel();
             window
                 .eval_with_callback(
@@ -423,9 +431,7 @@ pub fn download_track(track: &TablistTrack, page_url: &str) -> Result<Vec<u8>, S
         return Err(format!("'{}' exceeds the 512 MiB limit", track.title));
     }
     let mut bytes = Vec::new();
-    response
-        .take(MAX_TRACK_BYTES as u64 + 1)
-        .read_to_end(&mut bytes)
+    crate::bounded_io::read_into(response, &mut bytes, MAX_TRACK_BYTES as u64)
         .map_err(|error| format!("Could not read '{}': {error}", track.title))?;
     if bytes.len() > MAX_TRACK_BYTES {
         return Err(format!("'{}' exceeds the 512 MiB limit", track.title));
@@ -454,9 +460,7 @@ pub fn download_cover(path: &str, page_url: &str) -> Result<Vec<u8>, String> {
         return Err("Tablist cover exceeds the 10 MiB limit".to_string());
     }
     let mut bytes = Vec::new();
-    response
-        .take(MAX_COVER_BYTES + 1)
-        .read_to_end(&mut bytes)
+    crate::bounded_io::read_into(response, &mut bytes, MAX_COVER_BYTES)
         .map_err(|error| format!("Could not read Tablist cover: {error}"))?;
     if bytes.len() as u64 > MAX_COVER_BYTES {
         return Err("Tablist cover exceeds the 10 MiB limit".to_string());
@@ -472,7 +476,8 @@ fn client_for(host: &'static str) -> Result<Client, String> {
         }
     });
     Client::builder()
-        .timeout(Duration::from_secs(45))
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(15))
         .redirect(redirect::Policy::custom(move |attempt| {
             if attempt.url().scheme() == "https" && attempt.url().host_str() == Some(host) {
                 attempt.follow()
@@ -489,7 +494,8 @@ fn checked_response(response: Response, operation: &str) -> Result<Response, Str
         Ok(response)
     } else {
         let status = response.status();
-        let body = response.text().unwrap_or_default();
+        let mut body = String::new();
+        let _ = response.take(8192).read_to_string(&mut body);
         let detail: String = body.chars().take(2000).collect();
         Err(format!("{operation} failed with HTTP {status}: {detail}"))
     }
@@ -553,7 +559,7 @@ fn parse_document(document: &Value, fallback_path: &str) -> Result<TablistPage, 
             let url = remote_file_url(&path)?;
             let extension = url
                 .path_segments()
-                .and_then(|segments| segments.last())
+                .and_then(|mut segments| segments.next_back())
                 .and_then(|name| name.rsplit_once('.').map(|(_, ext)| ext))
                 .filter(|ext| {
                     matches!(

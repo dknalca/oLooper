@@ -101,7 +101,28 @@ Waveform rendering and library integration are separate specs.
 
 - rodio backend (ADR 0002): perceptually gapless, latency not guaranteed. Input
   files are capped at 512 MiB and 15 minutes. The decoded-track cache is bounded
-  to 128 MiB and six tracks.
+  dynamically to one eighth of available system RAM, capped at 512 MiB and 32
+  tracks.
+- Share the system-memory sample for one second. If unavailable, use at most
+  16 MiB per cache. The engine's one-second maintenance tick trims PCM/container
+  caches even without track changes; active playback buffers remain referenced.
+- Unloading a library clears decoded-track cache entries: virtual track IDs are
+  catalog-scoped and must never reuse another library's decoded sound.
+- Look-ahead: after a track finishes loading, the frontend asks `player_prefetch`
+  to decode the next sequential loop and one random candidate from the current
+  scope into the decoded cache. Prefetch never changes playback and keeps at most
+  two candidates (one running, one queued); loads take priority and the queue is
+  drained when the engine is idle. Random consumes the prepared candidate only
+  when the scope and current track still match, otherwise it queries again.
+  Unload invalidates in-flight prefetches from the previous library.
+- UI status polling is serial: schedule the next request after completion and
+  ignore results after cleanup, preventing overlapping native requests.
+- Timed Random and the Random button invoke one shared action/controller with
+  the latest library scope. Changing scope updates the next choice without
+  restarting the countdown. A manual change restarts the countdown after it
+  completes; overlapping triggers share one in-flight load. Both paths show the
+  same errors and start the next full interval after completion, including a
+  failed attempt. Disabling the timer prevents further automatic changes.
 
 ## Security implications
 
@@ -121,6 +142,8 @@ Waveform rendering and library integration are separate specs.
 - [x] Loading another track resets playback speed to 100%.
 - [x] Next random immediately plays another library track, including when no
   track is currently active.
+- [x] Next and Random reuse a prefetched decoded buffer while the scope still
+  matches; prefetch never changes the playing track.
 - [ ] Stereo output can follow the system default or route to any supported
   stereo channel pair on a selected device.
 

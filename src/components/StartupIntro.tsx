@@ -85,11 +85,13 @@ export default function StartupIntro({ onComplete }: Props) {
           <Logo className="h-full w-full object-contain" />
         </div>
       </div>
-      <div ref={quoteRef} className="absolute left-1/2 top-[61%] w-[min(42rem,calc(100vw-3rem))] -translate-x-1/2 px-4 text-center">
-        <p className="text-sm font-medium leading-relaxed text-text sm:text-base">“{quote.text}”</p>
-        <p className="mt-3 text-[10px] uppercase tracking-[0.18em] text-accent">
-          {quote.attribution}{quote.source ? ` · ${quote.source}` : ""}
-        </p>
+      <div data-intro-quote-center className="absolute left-1/2 top-[61%] w-[min(42rem,calc(100vw-3rem))] -translate-x-1/2 px-4 text-center">
+        <div ref={quoteRef} data-intro-quote-transition>
+          <p className="text-sm font-medium leading-relaxed text-text sm:text-base">“{quote.text}”</p>
+          <p className="mt-3 text-[10px] uppercase tracking-[0.18em] text-accent">
+            {quote.attribution}{quote.source ? ` · ${quote.source}` : ""}
+          </p>
+        </div>
       </div>
     </div>
   );

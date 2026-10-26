@@ -6,7 +6,7 @@
 //! but never its original source file.
 
 use std::collections::{BTreeMap, HashSet};
-use std::io::{Cursor, Read as _};
+use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -16,10 +16,21 @@ use sha2::{Digest as _, Sha256};
 
 use crate::import::swf::Sound;
 
+mod bpm;
+mod embedded;
+mod folders;
+pub(crate) use bpm::BpmOutcome;
+pub use bpm::TempoSuggestion;
+pub use folders::{FolderScan, LinkedFolder};
+mod operations;
+mod recovery;
 mod serato;
 
+pub(crate) use embedded::decode_embedded_sound_file;
+pub(crate) use embedded::trim_source_cache;
+
 /// Current schema version (`PRAGMA user_version`).
-const SCHEMA_VERSION: i32 = 10;
+const SCHEMA_VERSION: i32 = 11;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Track {
@@ -143,7 +154,7 @@ fn copy_file_noclobber(source: &Path, destination: &Path) -> std::io::Result<()>
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "missing parent"))?;
     let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
     let mut input = std::fs::File::open(source)?;
-    std::io::copy(&mut input, temporary.as_file_mut())?;
+    crate::bounded_io::copy(&mut input, temporary.as_file_mut(), 512 * 1024 * 1024)?;
     temporary.as_file().sync_all()?;
     temporary
         .persist_noclobber(destination)
@@ -229,6 +240,7 @@ fn compact_playlist_positions(
         )
         .map_err(|error| error.to_string())?;
     }
+
     Ok(())
 }
 
@@ -294,11 +306,22 @@ pub struct SeratoMetadata {
     pub bpm: Option<f64>,
 }
 
+/// Playback metadata carries the effective catalog BPM provenance atomically.
+#[derive(Debug, Clone, Serialize)]
+pub struct SeratoMetadataSnapshot {
+    #[serde(flatten)]
+    pub metadata: SeratoMetadata,
+    pub bpm_source: Option<String>,
+    pub bpm_confidence: Option<f64>,
+}
+
 pub struct Library {
     conn: Connection,
     pub root: PathBuf,
+    operations: std::sync::Arc<operations::Operations>,
 }
 
+#[derive(Serialize, Deserialize)]
 struct QuarantinedFiles {
     directory: PathBuf,
     moved: Vec<(PathBuf, PathBuf)>,
@@ -313,6 +336,8 @@ impl Library {
         std::fs::create_dir_all(root)
             .and_then(|()| std::fs::create_dir_all(root.join("Custom Loops")))
             .map_err(|e| format!("cannot create library dirs: {e}"))?;
+        let operations = operations::acquire(root)?;
+        let _guard = operations.lock.lock();
         let conn = Connection::open(root.join("olooper.db"))
             .map_err(|e| format!("cannot open library database: {e}"))?;
         // Enable foreign key enforcement (off by default in SQLite).
@@ -325,10 +350,15 @@ impl Library {
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")
             .map_err(|e| format!("cannot set WAL mode: {e}"))?;
         migrate(&conn)?;
-        Ok(Self {
+        let library = Self {
             conn,
             root: root.to_path_buf(),
-        })
+            operations: operations.clone(),
+        };
+        library.recover_quarantined()?;
+        #[cfg(target_os = "windows")]
+        library.recover_metadata_files()?;
+        Ok(library)
     }
 
     pub fn schema_version(&self) -> Result<i32, String> {
@@ -337,20 +367,72 @@ impl Library {
             .map_err(|e| e.to_string())
     }
 
+    pub(crate) fn source_reference_count(&self, path: &str) -> Result<i64, String> {
+        self.conn
+            .query_row(
+                "SELECT COUNT(*) FROM tracks WHERE source_path=?1 OR file_path=?1",
+                [path],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())
+    }
+
+    pub(crate) fn cache_directory(&self, parts: &[&str]) -> Result<PathBuf, String> {
+        let _guard = self.operations.lock.lock();
+        let root = self.root.canonicalize().map_err(|e| e.to_string())?;
+        let mut path = root.clone();
+        for part in parts {
+            if std::path::Path::new(part).components().count() != 1
+                || !matches!(
+                    std::path::Path::new(part).components().next(),
+                    Some(std::path::Component::Normal(_))
+                )
+            {
+                return Err("invalid managed directory".into());
+            }
+            path.push(part);
+            match std::fs::create_dir(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error.to_string()),
+            }
+            path = path.canonicalize().map_err(|e| e.to_string())?;
+            if !path.starts_with(&root) || !path.is_dir() {
+                return Err("cache directory escapes the library".into());
+            }
+        }
+        Ok(path)
+    }
+
     pub fn list_tracks(&self) -> Result<Vec<Track>, String> {
+        self.query_tracks(None, None)
+    }
+
+    fn query_tracks(
+        &self,
+        id: Option<i64>,
+        source_hash: Option<&str>,
+    ) -> Result<Vec<Track>, String> {
+        // Keep point lookups indexable, and never stat every library file merely
+        // to load or edit one row. The row projection stays shared with listing.
+        let predicate = match (id, source_hash) {
+            (Some(_), _) => "id=?1 AND (?2 IS NULL OR source_hash=?2)",
+            (None, Some(_)) => "?1 IS NULL AND source_hash=?2",
+            (None, None) => "?1 IS NULL AND ?2 IS NULL",
+        };
         let mut stmt = self
             .conn
-            .prepare(
+            .prepare(&format!(
                 "SELECT id,title,looper_name,file_path,source_type,source_path,source_hash,\
                  source_sound_id,codec,sample_rate,channels,duration_ms,seek_samples,trimmed_leading,\
                  bpm,bpm_confidence,bpm_source,primary_cue_ms,loop_start_ms,\
                    loop_end_ms,loop_enabled,loop_start_frame,loop_end_frame,loop_origin,\
                  loop_quality,loop_needs_review,total_frames,imported_at,updated_at,favorite,tags,last_played_at,audio_storage,source_managed \
-                 FROM tracks ORDER BY id",
-            )
+                  FROM tracks WHERE {predicate} ORDER BY id",
+            ))
             .map_err(|e| e.to_string())?;
         let rows = stmt
-            .query_map([], |r| {
+            .query_map(rusqlite::params![id, source_hash], |r| {
                 let file_path: String = r.get(3)?;
                 let id: i64 = r.get(0)?;
                 let audio_storage: String = r.get(32)?;
@@ -677,17 +759,26 @@ impl Library {
     }
 
     pub fn get_track(&self, id: i64) -> Result<Option<Track>, String> {
-        Ok(self.list_tracks()?.into_iter().find(|t| t.id == id))
+        Ok(self.query_tracks(Some(id), None)?.into_iter().next())
     }
 
     pub(crate) fn playback_request(
         &self,
         id: i64,
     ) -> Result<crate::player::AudioLoadRequest, String> {
+        let _guard = self.operations.lock.lock();
         let track = self
             .get_track(id)?
             .ok_or_else(|| format!("track {id} not found"))?;
+        if !track.exists {
+            return Err(format!("Audio file is missing: {}", track.file_path));
+        }
         let path = self.managed_source_path_for_track(&track)?;
+        let practice = (
+            track.loop_start_frame.max(0) as u64,
+            track.loop_end_frame.max(0) as u64,
+            track.loop_enabled,
+        );
         if track.audio_storage == "embedded" {
             if !matches!(track.source_type.as_str(), "swf" | "exe") {
                 return Err("embedded audio must belong to an SWF/EXE source".to_string());
@@ -700,12 +791,14 @@ impl Library {
                 track.source_type,
                 sound_id,
                 track.source_hash,
-            ))
+            )
+            .with_practice(practice.0, practice.1, practice.2))
         } else {
             Ok(crate::player::AudioLoadRequest::file(
                 track.playback_path,
                 path.to_string_lossy().to_string(),
-            ))
+            )
+            .with_practice(practice.0, practice.1, practice.2))
         }
     }
 
@@ -814,9 +907,13 @@ impl Library {
 
     /// Choose a playable library track at random, avoiding the current track
     /// when another playable track is available.
-    pub fn random_track(&self, exclude_id: Option<i64>) -> Result<Option<Track>, String> {
+    pub fn random_track(
+        &self,
+        exclude_id: Option<i64>,
+        source_hash: Option<&str>,
+    ) -> Result<Option<Track>, String> {
         let mut tracks: Vec<_> = self
-            .list_tracks()?
+            .query_tracks(None, source_hash)?
             .into_iter()
             .filter(|track| track.exists)
             .collect();
@@ -995,6 +1092,56 @@ impl Library {
             .ok_or_else(|| format!("track {id} vanished"))
     }
 
+    pub(crate) fn persist_practice(
+        &self,
+        status: &crate::player::PlayerStatus,
+    ) -> Result<(), String> {
+        let _guard = self.operations.lock.lock();
+        let Some(path) = status.path.as_deref() else {
+            return Ok(());
+        };
+        let id = if let Some(id) = path.strip_prefix("embedded:") {
+            id.parse::<i64>().ok()
+        } else {
+            self.conn
+                .query_row("SELECT id FROM tracks WHERE file_path=?1", [path], |row| {
+                    row.get(0)
+                })
+                .optional()
+                .map_err(|e| e.to_string())?
+        };
+        let Some(id) = id else {
+            return Ok(());
+        };
+        let Some(track) = self.get_track(id)? else {
+            return Ok(());
+        };
+        if track.playback_path != path
+            || status.total_frames == 0
+            || track.duration_ms <= 0
+            || track.total_frames <= 0
+        {
+            return Ok(());
+        }
+        let start = (status.loop_start_frame as u128 * track.duration_ms as u128
+            / status.total_frames as u128) as i64;
+        let end = (status.loop_end_frame as u128 * track.duration_ms as u128
+            / status.total_frames as u128) as i64;
+        let start = start.clamp(0, track.duration_ms.saturating_sub(1));
+        let end = end.clamp(start + 1, track.duration_ms.max(start + 1));
+        let original_start = (status.loop_start_frame as u128 * track.total_frames.max(0) as u128
+            / status.total_frames as u128) as i64;
+        let original_end = (status.loop_end_frame as u128 * track.total_frames.max(0) as u128
+            / status.total_frames as u128) as i64;
+        self.conn
+            .execute(
+                "UPDATE tracks SET loop_start_frame=?1,loop_end_frame=?2,loop_start_ms=?3,loop_end_ms=?4,loop_enabled=?5,loop_origin='manual',updated_at=?6 WHERE id=?7",
+                rusqlite::params![original_start, original_end, start, end, status.loop_enabled, now_secs(), id],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
     pub fn update_bpm(
         &self,
         id: i64,
@@ -1002,19 +1149,33 @@ impl Library {
         confidence: Option<f64>,
         manual: bool,
     ) -> Result<Track, String> {
+        let _guard = self.operations.lock.lock();
         if !(20.0..=300.0).contains(&bpm) {
             return Err("bpm outside 20–300".to_string());
         }
         self.get_track(id)?
             .ok_or_else(|| format!("track {id} not found"))?;
         let source = if manual { "manual" } else { "analyzed" };
-        self.conn
+        let transaction = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| e.to_string())?;
+        transaction
             .execute(
                 "UPDATE tracks SET bpm=?1,bpm_confidence=?2,bpm_source=?3,updated_at=?4 \
                  WHERE id=?5",
                 rusqlite::params![bpm, confidence, source, now_secs(), id],
             )
             .map_err(|e| e.to_string())?;
+        if manual {
+            transaction
+                .execute(
+                    "INSERT OR REPLACE INTO settings(key,value) VALUES(?1,'1')",
+                    [format!("pending-manual-bpm:{id}")],
+                )
+                .map_err(|e| e.to_string())?;
+        }
+        transaction.commit().map_err(|e| e.to_string())?;
         self.get_track(id)?
             .ok_or_else(|| format!("track {id} vanished"))
     }
@@ -1022,6 +1183,7 @@ impl Library {
     /// Delete one catalog track and its library-managed audio copy. Remove a
     /// managed SWF/EXE copy only when the final track referencing it is removed.
     pub fn remove_track(&self, id: i64) -> Result<bool, String> {
+        let _guard = self.operations.lock.lock();
         let Some(track) = self.get_track(id)? else {
             return Ok(false);
         };
@@ -1120,6 +1282,7 @@ impl Library {
         tags: &str,
         confirm_manual_bpm: bool,
     ) -> Result<Track, String> {
+        let _guard = self.operations.lock.lock();
         let title = sanitize_name(title);
         if let Some(bpm) = bpm {
             if !(20.0..=300.0).contains(&bpm) {
@@ -1132,10 +1295,13 @@ impl Library {
             .filter(|tag| tag != "untitled")
             .collect::<Vec<_>>()
             .join(", ");
-        let changed = self
+        let transaction = self
             .conn
+            .unchecked_transaction()
+            .map_err(|e| e.to_string())?;
+        let changed = transaction
             .execute(
-                "UPDATE tracks SET title=?1,bpm=?2,\
+                "UPDATE tracks SET title=?1,bpm=CASE WHEN ?5 THEN ?2 ELSE bpm END,\
              bpm_source=CASE WHEN ?5 THEN 'manual' ELSE bpm_source END,\
              bpm_confidence=CASE WHEN ?5 THEN NULL ELSE bpm_confidence END,\
              tags=?3,updated_at=?4 WHERE id=?6",
@@ -1152,6 +1318,15 @@ impl Library {
         if changed == 0 {
             return Err(format!("track {id} not found"));
         }
+        if confirm_manual_bpm && bpm.is_some() {
+            transaction
+                .execute(
+                    "INSERT OR REPLACE INTO settings(key,value) VALUES(?1,'1')",
+                    [format!("pending-manual-bpm:{id}")],
+                )
+                .map_err(|e| e.to_string())?;
+        }
+        transaction.commit().map_err(|e| e.to_string())?;
         self.get_track(id)?
             .ok_or_else(|| format!("track {id} vanished"))
     }
@@ -1248,6 +1423,7 @@ impl Library {
     }
 
     pub fn convert_wav_to_mp3_320(&self, id: i64) -> Result<Track, String> {
+        let _guard = self.operations.lock.lock();
         const MAX_SOURCE_BYTES: u64 = 512 * 1024 * 1024;
         let track = self
             .get_track(id)?
@@ -1272,8 +1448,7 @@ impl Library {
         if source_size == 0 || source_size > MAX_SOURCE_BYTES {
             return Err("WAV is empty or exceeds the 512 MiB conversion limit".to_string());
         }
-        let source_bytes =
-            std::fs::read(&source_path).map_err(|error| format!("cannot read WAV: {error}"))?;
+        let source_bytes = crate::bounded_io::read(&source_path, MAX_SOURCE_BYTES)?;
         let source_buffer = crate::player::decode_bytes(&source_bytes)?;
         if source_buffer.duration_ms() > crate::player::MAX_DURATION_MS {
             return Err("WAV exceeds the 15 minute conversion limit".to_string());
@@ -1413,7 +1588,7 @@ impl Library {
 
     fn group_tracks(&self, source_hash: &str) -> Result<Vec<Track>, String> {
         let tracks: Vec<_> = self
-            .list_tracks()?
+            .query_tracks(None, Some(source_hash))?
             .into_iter()
             .filter(|track| track.source_hash == source_hash)
             .collect();
@@ -1457,16 +1632,11 @@ impl Library {
         if track.audio_storage != "embedded" {
             return self.group_directory(source_hash);
         }
-        let root = self
-            .root
-            .canonicalize()
-            .map_err(|error| format!("cannot resolve library root: {error}"))?;
-        let directory = root
-            .join(".olooper-cache")
-            .join("looper-covers")
-            .join(sha256_hex(source_hash.as_bytes()));
-        std::fs::create_dir_all(&directory)
-            .map_err(|error| format!("cannot create source-backed cover folder: {error}"))?;
+        let directory = self.cache_directory(&[
+            ".olooper-cache",
+            "looper-covers",
+            &sha256_hex(source_hash.as_bytes()),
+        ])?;
         Ok(directory)
     }
 
@@ -1505,7 +1675,7 @@ impl Library {
         if metadata.len() > MAX_STORED_COVER_BYTES {
             return Err("stored cover exceeds the size limit".to_string());
         }
-        let bytes = std::fs::read(path).map_err(|error| error.to_string())?;
+        let bytes = crate::bounded_io::read(path, MAX_STORED_COVER_BYTES)?;
         use base64::Engine as _;
         Ok(Some(format!(
             "data:image/jpeg;base64,{}",
@@ -1559,6 +1729,17 @@ impl Library {
             }
         };
         let mut moved = Vec::with_capacity(safe_files.len());
+        let manifest = QuarantinedFiles {
+            directory: directory.clone(),
+            moved: safe_files
+                .iter()
+                .enumerate()
+                .map(|(index, original)| {
+                    (original.clone(), directory.join(format!("asset-{index}")))
+                })
+                .collect(),
+        };
+        self.write_quarantine_manifest(&manifest)?;
         for (index, original) in safe_files.into_iter().enumerate() {
             let quarantined = directory.join(format!("asset-{index}"));
             if let Err(error) = std::fs::rename(&original, &quarantined) {
@@ -1575,6 +1756,15 @@ impl Library {
                 });
             }
             moved.push((original, quarantined));
+            recovery::sync_directory(&directory)?;
+            recovery::sync_directory(
+                moved
+                    .last()
+                    .unwrap()
+                    .0
+                    .parent()
+                    .ok_or("invalid library path")?,
+            )?;
         }
         Ok(Some(QuarantinedFiles { directory, moved }))
     }
@@ -1584,6 +1774,7 @@ impl Library {
             std::fs::rename(quarantined, original)
                 .map_err(|error| format!("cannot restore {}: {error}", original.display()))?;
         }
+        std::fs::remove_file(files.directory.join("manifest.json")).map_err(|e| e.to_string())?;
         std::fs::remove_dir(&files.directory).map_err(|error| error.to_string())
     }
 
@@ -1598,6 +1789,7 @@ impl Library {
 
     /// Rename the derived-audio folder and its catalog label. Source files stay untouched.
     pub fn rename_looper(&self, source_hash: &str, new_name: &str) -> Result<(), String> {
+        let _guard = self.operations.lock.lock();
         let tracks = self.group_tracks(source_hash)?;
         if tracks[0].source_type == "custom" {
             return Err("custom loops cannot be renamed as a group".to_string());
@@ -1657,6 +1849,7 @@ impl Library {
     /// Remove a looper's catalog rows, derived audio, cover, and unreferenced
     /// library-owned SWF/EXE copies. Original files outside the library remain.
     pub fn remove_looper(&self, source_hash: &str) -> Result<usize, String> {
+        let _guard = self.operations.lock.lock();
         let tracks = self.group_tracks(source_hash)?;
         if tracks[0].source_type == "custom" {
             return Err("custom audio tracks cannot be removed as a looper group".to_string());
@@ -1776,6 +1969,7 @@ impl Library {
     /// Read markers from the audio file on every track open. For pre-file-tag
     /// libraries, migrate old SQLite slots to the file once, then discard them.
     pub fn get_serato_metadata(&self, track_id: i64) -> Result<SeratoMetadata, String> {
+        let _guard = self.operations.lock.lock();
         let track = self
             .get_track(track_id)?
             .ok_or_else(|| format!("track {track_id} not found"))?;
@@ -1792,10 +1986,16 @@ impl Library {
         }
         let (track, path) = self.audio_path_for_track(track_id)?;
         let mut read = serato::read_audio_file(&path)?;
+        // A pending manual confirmation outranks a stale on-disk TBPM, even
+        // when a read/CUE operation interleaves before the explicit sync.
+        let pending_manual = self.pending_manual_bpm(track_id)?;
+        if pending_manual {
+            read.metadata.bpm = track.bpm;
+        }
         let legacy_slots = self.get_legacy_loop_slots(track_id)?;
         if !read.markers_present && !legacy_slots.is_empty() {
             let mut migrated = SeratoMetadata {
-                bpm: read.metadata.bpm.or(track.bpm),
+                bpm: read.metadata.bpm,
                 ..SeratoMetadata::default()
             };
             for old in legacy_slots.iter().filter(|slot| slot.enabled) {
@@ -1836,7 +2036,9 @@ impl Library {
             serato::write_audio_file(&path, &read.metadata, track.duration_ms)?;
             read = serato::read_audio_file(&path)?;
         }
-        if let Some(bpm) = read.metadata.bpm {
+        if pending_manual {
+            read.metadata.bpm = track.bpm;
+        } else if let Some(bpm) = read.metadata.bpm {
             if track.bpm != Some(bpm) {
                 self.conn
                     .execute(
@@ -1851,11 +2053,43 @@ impl Library {
         Ok(read.metadata)
     }
 
+    pub fn serato_metadata_snapshot(
+        &self,
+        track_id: i64,
+        cue: Option<(i64, Option<i64>)>,
+    ) -> Result<SeratoMetadataSnapshot, String> {
+        let _guard = self.operations.lock.lock();
+        let mut metadata = if let Some((slot, position)) = cue {
+            self.set_serato_cue(track_id, slot, position)?
+        } else {
+            self.get_serato_metadata(track_id)?
+        };
+        let track = self.get_track(track_id)?.ok_or("Track disappeared")?;
+        metadata.bpm = track.bpm;
+        Ok(SeratoMetadataSnapshot {
+            metadata,
+            bpm_source: track.bpm_source,
+            bpm_confidence: track.bpm_confidence,
+        })
+    }
+
     fn clear_legacy_loop_slots(&self, track_id: i64) -> Result<(), String> {
         self.conn
             .execute("DELETE FROM loop_slots WHERE track_id=?1", [track_id])
             .map_err(|error| format!("cannot clear migrated CUE database rows: {error}"))?;
         Ok(())
+    }
+
+    fn pending_manual_bpm(&self, id: i64) -> Result<bool, String> {
+        self.conn
+            .query_row(
+                "SELECT 1 FROM settings WHERE key=?1 AND EXISTS(SELECT 1 FROM tracks WHERE id=?2 AND bpm_source='manual')",
+                rusqlite::params![format!("pending-manual-bpm:{id}"), id],
+                |_| Ok(()),
+            )
+            .optional()
+            .map(|value| value.is_some())
+            .map_err(|e| e.to_string())
     }
 
     fn save_serato_metadata(
@@ -1864,11 +2098,21 @@ impl Library {
         mut metadata: SeratoMetadata,
     ) -> Result<SeratoMetadata, String> {
         let (track, path) = self.audio_path_for_track(track_id)?;
-        if metadata.bpm.is_none() {
-            metadata.bpm = track.bpm;
-        }
+        // CUE edits preserve file-authored BPM, but never promote an automatic
+        // catalog estimate into a protected file tag.
+        metadata.bpm = if self.pending_manual_bpm(track_id)? {
+            track.bpm
+        } else {
+            serato::read_audio_file(&path)?.metadata.bpm
+        };
         serato::write_audio_file(&path, &metadata, track.duration_ms)?;
         self.clear_legacy_loop_slots(track_id)?;
+        self.conn
+            .execute(
+                "DELETE FROM settings WHERE key=?1",
+                [format!("pending-manual-bpm:{track_id}")],
+            )
+            .map_err(|e| e.to_string())?;
         Ok(serato::read_audio_file(&path)?.metadata)
     }
 
@@ -1878,6 +2122,7 @@ impl Library {
         slot: i64,
         position_ms: Option<i64>,
     ) -> Result<SeratoMetadata, String> {
+        let _guard = self.operations.lock.lock();
         if !(1..=4).contains(&slot) {
             return Err("CUE slot must be between 1 and 4".to_string());
         }
@@ -1912,6 +2157,7 @@ impl Library {
     }
 
     pub fn sync_serato_metadata(&self, track_id: i64) -> Result<(), String> {
+        let _guard = self.operations.lock.lock();
         let track = self
             .get_track(track_id)?
             .ok_or_else(|| format!("track {track_id} not found"))?;
@@ -1932,10 +2178,15 @@ impl Library {
         ensure_default_serato_cue(&mut metadata);
         if track.bpm_source.as_deref() == Some("manual") {
             metadata.bpm = track.bpm;
-        } else if metadata.bpm.is_none() {
-            metadata.bpm = track.bpm;
         }
-        serato::write_audio_file(&path, &metadata, track.duration_ms)
+        serato::write_audio_file(&path, &metadata, track.duration_ms)?;
+        self.conn
+            .execute(
+                "DELETE FROM settings WHERE key=?1",
+                [format!("pending-manual-bpm:{track_id}")],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(())
     }
 
     /// Ensure `path` resolves inside the library root (after canonicalize).
@@ -1967,11 +2218,13 @@ impl Library {
             .and_then(|_| tmp.as_file_mut().sync_all())
             .and_then(|_| tmp.seek(SeekFrom::Start(0)).map(|_| ()))
             .map_err(|e| format!("write failed: {e}"))?;
-        let mut back = Vec::new();
-        tmp.read_to_end(&mut back)
-            .map_err(|e| format!("verify failed: {e}"))?;
-        if back != frames {
-            return Err("verify failed: bytes differ".to_string());
+        let mut back = [0u8; 64 * 1024];
+        for chunk in frames.chunks(back.len()) {
+            tmp.read_exact(&mut back[..chunk.len()])
+                .map_err(|e| format!("verify failed: {e}"))?;
+            if &back[..chunk.len()] != chunk {
+                return Err("verify failed: bytes differ".into());
+            }
         }
         tmp.persist_noclobber(&dest)
             .map_err(|e| format!("rename failed: {e}"))?;
@@ -2039,7 +2292,7 @@ impl Library {
     /// needed) or when the declared range is invalid.
     fn trim_mp3_gapless(
         buf: &crate::player::LoopBuffer,
-        seek_samples: u16,
+        seek_samples: i16,
         sample_count: u32,
     ) -> Option<(crate::player::LoopBuffer, Vec<u8>)> {
         let trimmed = Self::trim_mp3_buffer(buf, seek_samples, sample_count)?;
@@ -2049,7 +2302,7 @@ impl Library {
 
     fn trim_mp3_buffer(
         buf: &crate::player::LoopBuffer,
-        seek_samples: u16,
+        seek_samples: i16,
         sample_count: u32,
     ) -> Option<crate::player::LoopBuffer> {
         if seek_samples == 0 && sample_count == 0 {
@@ -2057,19 +2310,27 @@ impl Library {
         }
         let total = buf.frames();
         let channels = buf.channels as usize;
-        let start = seek_samples as usize;
+        let start = seek_samples.max(0) as usize;
+        let padding = (-(seek_samples as i32)).max(0) as usize;
+        let padding = if sample_count > 0 {
+            padding.min(sample_count as usize)
+        } else {
+            padding
+        };
         let end = if sample_count > 0 {
-            (start + sample_count as usize).min(total)
+            (start + (sample_count as usize).saturating_sub(padding)).min(total)
         } else {
             total
         };
-        if start >= total || end <= start {
+        if start >= total || (end <= start && padding == 0) {
             return None;
         }
         let start_sample = start * channels;
         let end_sample = end * channels;
+        let mut samples = vec![0; padding * channels];
+        samples.extend_from_slice(&buf.samples[start_sample..end_sample]);
         let trimmed = crate::player::LoopBuffer {
-            samples: buf.samples[start_sample..end_sample].to_vec(),
+            samples,
             channels: buf.channels,
             rate: buf.rate,
         };
@@ -2298,10 +2559,9 @@ impl Library {
             }
         };
         let total = sounds.len();
-        let workers = std::thread::available_parallelism()
-            .map(usize::from)
-            .unwrap_or(2)
-            .clamp(1, 4);
+        // Preparation retains PCM and analysis scratch; never multiply that
+        // working set by the machine's CPU count.
+        let workers = 1;
 
         // Decode and BPM-analyze small bounded batches in parallel. Keep all
         // SQLite writes and atomic file copies on this worker thread and commit
@@ -2357,25 +2617,17 @@ impl Library {
                 }
             }
 
-            let decoded_batch = std::thread::scope(|scope| {
-                let handles: Vec<_> = decode_indices
-                    .iter()
-                    .map(|(slot, index)| {
-                        let sound = &sounds[*index];
-                        let slot = *slot;
-                        (slot, scope.spawn(move || prepare_sound(sound)))
-                    })
-                    .collect();
-                handles
-                    .into_iter()
-                    .map(|(slot, handle)| {
-                        let result = handle
-                            .join()
-                            .unwrap_or_else(|_| Err("audio decode worker panicked".to_string()));
-                        (slot, result)
-                    })
-                    .collect::<Vec<_>>()
-            });
+            let decoded_batch: Vec<_> = decode_indices
+                .into_iter()
+                .map(|(slot, index)| {
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        crate::check_cancelled()?;
+                        prepare_sound(&sounds[index], extract_audio)
+                    }))
+                    .unwrap_or_else(|_| Err("audio decode worker panicked".into()));
+                    (slot, result)
+                })
+                .collect();
             for (slot, result) in decoded_batch {
                 prepared[slot] = Some(result);
             }
@@ -2590,15 +2842,7 @@ impl Library {
             error: Some(reason),
         };
         let src = Path::new(path);
-        let data = match std::fs::metadata(src)
-            .map_err(|e| format!("cannot open file: {e}"))
-            .and_then(|m| {
-                if m.len() > 512 * 1024 * 1024 {
-                    Err("file exceeds the 512 MiB limit".to_string())
-                } else {
-                    std::fs::read(src).map_err(|e| format!("cannot read file: {e}"))
-                }
-            }) {
+        let data = match crate::bounded_io::read(src, 512 * 1024 * 1024) {
             Ok(d) => d,
             Err(e) => return fail(e),
         };
@@ -2699,6 +2943,8 @@ impl Library {
 
     /// Persist one pre-looped Tablist audio file under its looper group.
     /// The whole audio file remains the loop region; published BPM is retained.
+    // The import boundary deliberately mirrors the remote track DTO.
+    #[allow(clippy::too_many_arguments)]
     pub fn import_tablist_track(
         &self,
         looper_name: &str,
@@ -2849,7 +3095,14 @@ impl Library {
                 error: Some("already in library".to_string()),
             };
         }
-        let estimate = crate::analysis::estimate(&buf);
+        let estimate = if bpm.is_none() {
+            crate::analysis::estimate_with_context(
+                &buf,
+                crate::analysis::TempoContext::PerfectLoop4_4,
+            )
+        } else {
+            None
+        };
         let (effective_bpm, confidence) = match bpm {
             Some(bpm) => (Some(bpm), None),
             None => (
@@ -2880,61 +3133,26 @@ struct PreparedSound {
     estimate: Option<crate::analysis::BpmEstimate>,
 }
 
-pub(crate) fn decode_embedded_sound_file(
-    path: &str,
-    source_type: &str,
-    sound_id: u16,
-    expected_hash: &str,
-) -> Result<crate::player::LoopBuffer, String> {
-    const MAX_SOURCE_BYTES: u64 = 512 * 1024 * 1024;
-    let file = std::fs::File::open(path).map_err(|error| format!("cannot open source: {error}"))?;
-    let metadata = file
-        .metadata()
-        .map_err(|error| format!("cannot inspect source: {error}"))?;
-    if metadata.len() > MAX_SOURCE_BYTES {
-        return Err("source exceeds the 512 MiB limit".to_string());
-    }
-    let mut data = Vec::new();
-    file.take(MAX_SOURCE_BYTES + 1)
-        .read_to_end(&mut data)
-        .map_err(|error| format!("cannot read source: {error}"))?;
-    if data.len() as u64 > MAX_SOURCE_BYTES {
-        return Err("source exceeds the 512 MiB limit".to_string());
-    }
-    if sha256_hex(&data) != expected_hash {
-        return Err("the SWF/EXE source changed after import".to_string());
-    }
-    let swf_data = match source_type {
-        "swf" => data.as_slice(),
-        "exe" => {
-            let found = crate::import::exe::locate(&data)
-                .map_err(|error| crate::import::exe::user_message(&error))?;
-            &data[found.offset..found.offset + found.length]
-        }
-        _ => return Err("unsupported source-backed audio type".to_string()),
-    };
-    let parsed = crate::import::swf::parse_sound(swf_data, sound_id)
-        .map_err(|error| crate::import::swf::user_message(&error))?;
-    let sound = parsed
-        .sounds
-        .iter()
-        .find(|sound| sound.id == sound_id)
-        .ok_or_else(|| format!("embedded sound {sound_id} was not found in the source"))?;
-    // BPM is already persisted at import time. Playback only needs PCM, not
-    // another analysis pass, a WAV encoding, or copies of compressed audio.
+fn prepare_sound(sound: &Sound, extract_audio: bool) -> Result<PreparedSound, String> {
     let buffer = crate::player::decode_bytes(&sound.frames)?;
-    if sound.codec == "mp3" {
-        if let Some(trimmed) =
+    if !extract_audio {
+        let buffer = if sound.codec == "mp3" {
             Library::trim_mp3_buffer(&buffer, sound.seek_samples, sound.sample_count)
-        {
-            return Ok(trimmed);
-        }
+                .unwrap_or(buffer)
+        } else {
+            buffer
+        };
+        let estimate = crate::analysis::estimate_with_context(
+            &buffer,
+            crate::analysis::TempoContext::PerfectLoop4_4,
+        );
+        return Ok(PreparedSound {
+            buffer,
+            file_bytes: Vec::new(),
+            file_codec: sound.codec.clone(),
+            estimate,
+        });
     }
-    Ok(buffer)
-}
-
-fn prepare_sound(sound: &Sound) -> Result<PreparedSound, String> {
-    let buffer = crate::player::decode_bytes(&sound.frames)?;
     let (buffer, file_bytes, file_codec) =
         if sound.codec == "mp3" && (sound.seek_samples > 0 || sound.sample_count > 0) {
             if let Some((trimmed, wav)) =
@@ -2947,7 +3165,10 @@ fn prepare_sound(sound: &Sound) -> Result<PreparedSound, String> {
         } else {
             (buffer, sound.frames.clone(), sound.codec.clone())
         };
-    let estimate = crate::analysis::estimate(&buffer);
+    let estimate = crate::analysis::estimate_with_context(
+        &buffer,
+        crate::analysis::TempoContext::PerfectLoop4_4,
+    );
     Ok(PreparedSound {
         buffer,
         file_bytes,
@@ -2968,7 +3189,7 @@ fn normalize_cover(bytes: &[u8]) -> Result<Vec<u8>, String> {
     let mut limits = image::Limits::default();
     limits.max_image_width = Some(8192);
     limits.max_image_height = Some(8192);
-    limits.max_alloc = Some(128 * 1024 * 1024);
+    limits.max_alloc = Some(crate::memory::working_budget(128 * 1024 * 1024) as u64);
     reader.limits(limits);
     let image = reader
         .decode()
@@ -3168,8 +3389,24 @@ fn migrate(conn: &Connection) -> Result<(), String> {
         )
         .map_err(|e| format!("migration 9→10 failed: {e}"))?;
     }
+    if v < 11 {
+        conn.execute_batch(
+            "BEGIN;
+             CREATE TABLE linked_folders(
+               id INTEGER PRIMARY KEY AUTOINCREMENT, path TEXT NOT NULL UNIQUE,
+               extract_audio INTEGER NOT NULL, copy_source INTEGER NOT NULL,
+               device_id TEXT);
+             CREATE TABLE linked_folder_sources(
+               folder_id INTEGER NOT NULL REFERENCES linked_folders(id) ON DELETE CASCADE,
+               source_hash TEXT NOT NULL, complete INTEGER NOT NULL DEFAULT 0,
+               PRIMARY KEY(folder_id,source_hash));
+             PRAGMA user_version = 11;
+             COMMIT;",
+        )
+        .map_err(|e| format!("migration 10→11 failed: {e}"))?;
+    }
     Ok(())
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

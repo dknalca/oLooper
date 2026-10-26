@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type Ref } from "react";
 import {
   playerSeek,
   playerSetLoopSnapped,
@@ -14,13 +14,15 @@ interface Props {
   status: PlayerStatus | null;
   trackTitle: string | null;
   trackCover: string | null;
+  coverRef?: Ref<HTMLDivElement>;
   trackId: number | null;
+  playbackPath?: string | null;
   showCover: boolean;
   loopEditing: boolean;
   onStatusChange: (status: PlayerStatus) => void;
 }
 
-export default function Waveform({ refreshKey, status, trackTitle, trackCover, trackId, showCover, loopEditing, onStatusChange }: Props) {
+export default function Waveform({ refreshKey, status, trackTitle, trackCover, coverRef, trackId, playbackPath, showCover, loopEditing, onStatusChange }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const wrapRef = useRef<HTMLDivElement>(null);
   const statusRef = useRef<PlayerStatus | null>(null);
@@ -40,7 +42,7 @@ export default function Waveform({ refreshKey, status, trackTitle, trackCover, t
   const [dragging, setDragging] = useState<"start" | "end" | null>(null);
   const [trackDropActive, setTrackDropActive] = useState(false);
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; time: number } | null>(null);
-  const loadedPath = status?.path ?? null;
+  const loadedPath = !playbackPath || status?.path === playbackPath ? status?.path ?? null : null;
 
   useEffect(() => {
     const updateLibraryDrag = (event: Event) => {
@@ -147,8 +149,12 @@ export default function Waveform({ refreshKey, status, trackTitle, trackCover, t
     let raf = 0;
     let lastPoll = performance.now();
     let lastPos = 0;
+    let lastPaint = 0;
+    let lastInputs: unknown[] = [];
     const draw = () => {
       raf = requestAnimationFrame(draw);
+      const now = performance.now();
+      if (document.hidden || now - lastPaint < 1000 / 30) return;
       const canvas = canvasRef.current;
       const st = statusRef.current;
       const wave = waveRef.current;
@@ -159,9 +165,15 @@ export default function Waveform({ refreshKey, status, trackTitle, trackCover, t
         lastPoll = performance.now();
       }
       const pos = st.playing
-        ? lastPos + (performance.now() - lastPoll)
+        ? lastPos + (now - lastPoll) * st.speed_pct / 100
         : lastPos;
-        render(canvas, wave, st, pos, cuesRef.current, zoomRef.current, previewRef.current, loopEditingRef.current);
+      const inputs = [wave, pos, st.loop_start_ms, st.loop_end_ms, st.loop_enabled,
+        cuesRef.current, zoomRef.current, previewRef.current, loopEditingRef.current,
+        canvas.clientWidth, canvas.clientHeight, window.devicePixelRatio];
+      if (inputs.every((value, index) => value === lastInputs[index])) return;
+      lastInputs = inputs;
+      lastPaint = now;
+      render(canvas, wave, st, pos, cuesRef.current, zoomRef.current, previewRef.current, loopEditingRef.current);
     };
     raf = requestAnimationFrame(draw);
     return () => cancelAnimationFrame(raf);
@@ -225,7 +237,7 @@ export default function Waveform({ refreshKey, status, trackTitle, trackCover, t
     previewRef.current = null;
     setDragging(null);
     if (e.currentTarget.hasPointerCapture(e.pointerId)) e.currentTarget.releasePointerCapture(e.pointerId);
-    playerSetLoopSnapped(preview.start, preview.end)
+    playerSetLoopSnapped(preview.start, preview.end, statusRef.current?.generation)
       .then(onStatusChange)
       .catch((reason: unknown) => setError(String(reason)));
   };
@@ -313,6 +325,7 @@ export default function Waveform({ refreshKey, status, trackTitle, trackCover, t
       <div className="flex min-h-0 flex-1 gap-2 p-2">
         {showCover && (
           <div
+            ref={coverRef}
             onPointerDown={startCoverPointerDrag}
             onPointerMove={moveCoverPointerDrag}
             onPointerUp={finishCoverPointerDrag}
@@ -407,9 +420,11 @@ function render(
   const dpr = window.devicePixelRatio || 1;
   const width = canvas.clientWidth;
   const height = canvas.clientHeight;
-  if (canvas.width !== width * dpr || canvas.height !== height * dpr) {
-    canvas.width = width * dpr;
-    canvas.height = height * dpr;
+  const pixelWidth = Math.round(width * dpr);
+  const pixelHeight = Math.round(height * dpr);
+  if (canvas.width !== pixelWidth || canvas.height !== pixelHeight) {
+    canvas.width = pixelWidth;
+    canvas.height = pixelHeight;
   }
   const ctx = canvas.getContext("2d");
   if (!ctx) return;

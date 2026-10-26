@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Release tag to build (for example, v0.7.0)
+        description: Release tag to build (for example, v0.8.0)
         required: true
-        default: v0.7.0
+        default: v0.8.0
         type: string
 
 permissions:
@@ -54,8 +54,8 @@ jobs:
           node scripts/generate-icons.mjs
           pnpm run tauri build --target universal-apple-darwin --bundles app
           ditto src-tauri/target/universal-apple-darwin/release/bundle/macos/oLooper.app oLooper.app
-          lipo -archs oLooper.app/Contents/MacOS/oLooper | grep -q x86_64
-          lipo -archs oLooper.app/Contents/MacOS/oLooper | grep -q arm64
+          lipo -archs oLooper.app/Contents/MacOS/olooper | grep -q x86_64
+          lipo -archs oLooper.app/Contents/MacOS/olooper | grep -q arm64
           plutil -extract LSMinimumSystemVersion raw -o - oLooper.app/Contents/Info.plist | grep -qx '11.0'
           ./scripts/package-dmg.sh
           version="$(node -p "require('./src-tauri/tauri.conf.json').version")"

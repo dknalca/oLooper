@@ -2,6 +2,9 @@
 
 ## Scope
 
+Status: Tap tempo and persistence are implemented. Remaining unchecked criteria
+below require physical-device/manual interaction, not missing implementation.
+
 Let users replace a doubtful or missing BPM estimate by tapping the beat of the
 selected track, using the existing manual metadata editor and persistence flow.
 
@@ -24,6 +27,6 @@ selected track, using the existing manual metadata editor and persistence flow.
 - [x] Jittered intervals use a robust recent median rather than a single tap
   interval.
 - [x] A pause or invalid tempo range resets the tap sequence.
-- [ ] Saving a tapped value persists it as manual BPM and keeps existing metadata
+- [x] Saving a tapped value persists it as manual BPM and keeps existing metadata
   synchronization behavior.
 - [ ] Manual: tapping never starts or interrupts playback.

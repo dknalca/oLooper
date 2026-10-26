@@ -17,11 +17,12 @@ interface Props {
   onAudioOptions: () => void;
   onMidiOptions: () => void;
   onShortcuts: () => void;
+  onPreferences: () => void;
   trackBpm: number | null;
   children?: ReactNode;
 }
 
-export default function TopBar({ onLibraryReady, playing, onAudioOptions, onMidiOptions, onShortcuts, trackBpm, children }: Props) {
+export default function TopBar({ onLibraryReady, playing, onAudioOptions, onMidiOptions, onShortcuts, onPreferences, trackBpm, children }: Props) {
   const [status, setStatus] = useState<AppStatus | null>(null);
   const [root, setRoot] = useState("");
   const [setupOpen, setSetupOpen] = useState(false);
@@ -133,13 +134,20 @@ export default function TopBar({ onLibraryReady, playing, onAudioOptions, onMidi
 
   useEffect(() => {
     let cancelled = false;
+    let restoreFailed = false;
     const rememberedRoot = localStorage.getItem("olooper.library.root");
-    Promise.all([getAppStatus(), libraryDefaultRoot(), libraryRestore(rememberedRoot)])
+    Promise.all([getAppStatus(), libraryDefaultRoot(), libraryRestore(rememberedRoot).catch((cause) => {
+      restoreFailed = true;
+      if (!cancelled) setError(`Could not open the saved library: ${String(cause)}`);
+      return null;
+    })])
       .then(([appStatus, defaultRoot, savedRoot]) => {
         if (cancelled) return;
-        if (savedRoot) localStorage.setItem("olooper.library.root", savedRoot);
-        else if (rememberedRoot) localStorage.removeItem("olooper.library.root");
-        setRoot(savedRoot ?? defaultRoot);
+        try {
+          if (savedRoot) localStorage.setItem("olooper.library.root", savedRoot);
+          else if (rememberedRoot && !restoreFailed) localStorage.removeItem("olooper.library.root");
+        } catch (cause) { setError(`Library opened, but its preference could not be saved: ${String(cause)}`); }
+        setRoot(savedRoot ?? (restoreFailed ? rememberedRoot ?? defaultRoot : defaultRoot));
         setStatus({ ...appStatus, library_set: savedRoot !== null });
         if (savedRoot) onLibraryReady(savedRoot);
         else setSetupOpen(true);
@@ -165,7 +173,8 @@ export default function TopBar({ onLibraryReady, playing, onAudioOptions, onMidi
     libraryInit(root)
       .then((libraryRoot) => {
         setStatus((current) => current ? { ...current, library_set: true } : current);
-        localStorage.setItem("olooper.library.root", libraryRoot);
+        try { localStorage.setItem("olooper.library.root", libraryRoot); }
+        catch (cause) { setError(`Library opened, but its preference could not be saved: ${String(cause)}`); }
         setRoot(libraryRoot);
         setSetupOpen(false);
         onLibraryReady(libraryRoot);
@@ -243,6 +252,7 @@ export default function TopBar({ onLibraryReady, playing, onAudioOptions, onMidi
         </button>
         <button onClick={onMidiOptions} className="toolbar-button" title="Connect and map a MIDI controller">MIDI</button>
         <button onClick={onShortcuts} className="toolbar-button" title="Keyboard shortcuts">Shortcuts</button>
+        <button onClick={onPreferences} className="toolbar-button" title="Application appearance preferences">Preferences</button>
         {root && <span className="hidden min-w-0 flex-1 truncate text-[10px] text-text-secondary xl:block" title={displayLibraryPath(root)}>{displayLibraryPath(root)}</span>}
         <div className="ml-auto flex shrink-0 items-center gap-2 rounded-lg border border-border/60 bg-app px-3 py-2" title="Practice time while audio is playing">
           <span aria-hidden="true" className={`h-1.5 w-1.5 rounded-full ${playing ? "bg-success" : "bg-text-secondary/40"}`} />

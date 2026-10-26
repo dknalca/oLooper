@@ -1,5 +1,9 @@
 # 060 - Reliability and Safety Hardening
 
+> Historical hardening snapshot. The library root is now persisted in app
+> preferences; the beside-the-app `olooper-library.json` is read only as a
+> one-time migration from older builds. Current details: ADR 0006 and spec 010.
+
 ## Scope
 
 Make existing playback, import, library selection, and CWS extraction reliable without changing the audio-library ownership model.
@@ -19,7 +23,8 @@ Make existing playback, import, library selection, and CWS extraction reliable w
 ## Failure and persistence behavior
 
 - CWS length or decompression failures return a normal import error and never write output files.
-- The selected library contains the portable catalog and audio together; its selection file remains beside the executable/app bundle.
+- The selected library contains the portable catalog and audio together. Its
+  path is remembered in application preferences, not beside the executable.
 - Reveal failures are returned to the UI without executing a shell command string.
 
 ## Security and non-goals

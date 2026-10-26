@@ -1,10 +1,19 @@
-//! Tempo estimation: energy-flux onset envelope + autocorrelation.
+//! Tempo estimation: duration-constrained 4/4 loops, or generic onset analysis.
 //!
 //! An assistant, never an authority: returns a value + confidence, or
 //! `None` when nothing periodic stands out. Manual corrections always win
 //! (stored as `bpm_source='manual'`, never re-analyzed).
 
 use serde::{Deserialize, Serialize};
+
+#[path = "analysis_loop.rs"]
+mod loop_tempo;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TempoContext {
+    GeneralAudio,
+    PerfectLoop4_4,
+}
 
 /// Analysis window and search range.
 const HOP: usize = 512;
@@ -26,6 +35,9 @@ fn mixdown(buf: &crate::player::LoopBuffer) -> Vec<f32> {
     let frames = buf.frames();
     let mut out = Vec::with_capacity(frames);
     for f in 0..frames {
+        if f % 65536 == 0 && crate::check_cancelled().is_err() {
+            return Vec::new();
+        }
         let mut mix = 0f32;
         for c in 0..ch {
             mix += buf.samples.get(f * ch + c).copied().unwrap_or(0) as f32 / 32768.0;
@@ -86,6 +98,20 @@ fn normalize_bpm(mut bpm: f64) -> Option<f64> {
 }
 
 pub fn estimate(buf: &crate::player::LoopBuffer) -> Option<BpmEstimate> {
+    estimate_with_context(buf, TempoContext::GeneralAudio)
+}
+
+pub fn estimate_with_context(
+    buf: &crate::player::LoopBuffer,
+    context: TempoContext,
+) -> Option<BpmEstimate> {
+    match context {
+        TempoContext::GeneralAudio => estimate_general(buf),
+        TempoContext::PerfectLoop4_4 => loop_tempo::estimate(buf),
+    }
+}
+
+fn estimate_general(buf: &crate::player::LoopBuffer) -> Option<BpmEstimate> {
     if buf.rate == 0 || buf.frames() < buf.rate as usize {
         return None; // need ~1 s minimum
     }

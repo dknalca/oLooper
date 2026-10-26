@@ -112,3 +112,38 @@ fn persistent_cache_reuses_peaks_for_unchanged_audio() {
     assert_eq!(std::fs::read_dir(&cache).unwrap().count(), 1);
     std::fs::remove_dir_all(root).ok();
 }
+
+#[test]
+fn cache_rejects_oversized_entries_and_invalid_peak_values() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source.wav");
+    std::fs::write(&source, b"fingerprint").unwrap();
+    let target = cache_target(root.path(), &source, 64).unwrap();
+    let file = std::fs::File::create(&target).unwrap();
+    file.set_len(MAX_CACHE_ENTRY_BYTES + 1).unwrap();
+    assert!(cache_lookup(root.path(), &source, 64).is_none());
+    let invalid = WaveformData {
+        peaks: vec![2.0; 64],
+        duration_ms: 1000,
+        buckets: 64,
+    };
+    std::fs::write(&target, serde_json::to_vec(&invalid).unwrap()).unwrap();
+    assert!(cache_lookup(root.path(), &source, 64).is_none());
+}
+
+#[test]
+fn persistent_cache_enforces_aggregate_bytes_and_entry_count() {
+    let root = tempfile::tempdir().unwrap();
+    let oversized = root.path().join("oversized.json");
+    std::fs::File::create(&oversized)
+        .unwrap()
+        .set_len(MAX_CACHE_BYTES + 1)
+        .unwrap();
+    prune_cache(root.path());
+    assert!(!oversized.exists());
+    for index in 0..=MAX_CACHE_FILES {
+        std::fs::write(root.path().join(format!("{index}.json")), b"{}").unwrap();
+    }
+    prune_cache(root.path());
+    assert!(std::fs::read_dir(root.path()).unwrap().count() <= MAX_CACHE_FILES);
+}

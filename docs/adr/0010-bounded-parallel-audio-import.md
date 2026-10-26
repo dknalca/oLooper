@@ -1,7 +1,12 @@
 # ADR 0010 — Bounded parallel audio preparation during import
 
-- Status: accepted
+- Status: superseded in part by [ADR 0022](0022-audit-resource-and-library-write-bounds.md)
 - Date: 2026-09-27
+
+The 2026-10-25 audit replaces the parallel worker count below with one sound
+prepared at a time under a shared memory guard. Ordered commits, PCM reuse and
+the single import queue remain in effect. The original decision follows for
+historical context.
 
 ## Context
 
@@ -23,6 +28,9 @@ large loopers took a long time even though their sounds are independent.
   sequential, cancellation is checked before batches and while committing them.
 
 ## Consequences
+
+The worker-count and peak-memory statements below describe the original
+2026-09-27 decision only. Current preparation is sequential under ADR 0022.
 
 - Multi-core systems can decode and analyze several tracks concurrently without
   opening concurrent SQLite writers or changing library order.

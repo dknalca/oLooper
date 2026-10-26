@@ -24,6 +24,19 @@ behavior to the audio thread.
   storage; no MIDI data or device dependency enters the SQLite catalog.
 - Expose device selection and MIDI Learn in **oLooper → MIDI Options…**.
 
+### Named and portable presets (2026-10-21)
+
+- Keep named preset snapshots and the active working mapping in a versioned local
+  preference, migrating the previous single mapping into `Custom_map`.
+- Share mappings as versioned `olooper-midi-map` JSON documents containing only
+  action IDs, message kinds, channels, and note/CC numbers. Device IDs/names and
+  output connection preferences remain local; load/import rebinds to the connected
+  input. Validate against the action allowlist and reject ambiguous controls.
+- Bundle controller templates in `src/midi-presets/` using the exported format.
+  Initial S11/Rane 72 templates are empty pending hardware-verified assignments.
+- Use native dialogs for import/export, bounded file reads, and atomic export
+  replacement. No filesystem plugin or catalog schema change is needed.
+
 ## Consequences
 
 - Transport, cue, loop, AUTO, speed, and navigation actions can be driven from

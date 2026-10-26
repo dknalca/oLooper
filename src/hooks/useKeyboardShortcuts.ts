@@ -61,7 +61,8 @@ export default function useKeyboardShortcuts(libraryNavigationEnabled = true) {
       // Skip when typing in inputs.
       if (isTextInput(document.activeElement)) return;
       // Dialog controls own Space/Enter; tapping tempo must not toggle playback.
-      if (document.activeElement?.closest('[role="dialog"]')) return;
+      if (document.querySelector('[role="dialog"][aria-modal="true"]')
+        || document.activeElement?.closest('[role="slider"]')) return;
       // The library-view tabs already own left/right arrow navigation.
       if (e.target instanceof Element && e.target.closest('[role="tablist"]')) return;
       // Skip other modified shortcuts (allow Cmd+C, Cmd+V, etc.).
@@ -120,6 +121,11 @@ export default function useKeyboardShortcuts(libraryNavigationEnabled = true) {
           window.dispatchEvent(new CustomEvent("olooper:library-navigation", {
             detail: e.code === "ArrowUp" ? "up" : "down",
           }));
+          break;
+        }
+        case "KeyR": {
+          e.preventDefault();
+          window.dispatchEvent(new Event("olooper:random-loop"));
           break;
         }
         case "KeyL": {

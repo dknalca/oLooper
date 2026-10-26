@@ -23,7 +23,7 @@ fn copy_managed_audio_to_destination(source: &Path, destination: &Path) -> Resul
         .create_new(true)
         .open(destination)
         .map_err(|error| format!("cannot create desktop audio copy: {error}"))?;
-    let result = std::io::copy(&mut input, &mut output)
+    let result = crate::bounded_io::copy(&mut input, &mut output, 512 * 1024 * 1024)
         .and_then(|_| output.flush())
         .and_then(|_| output.sync_all())
         .map_err(|error| format!("cannot write desktop audio copy: {error}"));
@@ -34,11 +34,8 @@ fn copy_managed_audio_to_destination(source: &Path, destination: &Path) -> Resul
 }
 
 #[cfg(target_os = "macos")]
-#[allow(deprecated, unexpected_cfgs)]
+#[allow(deprecated, unexpected_cfgs, non_camel_case_types)]
 mod macos {
-    use cocoa::appkit::NSApp;
-    use cocoa::base::{id, nil};
-    use cocoa::foundation::{NSArray, NSAutoreleasePool, NSPoint, NSRect, NSSize, NSString};
     use dispatch::Queue;
     use objc::declare::ClassDecl;
     use objc::runtime::{Class, Object, Protocol, Sel};
@@ -47,6 +44,72 @@ mod macos {
     use std::os::raw::c_char;
     use std::path::{Path, PathBuf};
     use std::sync::OnceLock;
+
+    type id = *mut Object;
+    const NIL: id = std::ptr::null_mut();
+    #[allow(non_upper_case_globals)]
+    const nil: id = NIL;
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct NSPoint {
+        x: f64,
+        y: f64,
+    }
+    unsafe impl objc::Encode for NSPoint {
+        fn encode() -> objc::Encoding {
+            unsafe { objc::Encoding::from_str("{CGPoint=dd}") }
+        }
+    }
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct NSSize {
+        width: f64,
+        height: f64,
+    }
+    unsafe impl objc::Encode for NSSize {
+        fn encode() -> objc::Encoding {
+            unsafe { objc::Encoding::from_str("{CGSize=dd}") }
+        }
+    }
+    impl NSSize {
+        fn new(width: f64, height: f64) -> Self {
+            Self { width, height }
+        }
+    }
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct NSRect {
+        origin: NSPoint,
+        size: NSSize,
+    }
+    unsafe impl objc::Encode for NSRect {
+        fn encode() -> objc::Encoding {
+            unsafe { objc::Encoding::from_str("{CGRect={CGPoint=dd}{CGSize=dd}}") }
+        }
+    }
+    impl NSRect {
+        fn new(origin: NSPoint, size: NSSize) -> Self {
+            Self { origin, size }
+        }
+    }
+
+    struct AutoreleasePool(id);
+    impl AutoreleasePool {
+        unsafe fn new() -> Self {
+            Self(msg_send![class!(NSAutoreleasePool), new])
+        }
+    }
+    impl Drop for AutoreleasePool {
+        fn drop(&mut self) {
+            unsafe {
+                let _: () = msg_send![self.0, drain];
+            }
+        }
+    }
+    unsafe fn string(value: &str) -> id {
+        let allocated: id = msg_send![class!(NSString), alloc];
+        msg_send![allocated, initWithBytes:value.as_ptr() length:value.len() encoding:4usize]
+    }
 
     const NS_DRAG_OPERATION_COPY: u64 = 1;
 
@@ -69,9 +132,9 @@ mod macos {
 
     fn start_on_main_thread(path: &Path) -> Result<(), String> {
         unsafe {
-            let pool = NSAutoreleasePool::new(nil);
+            let _pool = AutoreleasePool::new();
             let result = (|| {
-                let app: id = NSApp();
+                let app: id = msg_send![class!(NSApplication), sharedApplication];
                 if app == nil {
                     return Err("macOS application object is unavailable".to_string());
                 }
@@ -97,8 +160,7 @@ mod macos {
                 }
 
                 let path_string = path.to_string_lossy();
-                let path_ns = NSString::alloc(nil).init_str(&path_string);
-                let _: id = msg_send![path_ns, retain];
+                let path_ns = string(&path_string);
                 let delegate_class = dragging_source_class();
                 let delegate: id = msg_send![delegate_class, new];
                 (*delegate).set_ivar("path", path_ns);
@@ -106,7 +168,8 @@ mod macos {
                 let workspace: id = msg_send![class!(NSWorkspace), sharedWorkspace];
                 let file_type: id = msg_send![workspace, typeOfFile:path_ns error:nil];
                 let file_type = if file_type == nil {
-                    NSString::alloc(nil).init_str("public.data")
+                    let fallback = string("public.data");
+                    msg_send![fallback, autorelease]
                 } else {
                     file_type
                 };
@@ -117,6 +180,18 @@ mod macos {
                     release_drag_source(delegate);
                     return Err("macOS could not prepare the audio file promise".to_string());
                 }
+                // NSFilePromiseProvider's delegate is weak. Associate a strong
+                // owner so a deferred promised-file write can outlive drag-ended.
+                unsafe extern "C" {
+                    fn objc_setAssociatedObject(
+                        object: id,
+                        key: *const u8,
+                        value: id,
+                        policy: usize,
+                    );
+                }
+                static DELEGATE_KEY: u8 = 0;
+                objc_setAssociatedObject(provider, &DELEGATE_KEY, delegate, 1);
                 let icon: id = msg_send![workspace, iconForFile:path_ns];
                 if icon != nil {
                     let _: () = msg_send![icon, setSize:NSSize::new(48.0, 48.0)];
@@ -127,15 +202,18 @@ mod macos {
                 let item: id = msg_send![class!(NSDraggingItem), alloc];
                 let item: id = msg_send![item, initWithPasteboardWriter:provider];
                 let _: () = msg_send![item, setDraggingFrame:frame contents:icon];
-                let items = NSArray::arrayWithObject(nil, item);
+                let items: id = msg_send![class!(NSArray), arrayWithObject:item];
                 let session: id = msg_send![view, beginDraggingSessionWithItems:items event:event source:delegate];
                 if session == nil {
+                    let _: () = msg_send![item, release];
+                    let _: () = msg_send![provider, release];
                     release_drag_source(delegate);
                     return Err("macOS did not start the Finder drag session".to_string());
                 }
+                let _: () = msg_send![item, release];
+                let _: () = msg_send![provider, release];
                 Ok(())
             })();
-            pool.drain();
             result
         }
     }
@@ -148,6 +226,16 @@ mod macos {
             declaration.add_protocol(Protocol::get("NSDraggingSource").unwrap());
             declaration.add_protocol(Protocol::get("NSFilePromiseProviderDelegate").unwrap());
             declaration.add_ivar::<*mut Object>("path");
+            extern "C" fn dealloc(this: &mut Object, _selector: Sel) {
+                unsafe {
+                    let path: *mut Object = *this.get_ivar("path");
+                    if !path.is_null() {
+                        let _: () = msg_send![path, release];
+                    }
+                    let _: () = msg_send![super(this, class!(NSObject)), dealloc];
+                }
+            }
+            declaration.add_method(sel!(dealloc), dealloc as extern "C" fn(&mut Object, Sel));
 
             extern "C" fn source_operation(
                 _this: &Object,
@@ -174,7 +262,7 @@ mod macos {
                         return nil;
                     }
                     let name: id = msg_send![path as id, lastPathComponent];
-                    msg_send![name, copy]
+                    name
                 }
             }
             declaration.add_method(
@@ -239,21 +327,20 @@ mod macos {
     }
 
     unsafe fn release_drag_source(delegate: id) {
-        let delegate_object = &*(delegate as *const Object);
-        let path: *mut Object = *delegate_object.get_ivar("path");
-        if !path.is_null() {
-            let _: () = msg_send![path, release];
-        }
         let _: () = msg_send![delegate, release];
     }
 
     fn promise_error(message: &str) -> id {
         unsafe {
-            let domain = NSString::alloc(nil).init_str("com.olooper.drag-out");
-            let description = NSString::alloc(nil).init_str(message);
-            let description_key = NSString::alloc(nil).init_str("NSLocalizedDescription");
+            let domain = string("com.olooper.drag-out");
+            let description = string(message);
+            let description_key = string("NSLocalizedDescription");
             let info: id = msg_send![class!(NSDictionary), dictionaryWithObject:description forKey:description_key];
-            msg_send![class!(NSError), errorWithDomain:domain code:1 userInfo:info]
+            let error: id = msg_send![class!(NSError), errorWithDomain:domain code:1 userInfo:info];
+            let _: () = msg_send![domain, release];
+            let _: () = msg_send![description, release];
+            let _: () = msg_send![description_key, release];
+            error
         }
     }
 
@@ -278,7 +365,7 @@ mod macos {
 pub fn start_file_drag_out(path: &Path) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
-        return macos::start_file_drag_out(path);
+        macos::start_file_drag_out(path)
     }
     #[cfg(not(target_os = "macos"))]
     {

@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { startPolling } from "../poll";
 import {
   audioOutputDevices,
   audioSetOutput,
@@ -124,21 +125,18 @@ export default function AudioSettingsDialog({
   useEffect(() => {
     if (!open) return;
     let active = true;
-    const poll = () => {
-      playerStatus().then((status) => {
-        if (!active) return;
-        setOutputLevels({
-          left: status.playing || testing ? status.output_left_level_pct : 0,
-          right: status.playing || testing ? status.output_right_level_pct : 0,
-        });
-        onPlayerStatusChange(status);
-      }).catch(() => {});
-    };
-    poll();
-    const interval = window.setInterval(poll, 100);
+    const stop = startPolling(async () => {
+      const status = await playerStatus();
+      if (!active) return;
+      setOutputLevels({
+        left: status.playing || testing ? status.output_left_level_pct : 0,
+        right: status.playing || testing ? status.output_right_level_pct : 0,
+      });
+      onPlayerStatusChange(status);
+    }, 100);
     return () => {
       active = false;
-      window.clearInterval(interval);
+      stop();
     };
   }, [open, onPlayerStatusChange, testing]);
 

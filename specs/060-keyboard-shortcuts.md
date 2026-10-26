@@ -17,6 +17,9 @@ No global shortcuts plugin; listener runs only while the app window is focused.
 4. `Cmd+O` opens the native **File → Import Files…** picker.
 5. `1` recalls the fixed CUE 1 at track start. `2`–`4` recall saved CUEs or
    save the current position when empty. `Shift+2`–`Shift+4` clears a CUE.
+6. `R` triggers the same "next random loop" action as the Random transport
+   button and the MIDI random mapping, using the current random scope (selected
+   looper or All tracks).
 
 ## Key mappings
 
@@ -29,6 +32,7 @@ No global shortcuts plugin; listener runs only while the app window is focused.
 | `←` (Left arrow) | Return to collections; no-op at collection level | Local library view |
 | `Shift+←` / `Shift+→` | Seek -/+5 seconds | Track loaded |
 | `L` | Toggle loop on/off | Track loaded |
+| `R` | Play the next random loop | Library ready |
 | `1` | Recall CUE 1 / track start | Track loaded |
 | `2`–`4` | Recall CUE, or save it if empty | Track loaded |
 | `Shift+2`–`Shift+4` | Clear saved CUE | Track loaded |
@@ -74,6 +78,7 @@ No global shortcuts plugin; listener runs only while the app window is focused.
 - [x] Loop selection wraps between the first and last loop in a collection.
 - [x] Shift+Left/Right seek ±5s, clamped to track bounds.
 - [x] L toggles loop enabled flag.
+- [x] R triggers the next random loop exactly like the Random transport button.
 - [x] `1` recalls CUE 1; `2`–`4` recall or save cues; Shift+`2`–`4` clears them.
 - [x] `+` and `-` change playback speed in 5% steps (50–200%).
 - [x] `Cmd+O` opens native file picker; selected files import automatically.

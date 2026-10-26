@@ -3,21 +3,41 @@ use std::sync::{Mutex, OnceLock};
 use tauri::Emitter as _;
 use tauri::Manager as _;
 
-static CANCELLED_IMPORTS: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+static CANCELLED_IMPORTS: OnceLock<Mutex<std::collections::HashMap<String, bool>>> =
+    OnceLock::new();
+thread_local! { static IMPORT_CONTEXT: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) }; }
+static EARLY_CANCELLATIONS: Mutex<std::collections::VecDeque<(String, std::time::Instant)>> =
+    Mutex::new(std::collections::VecDeque::new());
+
+pub(crate) fn check_cancelled() -> Result<(), String> {
+    if bpm_jobs::cancelled() {
+        return Err("BPM analysis cancelled".into());
+    }
+    if IMPORT_CONTEXT.with(|context| context.borrow().as_deref().is_some_and(import_cancelled)) {
+        Err("import cancelled".into())
+    } else {
+        Ok(())
+    }
+}
 
 fn import_cancelled(job_id: &str) -> bool {
-    CANCELLED_IMPORTS
-        .get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+    let active = CANCELLED_IMPORTS
+        .get_or_init(Default::default)
         .lock()
-        .map(|jobs| jobs.contains(job_id))
-        .unwrap_or(false)
+        .map(|jobs| jobs.get(job_id).copied().unwrap_or(false))
+        .unwrap_or(false);
+    active
+        || EARLY_CANCELLATIONS
+            .lock()
+            .map(|mut pending| {
+                pending.retain(|(_, time)| time.elapsed() < std::time::Duration::from_secs(30));
+                pending.iter().any(|(id, _)| id == job_id)
+            })
+            .unwrap_or(false)
 }
 
 fn import_unmark_cancelled(job_id: &str) {
-    if let Ok(mut jobs) = CANCELLED_IMPORTS
-        .get_or_init(|| Mutex::new(std::collections::HashSet::new()))
-        .lock()
-    {
+    if let Ok(mut jobs) = CANCELLED_IMPORTS.get_or_init(Default::default).lock() {
         jobs.remove(job_id);
     }
 }
@@ -29,15 +49,119 @@ async fn scan_looper_folder(path: String) -> Result<Vec<String>, String> {
         .map_err(|error| format!("Folder scan failed: {error}"))?
 }
 
+#[tauri::command]
+async fn library_link_folder(
+    path: String,
+    extract_audio: bool,
+    copy_source: bool,
+    database: Db<'_>,
+) -> Result<library::LinkedFolder, String> {
+    let root = require_lib(&db(&database)?)?.root.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        library::Library::open(&root)?.link_folder(
+            std::path::Path::new(&path),
+            extract_audio,
+            copy_source,
+        )
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+fn library_linked_folders(database: Db<'_>) -> Result<Vec<library::LinkedFolder>, String> {
+    require_lib(&db(&database)?)?.linked_folders()
+}
+
+#[tauri::command]
+fn library_source_folders(
+    source_hash: String,
+    database: Db<'_>,
+) -> Result<Vec<library::LinkedFolder>, String> {
+    require_lib(&db(&database)?)?.folders_for_source(&source_hash)
+}
+
+#[tauri::command]
+async fn library_rescan_folder(
+    id: i64,
+    library_root: String,
+    database: Db<'_>,
+) -> Result<library::FolderScan, String> {
+    let root = require_lib(&db(&database)?)?.root.clone();
+    if root != std::path::Path::new(&library_root) {
+        return Err("Library changed; reopen the folder list".into());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        std::fs::metadata(root.join("olooper.db"))
+            .map_err(|e| format!("Library unavailable: {e}"))?;
+        library::Library::open(&root)?.rescan_folder(id)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+fn import_linked_file(
+    id: i64,
+    library_root: String,
+    path: String,
+    job_id: String,
+    queue: tauri::State<'_, ImportQueue>,
+    database: Db<'_>,
+) -> Result<String, String> {
+    let guard = db(&database)?;
+    let lib = require_lib(&guard)?;
+    if lib.root != std::path::Path::new(&library_root) {
+        return Err("Library changed; rescan stopped".into());
+    }
+    let folder = lib
+        .linked_folders()?
+        .into_iter()
+        .find(|f| f.id == id)
+        .ok_or("Linked folder not found")?;
+    let canonical = std::path::Path::new(&path)
+        .canonicalize()
+        .map_err(|e| e.to_string())?;
+    if !canonical.starts_with(&folder.path) {
+        return Err("Source is outside its linked folder".into());
+    }
+    let kind = match canonical
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("swf") => ImportKind::Swf,
+        Some("exe") => ImportKind::Exe,
+        _ => return Err("Not an SWF/EXE looper".into()),
+    };
+    queue.enqueue(ImportJob {
+        root: lib.root.clone(),
+        kind,
+        extract_audio: folder.extract_audio,
+        copy_source: folder.copy_source,
+        paths: vec![canonical.to_str().ok_or("Invalid source path")?.into()],
+        cover_path: None,
+        job_id: job_id.clone(),
+    })?;
+    Ok(job_id)
+}
+
 pub mod analysis;
 pub mod audio_conversion;
 pub mod audio_log;
 pub mod autoloop;
+mod bounded_io;
+mod bpm_jobs;
 pub mod drag_out;
 pub mod import;
 mod import_folder;
+#[cfg(test)]
+mod ipc_tests;
 pub mod library;
+mod memory;
 pub mod midi;
+mod midi_map_files;
 pub mod player;
 pub mod tablist;
 pub mod waveform;
@@ -116,14 +240,17 @@ fn take_legacy_library_root_from(path: &std::path::Path) -> Result<Option<String
     if !path.exists() {
         return Ok(None);
     }
-    let data = std::fs::read(&path).map_err(|e| format!("cannot read library selection: {e}"))?;
+    let data = bounded_io::read(path, 64 * 1024)
+        .map_err(|e| format!("cannot read library selection: {e}"))?;
     let saved: SavedLibraryRoot =
         serde_json::from_slice(&data).map_err(|e| format!("cannot read library selection: {e}"))?;
-    std::fs::remove_file(&path)
+    std::fs::remove_file(path)
         .map_err(|e| format!("cannot remove old library selection file: {e}"))?;
     Ok(Some(saved.root))
 }
 
+// Event fields match the typed frontend IPC contract.
+#[allow(clippy::too_many_arguments)]
 fn emit_import_progress(
     app: &tauri::AppHandle,
     job_id: &str,
@@ -152,6 +279,7 @@ fn emit_import_progress(
 
 /// Final event of a worker-run import: carries the report so fire-and-forget
 /// commands still give the frontend per-file counts.
+#[allow(clippy::too_many_arguments)]
 fn emit_import_done(
     app: &tauri::AppHandle,
     job_id: &str,
@@ -178,18 +306,27 @@ fn emit_import_done(
     );
 }
 
-fn copy_dropped_source(root: &std::path::Path, path: &str, data: &[u8]) -> Result<String, String> {
+fn copy_dropped_source(
+    root: &std::path::Path,
+    path: &str,
+    data: &[u8],
+) -> Result<(String, bool), String> {
     let source_dir = root.join("loopersFlash");
     std::fs::create_dir_all(&source_dir)
         .map_err(|e| format!("cannot create loopersFlash inside the selected library: {e}"))?;
-    copy_dropped_source_to(&source_dir, path, data)
+    let canonical_root = root.canonicalize().map_err(|e| e.to_string())?;
+    let canonical_source = source_dir.canonicalize().map_err(|e| e.to_string())?;
+    if !canonical_source.starts_with(canonical_root) {
+        return Err("source-copy directory escapes the library".into());
+    }
+    copy_dropped_source_with_status_to(&source_dir, path, data)
 }
 
-fn copy_dropped_source_to(
+fn copy_dropped_source_with_status_to(
     source_dir: &std::path::Path,
     path: &str,
     data: &[u8],
-) -> Result<String, String> {
+) -> Result<(String, bool), String> {
     let source = std::path::Path::new(path);
     let stem = source
         .file_stem()
@@ -212,8 +349,12 @@ fn copy_dropped_source_to(
         };
         let dest = source_dir.join(format!("{stem}{suffix}.{ext}"));
         if dest.exists() {
-            if std::fs::read(&dest).ok().as_deref() == Some(data) {
-                return Ok(dest.to_string_lossy().to_string());
+            if bounded_io::read(&dest, MAX_INPUT_LEN as u64)
+                .ok()
+                .as_deref()
+                == Some(data)
+            {
+                return Ok((dest.to_string_lossy().to_string(), false));
             }
             continue;
         }
@@ -224,14 +365,17 @@ fn copy_dropped_source_to(
             .and_then(|_| tmp.as_file_mut().sync_all())
             .and_then(|_| tmp.seek(SeekFrom::Start(0)).map(|_| ()))
             .map_err(|e| format!("cannot copy source: {e}"))?;
-        let mut verified = Vec::new();
-        tmp.read_to_end(&mut verified)
-            .map_err(|e| format!("cannot verify source copy: {e}"))?;
-        if verified != data {
-            return Err("cannot verify source copy".to_string());
+        let mut verified = [0u8; 64 * 1024];
+        for chunk in data.chunks(verified.len()) {
+            check_cancelled()?;
+            tmp.read_exact(&mut verified[..chunk.len()])
+                .map_err(|e| format!("cannot verify source copy: {e}"))?;
+            if &verified[..chunk.len()] != chunk {
+                return Err("cannot verify source copy".into());
+            }
         }
         match tmp.persist_noclobber(&dest) {
-            Ok(_) => return Ok(dest.to_string_lossy().to_string()),
+            Ok(_) => return Ok((dest.to_string_lossy().to_string(), true)),
             Err(e) if e.error.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(format!("cannot save source copy: {e}")),
         }
@@ -286,11 +430,7 @@ pub struct ExeReport {
 const MAX_INPUT_LEN: usize = 512 * 1024 * 1024;
 
 fn read_input(path: &str) -> Result<Vec<u8>, String> {
-    let meta = std::fs::metadata(path).map_err(|e| format!("cannot open file: {e}"))?;
-    if meta.len() > MAX_INPUT_LEN as u64 {
-        return Err("file exceeds the 512 MiB inspection limit".to_string());
-    }
-    std::fs::read(path).map_err(|e| format!("cannot read file: {e}"))
+    bounded_io::read(path, MAX_INPUT_LEN as u64)
 }
 
 fn to_report(s: import::swf::SwfSounds) -> SwfReport {
@@ -320,25 +460,31 @@ fn to_report(s: import::swf::SwfSounds) -> SwfReport {
 }
 
 #[tauri::command]
-fn inspect_swf(path: String) -> Result<SwfReport, String> {
-    let data = read_input(&path)?;
-    import::swf::parse(&data)
-        .map(to_report)
-        .map_err(|e| import::swf::user_message(&e))
+async fn inspect_swf(path: String) -> Result<SwfReport, String> {
+    run_blocking(move || {
+        let data = read_input(&path)?;
+        import::swf::parse(&data)
+            .map(to_report)
+            .map_err(|e| import::swf::user_message(&e))
+    })
+    .await
 }
 
 #[tauri::command]
-fn inspect_exe(path: String) -> Result<ExeReport, String> {
-    let data = read_input(&path)?;
-    let found = import::exe::locate(&data).map_err(|e| import::exe::user_message(&e))?;
-    let inner = import::swf::parse(&data[found.offset..found.offset + found.length])
-        .map(to_report)
-        .map_err(|e| import::swf::user_message(&e))?;
-    Ok(ExeReport {
-        swf_offset: found.offset,
-        swf_length: found.length,
-        inner,
+async fn inspect_exe(path: String) -> Result<ExeReport, String> {
+    run_blocking(move || {
+        let data = read_input(&path)?;
+        let found = import::exe::locate(&data).map_err(|e| import::exe::user_message(&e))?;
+        let inner = import::swf::parse(&data[found.offset..found.offset + found.length])
+            .map(to_report)
+            .map_err(|e| import::swf::user_message(&e))?;
+        Ok(ExeReport {
+            swf_offset: found.offset,
+            swf_length: found.length,
+            inner,
+        })
     })
+    .await
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -348,6 +494,7 @@ pub fn run() {
         .manage(player::spawn())
         .manage(std::sync::Mutex::new(None::<library::Library>))
         .manage(Mutex::new(midi::MidiManager::default()))
+        .manage(bpm_jobs::BpmJobs::default())
         .setup(|app| {
             use tauri::menu::{MenuBuilder, MenuItem, SubmenuBuilder};
 
@@ -385,6 +532,13 @@ pub fn run() {
                 MenuItem::with_id(app, "midi-options", "MIDI Options…", true, None::<&str>)?;
             let audio_options =
                 MenuItem::with_id(app, "audio-options", "Audio Output…", true, None::<&str>)?;
+            let preferences = MenuItem::with_id(
+                app,
+                "preferences",
+                "Preferences…",
+                true,
+                Some("CmdOrCtrl+,"),
+            )?;
             let file_menu = SubmenuBuilder::new(app, "File")
                 .items(&[&open_files, &open_loopers, &import_folder, &import_audio])
                 .separator()
@@ -394,6 +548,8 @@ pub fn run() {
                 .build()?;
             let app_menu = SubmenuBuilder::new(app, "oLooper")
                 .about(None)
+                .separator()
+                .item(&preferences)
                 .separator()
                 .item(&audio_options)
                 .item(&midi_options)
@@ -444,6 +600,7 @@ pub fn run() {
                         | "choose-library"
                         | "show-shortcuts"
                         | "audio-options"
+                        | "preferences"
                         | "midi-options"
                 ) {
                     let _ = app.emit("olooper:menu-command", command);
@@ -454,7 +611,7 @@ pub fn run() {
             // processed sequentially with their own SQLite connection, so the
             // UI thread never blocks on a multi-minute import.
             let handle = app.handle().clone();
-            let (tx, rx) = std::sync::mpsc::channel::<ImportJob>();
+            let (tx, rx) = std::sync::mpsc::sync_channel::<ImportJob>(16);
             app.manage(ImportQueue { tx });
             std::thread::Builder::new()
                 .name("olooper-import".to_string())
@@ -463,13 +620,21 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            midi_map_files::midi_import_map_file,
+            midi_map_files::midi_export_map_file,
             scan_looper_folder,
+            library_link_folder,
+            library_linked_folders,
+            library_source_folders,
+            library_rescan_folder,
+            import_linked_file,
             get_app_status,
             greet,
             inspect_swf,
             inspect_exe,
             player_load,
             player_load_library_track,
+            player_prefetch,
             player_unload,
             audio_output_devices,
             audio_set_output,
@@ -496,6 +661,10 @@ pub fn run() {
             library_restore,
             library_status,
             library_list,
+            library_analyze_bpm,
+            reanalyze_bpm,
+            cancel_bpm_reanalysis,
+            bpm_reanalysis_status,
             library_drag_track_out,
             library_convert_wav_to_mp3_320,
             library_looper_order,
@@ -552,17 +721,30 @@ fn player_load(path: String, audio: Audio<'_>) -> Result<player::PlayerStatus, S
     audio.load(path)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn player_load_library_track(
     id: i64,
     audio: Audio<'_>,
     database: Db<'_>,
 ) -> Result<player::PlayerStatus, String> {
+    let guard = db(&database)?;
+    let request = require_lib(&guard)?.playback_request(id)?;
+    let result = audio.load_request(request);
+    drop(guard);
+    result
+}
+
+/// Warm the decoded cache for a likely next track without changing playback.
+#[tauri::command]
+async fn player_prefetch(id: i64, audio: Audio<'_>, database: Db<'_>) -> Result<bool, String> {
     let request = {
         let guard = db(&database)?;
         require_lib(&guard)?.playback_request(id)?
     };
-    audio.load_request(request)
+    let audio = audio.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || audio.prefetch(request))
+        .await
+        .map_err(|error| format!("prefetch worker failed: {error}"))?
 }
 
 #[tauri::command]
@@ -647,29 +829,45 @@ fn player_set_pitch_lock(enabled: bool, audio: Audio<'_>) -> Result<player::Play
 }
 
 #[tauri::command]
-fn player_set_loop(
+async fn player_set_loop(
     start_ms: u64,
     end_ms: u64,
     audio: Audio<'_>,
+    db: Db<'_>,
 ) -> Result<player::PlayerStatus, String> {
-    audio.set_loop(start_ms, end_ms)
+    let root = library_root(&db)?;
+    let status = audio.set_loop(start_ms, end_ms)?;
+    let saved = status.clone();
+    run_library_blocking(root, move |library| library.persist_practice(&saved)).await?;
+    Ok(status)
 }
 
 #[tauri::command]
-fn player_set_loop_snapped(
+async fn player_set_loop_snapped(
     start_ms: u64,
     end_ms: u64,
+    generation: Option<u64>,
     audio: Audio<'_>,
+    db: Db<'_>,
 ) -> Result<player::PlayerStatus, String> {
-    audio.set_loop_snapped(start_ms, end_ms)
+    let root = library_root(&db)?;
+    let status = audio.set_loop_snapped_for_generation(start_ms, end_ms, generation)?;
+    let saved = status.clone();
+    run_library_blocking(root, move |library| library.persist_practice(&saved)).await?;
+    Ok(status)
 }
 
 #[tauri::command]
-fn player_set_loop_enabled(
+async fn player_set_loop_enabled(
     enabled: bool,
     audio: Audio<'_>,
+    db: Db<'_>,
 ) -> Result<player::PlayerStatus, String> {
-    audio.set_loop_enabled(enabled)
+    let root = library_root(&db)?;
+    let status = audio.set_loop_enabled(enabled)?;
+    let saved = status.clone();
+    run_library_blocking(root, move |library| library.persist_practice(&saved)).await?;
+    Ok(status)
 }
 
 #[tauri::command]
@@ -720,11 +918,14 @@ fn player_snap_loop_boundary(
 }
 
 #[tauri::command]
-fn player_auto_loop(
+async fn player_auto_loop(
     bpm: Option<f64>,
     audio: Audio<'_>,
 ) -> Result<crate::autoloop::AutoLoopResult, String> {
-    audio.auto_loop(bpm)
+    let audio = audio.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || audio.auto_loop(bpm))
+        .await
+        .map_err(|e| format!("automatic loop worker failed: {e}"))?
 }
 
 #[tauri::command]
@@ -765,6 +966,14 @@ where
         .map_err(|error| format!("library worker failed: {error}"))?
 }
 
+async fn run_blocking<T: Send + 'static>(
+    operation: impl FnOnce() -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    tauri::async_runtime::spawn_blocking(operation)
+        .await
+        .map_err(|error| format!("worker failed: {error}"))?
+}
+
 #[tauri::command]
 fn library_default_root(app: tauri::AppHandle) -> Result<String, String> {
     let documents_dir = app
@@ -776,35 +985,68 @@ fn library_default_root(app: tauri::AppHandle) -> Result<String, String> {
 }
 
 #[tauri::command]
-fn library_init(root: String, db: Db<'_>) -> Result<String, String> {
-    let lib = library::Library::open(std::path::Path::new(&root))?;
-    let canonical = lib.root.canonicalize().map_err(|e| e.to_string())?;
-    audio_log::set_library_root(&canonical)
-        .map_err(|error| format!("cannot initialize audio log folder: {error}"))?;
-    let root = canonical.to_string_lossy().to_string();
-    *db.lock().map_err(|e| e.to_string())? = Some(lib);
+async fn library_init(
+    root: String,
+    db: Db<'_>,
+    audio: Audio<'_>,
+    jobs: tauri::State<'_, bpm_jobs::BpmJobs>,
+) -> Result<String, String> {
+    let (lib, root) = run_blocking(move || {
+        let lib = library::Library::open(std::path::Path::new(&root))?;
+        let canonical = lib.root.canonicalize().map_err(|e| e.to_string())?;
+        audio_log::set_library_root(&canonical)
+            .map_err(|error| format!("cannot initialize audio log folder: {error}"))?;
+        let root = canonical.to_string_lossy().to_string();
+        Ok((lib, root))
+    })
+    .await?;
+    let mut selected = db.lock().map_err(|e| e.to_string())?;
+    if let Some(previous) = selected.as_ref() {
+        jobs.cancel_root(&previous.root);
+    }
+    audio.unload()?;
+    *selected = Some(lib);
     Ok(root)
 }
 
 #[tauri::command]
-fn library_restore(root: Option<String>, db: Db<'_>) -> Result<Option<String>, String> {
-    let root = match root {
-        Some(root) => Some(root),
-        None => take_legacy_library_root()?,
-    };
-    let Some(root) = root else {
+async fn library_restore(
+    root: Option<String>,
+    db: Db<'_>,
+    audio: Audio<'_>,
+    jobs: tauri::State<'_, bpm_jobs::BpmJobs>,
+) -> Result<Option<String>, String> {
+    let result = run_blocking(
+        move || -> Result<Option<(library::Library, String)>, String> {
+            let root = match root {
+                Some(root) => Some(root),
+                None => take_legacy_library_root()?,
+            };
+            let Some(root) = root else {
+                return Ok(None);
+            };
+            let path = std::path::Path::new(&root);
+            if !path.is_dir() {
+                return Ok(None);
+            }
+            let lib = library::Library::open(path)?;
+            let canonical = lib.root.canonicalize().map_err(|e| e.to_string())?;
+            audio_log::set_library_root(&canonical)
+                .map_err(|error| format!("cannot initialize audio log folder: {error}"))?;
+            Ok(Some((lib, canonical.to_string_lossy().to_string())))
+        },
+    )
+    .await?;
+    let Some((lib, root)) = result else {
         return Ok(None);
     };
-    let path = std::path::Path::new(&root);
-    if !path.is_dir() {
-        return Ok(None);
+    let mut selected = db.lock().map_err(|e| e.to_string())?;
+    if let Some(previous) = selected.as_ref() {
+        jobs.cancel_root(&previous.root);
     }
-    let lib = library::Library::open(path)?;
-    let canonical = lib.root.canonicalize().map_err(|e| e.to_string())?;
-    audio_log::set_library_root(&canonical)
-        .map_err(|error| format!("cannot initialize audio log folder: {error}"))?;
-    *db.lock().map_err(|e| e.to_string())? = Some(lib);
-    Ok(Some(canonical.to_string_lossy().to_string()))
+    audio.unload()?;
+    *selected = Some(lib);
+    Ok(Some(root))
 }
 
 #[tauri::command]
@@ -880,9 +1122,46 @@ fn library_status(db: Db<'_>) -> Result<serde_json::Value, String> {
 }
 
 #[tauri::command]
-fn library_list(db: Db<'_>) -> Result<Vec<library::Track>, String> {
-    let g = self::db(&db)?;
-    require_lib(&g)?.list_tracks()
+async fn library_list(db: Db<'_>) -> Result<Vec<library::Track>, String> {
+    run_library_blocking(library_root(&db)?, |library| library.list_tracks()).await
+}
+
+#[tauri::command]
+async fn library_analyze_bpm(id: i64, db: Db<'_>) -> Result<library::TempoSuggestion, String> {
+    run_library_blocking(library_root(&db)?, move |library| library.analyze_bpm(id)).await
+}
+
+#[tauri::command]
+async fn reanalyze_bpm(
+    scope: bpm_jobs::BpmScope,
+    job_id: String,
+    db: Db<'_>,
+    jobs: tauri::State<'_, bpm_jobs::BpmJobs>,
+    app: tauri::AppHandle,
+) -> Result<String, String> {
+    let root = library_root(&db)?;
+    let ids =
+        run_library_blocking(root.clone(), move |library| library.bpm_scope_ids(&scope)).await?;
+    let selected = self::db(&db)?;
+    if require_lib(&selected)?.root != root {
+        return Err("Library changed before BPM analysis started".into());
+    }
+    jobs.start(root, ids, job_id, app)
+}
+
+#[tauri::command]
+fn cancel_bpm_reanalysis(
+    job_id: String,
+    jobs: tauri::State<'_, bpm_jobs::BpmJobs>,
+) -> Result<(), String> {
+    jobs.cancel(&job_id)
+}
+
+#[tauri::command]
+fn bpm_reanalysis_status(
+    jobs: tauri::State<'_, bpm_jobs::BpmJobs>,
+) -> Result<Option<bpm_jobs::BpmProgress>, String> {
+    jobs.status()
 }
 
 #[tauri::command]
@@ -960,12 +1239,15 @@ fn library_reorder_playlist(
 }
 
 #[tauri::command]
-fn library_random_track(
+async fn library_random_track(
     exclude_id: Option<i64>,
+    source_hash: Option<String>,
     db: Db<'_>,
 ) -> Result<Option<library::Track>, String> {
-    let g = self::db(&db)?;
-    require_lib(&g)?.random_track(exclude_id)
+    run_library_blocking(library_root(&db)?, move |library| {
+        library.random_track(exclude_id, source_hash.as_deref())
+    })
+    .await
 }
 
 #[tauri::command]
@@ -1000,9 +1282,8 @@ fn library_update_bpm(
 }
 
 #[tauri::command]
-fn library_remove(id: i64, db: Db<'_>) -> Result<bool, String> {
-    let g = self::db(&db)?;
-    require_lib(&g)?.remove_track(id)
+async fn library_remove(id: i64, db: Db<'_>) -> Result<bool, String> {
+    run_library_blocking(library_root(&db)?, move |library| library.remove_track(id)).await
 }
 
 #[tauri::command]
@@ -1044,39 +1325,51 @@ async fn library_export_tracks(
 }
 
 #[tauri::command]
-fn library_rename_looper(source_hash: String, name: String, db: Db<'_>) -> Result<(), String> {
-    let g = self::db(&db)?;
-    require_lib(&g)?.rename_looper(&source_hash, &name)
+async fn library_rename_looper(
+    source_hash: String,
+    name: String,
+    db: Db<'_>,
+) -> Result<(), String> {
+    run_library_blocking(library_root(&db)?, move |library| {
+        library.rename_looper(&source_hash, &name)
+    })
+    .await
 }
 
 #[tauri::command]
-fn library_remove_looper(source_hash: String, db: Db<'_>) -> Result<usize, String> {
-    let g = self::db(&db)?;
-    require_lib(&g)?.remove_looper(&source_hash)
+async fn library_remove_looper(source_hash: String, db: Db<'_>) -> Result<usize, String> {
+    run_library_blocking(library_root(&db)?, move |library| {
+        library.remove_looper(&source_hash)
+    })
+    .await
 }
 
 #[tauri::command]
-fn library_group_directory(source_hash: String, db: Db<'_>) -> Result<String, String> {
-    let g = self::db(&db)?;
-    Ok(require_lib(&g)?
-        .group_directory(&source_hash)?
-        .to_string_lossy()
-        .to_string())
+async fn library_group_directory(source_hash: String, db: Db<'_>) -> Result<String, String> {
+    run_library_blocking(library_root(&db)?, move |library| {
+        Ok(library
+            .group_directory(&source_hash)?
+            .to_string_lossy()
+            .to_string())
+    })
+    .await
 }
 
 #[tauri::command]
-fn library_group_cover(source_hash: String, db: Db<'_>) -> Result<Option<String>, String> {
-    let g = self::db(&db)?;
-    require_lib(&g)?.group_cover_data_url(&source_hash)
+async fn library_group_cover(source_hash: String, db: Db<'_>) -> Result<Option<String>, String> {
+    run_library_blocking(library_root(&db)?, move |library| {
+        library.group_cover_data_url(&source_hash)
+    })
+    .await
 }
 
 #[tauri::command]
 async fn library_get_serato_metadata(
     track_id: i64,
     db: Db<'_>,
-) -> Result<library::SeratoMetadata, String> {
+) -> Result<library::SeratoMetadataSnapshot, String> {
     run_library_blocking(library_root(&db)?, move |library| {
-        library.get_serato_metadata(track_id)
+        library.serato_metadata_snapshot(track_id, None)
     })
     .await
 }
@@ -1087,9 +1380,9 @@ async fn library_set_serato_cue(
     slot: i64,
     position_ms: Option<i64>,
     db: Db<'_>,
-) -> Result<library::SeratoMetadata, String> {
+) -> Result<library::SeratoMetadataSnapshot, String> {
     run_library_blocking(library_root(&db)?, move |library| {
-        library.set_serato_cue(track_id, slot, position_ms)
+        library.serato_metadata_snapshot(track_id, Some((slot, position_ms)))
     })
     .await
 }
@@ -1186,22 +1479,27 @@ fn midi_disconnect(state: tauri::State<'_, Mutex<midi::MidiManager>>) -> Result<
 }
 
 #[tauri::command]
-fn waveform_peaks(path: String, buckets: usize) -> Result<waveform::WaveformData, String> {
-    let data = read_input(&path)?;
-    waveform::compute(&data, buckets)
+async fn waveform_peaks(path: String, buckets: usize) -> Result<waveform::WaveformData, String> {
+    run_blocking(move || {
+        let data = read_input(&path)?;
+        waveform::compute(&data, buckets)
+    })
+    .await
 }
 
 #[tauri::command]
-fn player_waveform_peaks(
+async fn player_waveform_peaks(
     path: String,
     buckets: usize,
     audio: Audio<'_>,
     db: Db<'_>,
 ) -> Result<waveform::WaveformData, String> {
-    let cache_dir = require_lib(&self::db(&db)?)?
-        .root
-        .join(".olooper-cache/waveforms");
-    audio.waveform_peaks(&path, buckets, &cache_dir)
+    let cache_dir =
+        require_lib(&self::db(&db)?)?.cache_directory(&[".olooper-cache", "waveforms"])?;
+    let audio = audio.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || audio.waveform_peaks(&path, buckets, &cache_dir))
+        .await
+        .map_err(|e| format!("waveform worker failed: {e}"))?
 }
 
 fn looper_name(path: &str) -> String {
@@ -1214,11 +1512,25 @@ fn looper_name(path: &str) -> String {
 
 #[tauri::command]
 fn cancel_import(job_id: String) -> Result<(), String> {
-    CANCELLED_IMPORTS
-        .get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+    if job_id.is_empty() || job_id.len() > 128 {
+        return Err("invalid import job ID".into());
+    }
+    let mut jobs = CANCELLED_IMPORTS
+        .get_or_init(Default::default)
         .lock()
-        .map_err(|e| e.to_string())?
-        .insert(job_id);
+        .map_err(|e| e.to_string())?;
+    if let Some(cancelled) = jobs.get_mut(&job_id) {
+        *cancelled = true;
+    } else {
+        let mut pending = EARLY_CANCELLATIONS.lock().map_err(|e| e.to_string())?;
+        pending.retain(|(id, time)| {
+            id != &job_id && time.elapsed() < std::time::Duration::from_secs(30)
+        });
+        while pending.len() >= 32 {
+            pending.pop_front();
+        }
+        pending.push_back((job_id, std::time::Instant::now()));
+    }
     Ok(())
 }
 
@@ -1244,7 +1556,39 @@ struct ImportJob {
 }
 
 struct ImportQueue {
-    tx: std::sync::mpsc::Sender<ImportJob>,
+    tx: std::sync::mpsc::SyncSender<ImportJob>,
+}
+
+impl ImportQueue {
+    fn enqueue(&self, job: ImportJob) -> Result<(), String> {
+        if job.job_id.is_empty()
+            || job.job_id.len() > 128
+            || job.paths.is_empty()
+            || job.paths.len() > 10_000
+            || job.paths.iter().any(|path| path.len() > 32768)
+            || job.paths.iter().map(String::len).sum::<usize>() > 1024 * 1024
+            || job
+                .cover_path
+                .as_ref()
+                .is_some_and(|path| path.len() > 32768)
+        {
+            return Err("invalid import job".into());
+        }
+        let mut jobs = CANCELLED_IMPORTS
+            .get_or_init(Default::default)
+            .lock()
+            .map_err(|e| e.to_string())?;
+        if jobs.contains_key(&job.job_id) {
+            return Err("import job ID already in use".into());
+        }
+        let id = job.job_id.clone();
+        jobs.insert(id.clone(), false);
+        if let Err(error) = self.tx.try_send(job) {
+            jobs.remove(&id);
+            return Err(format!("import queue is busy or unavailable: {error}"));
+        }
+        Ok(())
+    }
 }
 
 fn run_swf_job(app: &tauri::AppHandle, job: &ImportJob) {
@@ -1287,17 +1631,7 @@ fn run_container_job(app: &tauri::AppHandle, job: &ImportJob, exe: bool) {
             return;
         }
     };
-    let copied_path = if job.copy_source {
-        match copy_dropped_source(&job.root, path, &data) {
-            Ok(path) => path,
-            Err(e) => {
-                fail(e);
-                return;
-            }
-        }
-    } else {
-        path.to_string()
-    };
+    let copied_path = path.to_string();
     emit_import_progress(
         app,
         &job.job_id,
@@ -1371,6 +1705,38 @@ fn run_container_job(app: &tauri::AppHandle, job: &ImportJob, exe: bool) {
         }
     };
     let source_hash = library::sha256_hex(&data);
+    if import_cancelled(&job.job_id) {
+        fail("import cancelled".into());
+        return;
+    }
+    let (copied_path, created) = if job.copy_source {
+        match copy_dropped_source(&job.root, path, &data) {
+            Ok(copy) => copy,
+            Err(error) => {
+                fail(error);
+                return;
+            }
+        }
+    } else {
+        (copied_path, false)
+    };
+    struct CopyCleanup<'a> {
+        library: &'a library::Library,
+        path: &'a str,
+        created: bool,
+    }
+    impl Drop for CopyCleanup<'_> {
+        fn drop(&mut self) {
+            if self.created && self.library.source_reference_count(self.path).ok() == Some(0) {
+                let _ = std::fs::remove_file(self.path);
+            }
+        }
+    }
+    let _cleanup = CopyCleanup {
+        library: &lib,
+        path: &copied_path,
+        created,
+    };
     let mut report_progress = |stage: &str, current: usize, total: usize| {
         if import_cancelled(&job.job_id) {
             return Err("import cancelled".to_string());
@@ -1415,11 +1781,34 @@ fn run_container_job(app: &tauri::AppHandle, job: &ImportJob, exe: bool) {
             &mut report_progress,
         )
     };
+    let skipped = || {
+        sounds.skipped.iter().map(|sound| library::FailedSound {
+            id: sound.id as i64,
+            reason: sound.reason.to_string(),
+        })
+    };
+    let report = match report {
+        Ok(mut report) => {
+            report.failed.extend(skipped());
+            Ok(report)
+        }
+        Err((mut report, error)) => {
+            report.failed.extend(skipped());
+            Err((report, error))
+        }
+    };
     let imported_tracks = match &report {
         Ok(report) => report.added + report.already_there,
         Err((partial, _)) => partial.added + partial.already_there,
     };
     if imported_tracks > 0 {
+        let complete = matches!(&report, Ok(report) if report.failed.is_empty());
+        if let Err(error) = lib.record_folder_source(path, &source_hash, complete) {
+            fail(format!(
+                "Audio imported, but folder association failed: {error}"
+            ));
+            return;
+        }
         if let Some(cover) = sounds.cover_image.as_deref() {
             if let Err(error) = lib.save_group_cover(&source_hash, cover) {
                 eprintln!("[oLooper] SWF cover was not saved: {error}");
@@ -1431,8 +1820,8 @@ fn run_container_job(app: &tauri::AppHandle, job: &ImportJob, exe: bool) {
             emit_import_done(
                 app,
                 &job.job_id,
-                report.added + report.already_there,
-                sounds.sounds.len(),
+                report.added + report.already_there + report.failed.len(),
+                sounds.sounds.len() + sounds.skipped.len(),
                 &copied_path,
                 Some(report),
                 None,
@@ -1460,13 +1849,27 @@ fn run_container_job(app: &tauri::AppHandle, job: &ImportJob, exe: bool) {
 
 fn import_worker_loop(app: tauri::AppHandle, rx: std::sync::mpsc::Receiver<ImportJob>) {
     for job in rx {
-        match job.kind {
+        IMPORT_CONTEXT.with(|context| *context.borrow_mut() = Some(job.job_id.clone()));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match job.kind {
             ImportKind::Swf => run_swf_job(&app, &job),
             ImportKind::Exe => run_exe_job(&app, &job),
             ImportKind::Custom => run_custom_job(&app, &job),
             ImportKind::Tablist => run_tablist_job(&app, &job),
+        }));
+        if result.is_err() {
+            emit_import_done(
+                &app,
+                &job.job_id,
+                0,
+                0,
+                "Import worker failed; completed tracks remain in the library",
+                None,
+                None,
+                Some("import decoder failed".into()),
+            );
         }
         import_unmark_cancelled(&job.job_id);
+        IMPORT_CONTEXT.with(|context| *context.borrow_mut() = None);
     }
 }
 
@@ -1667,8 +2070,7 @@ fn import_swf(
     // Short lock: clone the root, then release. The worker does the rest.
     let root = require_lib(&self::db(&db)?)?.root.clone();
     queue
-        .tx
-        .send(ImportJob {
+        .enqueue(ImportJob {
             root,
             kind: ImportKind::Swf,
             extract_audio,
@@ -1696,8 +2098,7 @@ fn import_exe(
     // Short lock: clone the root, then release. The worker does the rest.
     let root = require_lib(&self::db(&db)?)?.root.clone();
     queue
-        .tx
-        .send(ImportJob {
+        .enqueue(ImportJob {
             root,
             kind: ImportKind::Exe,
             extract_audio,
@@ -1726,8 +2127,7 @@ fn import_custom(
     // Short lock: clone the root, then release. The worker does the rest.
     let root = require_lib(&self::db(&db)?)?.root.clone();
     queue
-        .tx
-        .send(ImportJob {
+        .enqueue(ImportJob {
             root,
             kind: ImportKind::Custom,
             extract_audio: true,
@@ -1754,8 +2154,7 @@ fn import_tablist(
     }
     let root = require_lib(&self::db(&db)?)?.root.clone();
     queue
-        .tx
-        .send(ImportJob {
+        .enqueue(ImportJob {
             root,
             kind: ImportKind::Tablist,
             extract_audio: true,
@@ -1909,14 +2308,18 @@ mod tests {
 
         let library_root = root.join("selected-library");
         let source_root = library_root.join("loopersFlash");
-        let first = copy_dropped_source(&library_root, "/drop/My Looper.swf", b"first").unwrap();
+        let (first, created) =
+            copy_dropped_source(&library_root, "/drop/My Looper.swf", b"first").unwrap();
+        assert!(created);
         assert_eq!(std::fs::read(&first).unwrap(), b"first");
         assert!(std::path::Path::new(&first).starts_with(&library_root));
 
-        let repeated = copy_dropped_source(&library_root, "/drop/My Looper.swf", b"first").unwrap();
+        let (repeated, created) =
+            copy_dropped_source(&library_root, "/drop/My Looper.swf", b"first").unwrap();
+        assert!(!created);
         assert_eq!(repeated, first);
 
-        let collision =
+        let (collision, _) =
             copy_dropped_source(&library_root, "/drop/My Looper.swf", b"second").unwrap();
         assert_ne!(collision, first);
         assert!(collision.ends_with("My Looper (2).swf"));
@@ -1928,7 +2331,7 @@ mod tests {
             let sentinel = root.join("outside-source");
             std::fs::write(&sentinel, b"untouched").unwrap();
             std::os::unix::fs::symlink(&sentinel, source_root.join("Another.exe.tmp")).unwrap();
-            let copied =
+            let (copied, _) =
                 copy_dropped_source(&library_root, "/drop/Another.exe", b"projector").unwrap();
             assert_eq!(std::fs::read(copied).unwrap(), b"projector");
             assert_eq!(std::fs::read(sentinel).unwrap(), b"untouched");
@@ -1936,4 +2339,40 @@ mod tests {
 
         std::fs::remove_dir_all(root).unwrap();
     }
+}
+#[test]
+fn import_admission_is_bounded_and_ids_are_unique() {
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    let queue = ImportQueue { tx };
+    let job = |id: &str| ImportJob {
+        root: std::path::PathBuf::new(),
+        kind: ImportKind::Swf,
+        extract_audio: false,
+        copy_source: false,
+        paths: vec!["input.swf".into()],
+        cover_path: None,
+        job_id: id.into(),
+    };
+    queue.enqueue(job("queue-regression-a")).unwrap();
+    assert!(queue.enqueue(job("queue-regression-a")).is_err());
+    assert!(queue.enqueue(job("queue-regression-b")).is_err());
+    rx.recv().unwrap();
+    import_unmark_cancelled("queue-regression-a");
+    queue.enqueue(job("queue-regression-b")).unwrap();
+    rx.recv().unwrap();
+    import_unmark_cancelled("queue-regression-b");
+}
+
+#[test]
+fn cancellation_can_precede_enqueue_without_unbounded_tombstones() {
+    for index in 0..100 {
+        cancel_import(format!("early-regression-{index}")).unwrap();
+    }
+    assert!(import_cancelled("early-regression-99"));
+    assert!(!import_cancelled("early-regression-0"));
+    assert!(EARLY_CANCELLATIONS.lock().unwrap().len() <= 32);
+    EARLY_CANCELLATIONS
+        .lock()
+        .unwrap()
+        .retain(|(id, _)| !id.starts_with("early-regression-"));
 }

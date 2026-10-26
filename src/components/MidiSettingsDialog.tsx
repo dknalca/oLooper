@@ -1,4 +1,6 @@
 import { useEffect, useState } from "react";
+import MidiMapPresets from "./MidiMapPresets";
+import type { MidiMapState } from "../midiMaps";
 import {
   midiConnectedInput,
   midiConnectedOutput,
@@ -45,6 +47,8 @@ interface Props {
   inputId: string | null;
   outputId: string | null;
   bindings: Partial<Record<MidiAction, MidiBinding>>;
+  maps: MidiMapState;
+  onMapsChange: (maps: MidiMapState) => void;
   learningAction: MidiAction | null;
   conflictAction: MidiAction | null;
   onInputIdChange: (id: string | null) => void;
@@ -63,6 +67,8 @@ export default function MidiSettingsDialog({
   inputId,
   outputId,
   bindings,
+  maps,
+  onMapsChange,
   learningAction,
   conflictAction,
   onInputIdChange,
@@ -194,6 +200,7 @@ export default function MidiSettingsDialog({
           <button onClick={onClose} className="dialog-close"><span aria-hidden="true">×</span> Close</button>
         </header>
 
+        <div className="min-h-0 flex-1 overflow-y-auto">
         <section className="mb-4 rounded border border-border bg-elevated/50 p-3">
           <div className="flex flex-wrap items-center gap-2">
             <label className="min-w-0 flex-1 text-[10px] text-text-secondary">
@@ -245,13 +252,15 @@ export default function MidiSettingsDialog({
           <p className="mt-2 text-[10px] text-text-secondary">When supported by the controller, assigned Note/CC pads are lit using MIDI feedback. LED color depends on the controller.</p>
         </section>
 
+        <MidiMapPresets maps={maps} input={connected} onChange={onMapsChange} />
+
         {conflictAction && (
           <p className="mb-3 rounded border border-accent/30 bg-accent/10 px-3 py-2 text-[10px] text-text" role="status">
             This control was already assigned to {MIDI_ACTIONS.find((action) => action.id === conflictAction)?.label}. Its assignment moved to the action you just learned.
           </p>
         )}
 
-        <div className="min-h-0 flex-1 overflow-y-auto">
+        <div>
           {(["Transport", "Cues", "Library", "Audio", "Practice"] as const).map((group) => (
             <section key={group} className="mb-4">
               <h3 className="mb-2 text-[10px] font-semibold uppercase tracking-wider text-text-secondary">{group}</h3>
@@ -277,6 +286,7 @@ export default function MidiSettingsDialog({
               </div>
             </section>
           ))}
+        </div>
         </div>
         <p className="mt-2 text-[10px] text-text-secondary">Note On triggers on press. Button CCs trigger on 0→nonzero. The library encoder uses relative CC values below 64 for down and above 64 for up; 0 and 64 are ignored. Assignments are stored locally per input.</p>
       </section>

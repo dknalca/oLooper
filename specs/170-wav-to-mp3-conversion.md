@@ -1,5 +1,8 @@
 # 170 — On-demand WAV to MP3 320 kbps conversion
 
+- Status: implemented. Automated tests cover encoding, tags, IDs and failure
+  preservation; complete the manual active-track/Serato checks before release.
+
 ## Scope
 
 Let a user convert one library-managed WAV loop to constant-bitrate MP3 at
@@ -33,12 +36,15 @@ the output validates.
 
 ## Acceptance criteria
 
+Unchecked criteria below require the named/manual release validation; they do
+not mean the conversion path itself is absent.
+
 - [ ] The row displays the format and offers conversion only for WAV loops.
-- [ ] Conversion creates a decodable 320 kbps MP3 and replaces the managed WAV
+- [x] Conversion creates a decodable 320 kbps MP3 and replaces the managed WAV
   only after output, metadata, and catalog changes validate.
 - [ ] CUEs, saved Serato loops, BPM, group, favorites, playlists, and source
   provenance remain intact across conversion and restart.
-- [ ] Conversion failure preserves the WAV and original external/source files.
+- [x] Conversion failure preserves the WAV and original external/source files.
 - [ ] The active track reloads from the MP3 without changing its prior
   play/pause state.
 

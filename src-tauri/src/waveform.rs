@@ -10,6 +10,9 @@ use sha2::{Digest as _, Sha256};
 pub const MIN_BUCKETS: usize = 64;
 pub const MAX_BUCKETS: usize = 8192;
 const CACHE_ALGORITHM_VERSION: u8 = 2;
+const MAX_CACHE_ENTRY_BYTES: u64 = 512 * 1024;
+const MAX_CACHE_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_CACHE_FILES: usize = 512;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WaveformData {
@@ -117,9 +120,16 @@ pub fn cache_lookup(
 ) -> Option<WaveformData> {
     let buckets = clamp_buckets(buckets);
     let target = cache_target(cache_dir, path, buckets)?;
-    let data = std::fs::read(&target).ok()?;
+    let data = crate::bounded_io::read(&target, MAX_CACHE_ENTRY_BYTES).ok()?;
     let cached = serde_json::from_slice::<WaveformData>(&data).ok()?;
-    (cached.buckets == buckets && cached.peaks.len() == buckets).then_some(cached)
+    (cached.buckets == buckets
+        && cached.peaks.len() == buckets
+        && cached.duration_ms <= crate::player::MAX_DURATION_MS
+        && cached
+            .peaks
+            .iter()
+            .all(|peak| peak.is_finite() && (0.0..=1.0).contains(peak)))
+    .then_some(cached)
 }
 
 /// Best-effort atomic store of derived peaks. Never fails the caller.
@@ -135,12 +145,54 @@ pub fn cache_store(
     };
     if std::fs::create_dir_all(cache_dir).is_ok() {
         if let Ok(data) = serde_json::to_vec(waveform) {
-            let tmp = target.with_extension("json.tmp");
-            if std::fs::write(&tmp, data).is_ok() {
-                if std::fs::rename(&tmp, &target).is_err() {
-                    let _ = std::fs::remove_file(&tmp);
+            use std::io::Write;
+            if data.len() as u64 > MAX_CACHE_ENTRY_BYTES {
+                return;
+            }
+            if let Ok(mut temporary) = tempfile::NamedTempFile::new_in(cache_dir) {
+                if temporary.write_all(&data).is_ok() {
+                    let _ = temporary.persist(&target);
+                    prune_cache(cache_dir);
                 }
             }
+        }
+    }
+}
+
+fn prune_cache(directory: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return;
+    };
+    let mut files = std::collections::BinaryHeap::new();
+    let mut bytes = 0u64;
+    for entry in entries.filter_map(Result::ok) {
+        let candidate = (|| {
+            if entry.path().extension()?.to_str()? != "json" {
+                return None;
+            }
+            let metadata = entry.metadata().ok()?;
+            if !entry.file_type().ok()?.is_file() {
+                return None;
+            }
+            Some((
+                metadata.modified().unwrap_or(std::time::UNIX_EPOCH),
+                metadata.len(),
+                entry.path(),
+            ))
+        })();
+        let Some(candidate) = candidate else {
+            continue;
+        };
+        bytes = bytes.saturating_add(candidate.1);
+        files.push(std::cmp::Reverse(candidate));
+        while bytes > MAX_CACHE_BYTES || files.len() > MAX_CACHE_FILES {
+            let Some(std::cmp::Reverse((_, size, path))) = files.pop() else {
+                break;
+            };
+            if std::fs::remove_file(path).is_err() {
+                return;
+            }
+            bytes = bytes.saturating_sub(size);
         }
     }
 }

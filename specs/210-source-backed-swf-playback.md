@@ -15,10 +15,27 @@
 
 ## Playback and metadata
 
-- On selection, the audio worker revalidates the source hash, parses the
-  SWF (or locates/parses the embedded SWF in an EXE), decodes only the requested
-  sound, and keeps PCM in bounded memory/cache. It creates no temporary audio
+- On a container-cache miss, the audio worker revalidates the source hash, parses
+  the SWF (or locates/parses the embedded SWF in an EXE), decodes only the
+  requested sound, and keeps PCM in bounded memory/cache. It creates no temporary audio
   file. Existing parser and input-size limits remain in force.
+- Keep up to two verified, decompressed containers in a shared in-memory LRU
+  cache, with a dynamic budget of one eighth of available system RAM and a hard
+  cap of 256 MiB total. Reuse them across sounds and analysis requests
+  without rereading, hashing, or decompressing unchanged files. Cache identity
+  includes path, source type, expected hash, size, and modification time (plus
+  filesystem identity/change time on Unix). Missing metadata disables reuse;
+  changed files require fresh hash verification. Never hold the cache lock during
+  I/O or decoding. Oversized containers remain playable without being retained.
+  Even an oversized insertion trims older entries to the current budget.
+- Retain up to 32 decoded loops under a dynamic budget of one eighth of available
+  system RAM, capped at 512 MiB, so short loops remain available across more
+  selections. Both caches are memory-only; source-backed playback still creates
+  no audio files.
+- Source-backed import prepares PCM and BPM only; it must not serialize unused
+  WAV output or copy compressed file payloads for extracted-audio storage.
+- Random playback inside a selected looper is limited to that looper's tracks;
+  **All** scope selects across the complete library.
 - Playback skips unrelated sounds and all cover decoding. EXE candidate
   validation checks container/tag bounds without decoding every sound. It must
   not repeat BPM analysis or serialize a WAV just to obtain a PCM buffer.

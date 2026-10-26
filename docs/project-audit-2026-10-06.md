@@ -1,5 +1,9 @@
 # Auditoría integral — 2026-10-06
 
+> Snapshot histórico de `720822b` y sus cambios locales de esa fecha. No describe
+> el estado actual del árbol; consulta la [auditoría completa posterior](full-app-audit-2026-10-25.md)
+> y el [seguimiento documental/de auditoría](documentation-review-2026-10-26.md).
+
 ## Alcance y método
 
 Base: commit `720822b` (v0.6.2), más Tap Tempo y la opción source-backed

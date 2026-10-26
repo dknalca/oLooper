@@ -18,6 +18,20 @@ Source-backed catalog rows identify the source container and embedded sound ID;
 playback parses that referenced file and decodes only the selected sound into the audio engine's bounded
 memory cache. No temporary or per-loop audio file is written.
 
+Reuse verified, decompressed SWF bodies in a shared memory-only LRU (two
+containers, one eighth of available system RAM, capped at 256 MiB total). File
+identity and the expected import hash scope each entry; an identity change
+requires rereading and hash verification. Selected
+sounds still undergo tag-bound validation and selective decoding. This avoids
+repeating whole-container I/O, hashing, and decompression for every loop while
+keeping the disk-saving import mode and bounded memory use. The PCM cache
+retains up to 32 loops using the same dynamic share, capped at 512 MiB.
+Availability is sampled at most once per second and shared by both caches. A
+failed OS query falls back to at most 16 MiB per cache. Engine maintenance trims
+both caches once per second even without new selections; dropping cache
+references does not drop the active playback buffer. Library unload clears
+decoded PCM because embedded track IDs are catalog-local.
+
 Source-backed rows use catalog-only BPM and app loop metadata. They have one
 fixed application CUE (slot 1 at time zero), no other Serato cues, and no Serato
 tag writes. Explicit user export may materialize a WAV outside the library.

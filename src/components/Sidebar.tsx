@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { memo, useEffect, useMemo, useRef, useState } from "react";
 import {
   libraryList,
   libraryGroupCover,
@@ -22,8 +22,10 @@ import {
   librarySetFavorite,
   librarySyncSeratoMetadata,
   libraryUpdateMetadata,
+  libraryAnalyzeBpm,
   playerLoadTrack,
   playerPause,
+  playerPrefetch,
   playerSetDiagnostics,
   playerStatus,
   pickDirectory,
@@ -33,15 +35,20 @@ import {
   type Track,
 } from "../tauri";
 import { recordTempoTap } from "../tapTempo";
+import { bpmOptions, formatBpm, validBpm, type BpmBase } from "../bpmOptions";
+import { requestBpmReanalysis } from "../bpmReanalysis";
 import { IMPORTED_AUDIO_GROUP_KEY, libraryGroupKey, libraryGroupName } from "../libraryGroups";
 import { navigateMidiLibrary, type MidiLibraryNavigationAction, type MidiLibraryNavigationState } from "../midiLibraryNavigation";
+import LibraryViewTabs, { type LibraryView } from "./LibraryViewTabs";
 
 interface Props {
   libraryReady: boolean;
   libraryGeneration: number;
   refreshKey: number;
   activeTrackId: number | null;
+  onLibraryViewChange: (view: LibraryView) => void;
   onRegisterTrackNavigation: (navigate: ((direction: -1 | 1) => void) | null) => void;
+  onRegisterRandomScope: (sourceHash: string | null) => void;
   onRegisterMidiLibraryNavigation: (navigate: ((command: MidiLibraryNavigationAction) => void) | null) => void;
   onTrackLoading: () => void;
   onTrackSelected: (track: Track, status: Awaited<ReturnType<typeof playerPlay>>) => void;
@@ -62,6 +69,9 @@ const BPM_REVIEW_THRESHOLD = 0.5;
 const DEFAULT_LOOPER_PANE_WIDTH = 224;
 const MIN_LOOPER_PANE_WIDTH = 160;
 const MAX_LOOPER_PANE_WIDTH = 420;
+const TRACK_ROW_HEIGHT = 44;
+const TRACK_COLUMNS = "grid-cols-[minmax(0,1fr)_5.75rem_4.25rem_4.5rem] sm:grid-cols-[minmax(0,1fr)_6.25rem_5rem_5rem]";
+const TRACK_COLUMNS_WITH_LOOPER = "grid-cols-[minmax(0,1fr)_minmax(4rem,0.8fr)_5.75rem_4.25rem_4.5rem] sm:grid-cols-[minmax(0,1fr)_7rem_6.25rem_5rem_5rem]";
 
 type LibraryPointerDrag =
   | { kind: "track"; pointerId: number; startX: number; startY: number; sourceTrackId: number; trackIds: number[]; canDesktopDrag: boolean; active: boolean }
@@ -78,7 +88,7 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-export default function Sidebar({ libraryReady, libraryGeneration, refreshKey, activeTrackId, onRegisterTrackNavigation, onRegisterMidiLibraryNavigation, onTrackLoading, onTrackSelected }: Props) {
+function Sidebar({ libraryReady, libraryGeneration, refreshKey, activeTrackId, onLibraryViewChange, onRegisterTrackNavigation, onRegisterRandomScope, onRegisterMidiLibraryNavigation, onTrackLoading, onTrackSelected }: Props) {
   const [tracks, setTracks] = useState<Track[]>([]);
   const [playlists, setPlaylists] = useState<Playlist[]>([]);
   const [looperOrder, setLooperOrder] = useState<string[]>([]);
@@ -109,7 +119,7 @@ export default function Sidebar({ libraryReady, libraryGeneration, refreshKey, a
   const [contextMenu, setContextMenu] = useState<number | null>(null);
   const [groupMenu, setGroupMenu] = useState<string | null>(null);
   const [groupDeletePrompt, setGroupDeletePrompt] = useState<{ sourceHash: string; name: string } | null>(null);
-  const [missingSourcePrompt, setMissingSourcePrompt] = useState<{ sourceHash: string; name: string; path: string } | null>(null);
+  const [missingSourcePrompt, setMissingSourcePrompt] = useState<{ sourceHash: string; name: string; path: string; trackId: number } | null>(null);
   const [playlistMenu, setPlaylistMenu] = useState<number | null>(null);
   const [dropTarget, setDropTarget] = useState<LibraryDropTarget>(null);
   const [draggingTrackIds, setDraggingTrackIds] = useState<number[]>([]);
@@ -126,6 +136,13 @@ export default function Sidebar({ libraryReady, libraryGeneration, refreshKey, a
   const [metadataBusy, setMetadataBusy] = useState(false);
   const [metadataError, setMetadataError] = useState<string | null>(null);
   const [bpmConfirmed, setBpmConfirmed] = useState(false);
+  const [bpmBase, setBpmBase] = useState<BpmBase | null>(null);
+  const [bpmAnalysisBusy, setBpmAnalysisBusy] = useState(false);
+  const [bpmAnalysisError, setBpmAnalysisError] = useState<string | null>(null);
+  const [metadataSession, setMetadataSession] = useState(0);
+  const [metadataFocus, setMetadataFocus] = useState<"title" | "bpm">("title");
+  const metadataRequest = useRef(0);
+  const bpmDraftRevision = useRef(0);
   const [tapTempoCount, setTapTempoCount] = useState(0);
   const [tapTempoEstimate, setTapTempoEstimate] = useState<number | null>(null);
   const tapTempoTimes = useRef<number[]>([]);
@@ -137,6 +154,7 @@ export default function Sidebar({ libraryReady, libraryGeneration, refreshKey, a
   const [covers, setCovers] = useState<Record<string, string>>({});
   const coverCache = useRef(new Map<string, string>());
   const trackNavigationRef = useRef<(direction: -1 | 1) => void>(() => {});
+  const nextPrefetchGeneration = useRef(0);
   const looperResizeStart = useRef<{ pointerX: number; width: number } | null>(null);
   const internalLibraryDrag = useRef(false);
   const pointerDrag = useRef<LibraryPointerDrag | null>(null);
@@ -147,6 +165,27 @@ export default function Sidebar({ libraryReady, libraryGeneration, refreshKey, a
   const activeTrackIdRef = useRef(activeTrackId);
   activeTrackIdRef.current = activeTrackId;
   const previousLibraryGeneration = useRef(libraryGeneration);
+  const refreshSequence = useRef(0);
+  const refreshOwner = useRef(libraryGeneration);
+  const listRef = useRef<HTMLDivElement>(null);
+  const visibleTracksRef = useRef<Track[]>([]);
+  const [viewport, setViewport] = useState({ top: 0, height: 600 });
+  useEffect(() => {
+    if (listRef.current) listRef.current.scrollTop = 0;
+    setViewport((value) => ({ ...value, top: 0 }));
+  }, [selectedGroup, search, sourceFilter, bpmFilter, durationFilter, sort, bpmDescending]);
+  useEffect(() => {
+    const node = listRef.current;
+    if (!node) return;
+    const observer = new ResizeObserver(() => setViewport((value) => ({ ...value, height: node.clientHeight })));
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, []);
+  if (refreshOwner.current !== libraryGeneration) {
+    refreshOwner.current = libraryGeneration;
+    refreshSequence.current += 1;
+  }
+  useEffect(() => () => { refreshSequence.current += 1; loadSeq.current += 1; metadataRequest.current += 1; }, []);
   // Newest selection wins: older in-flight loads are abandoned (the backend
   // discards superseded decodes by load generation).
   const loadSeq = useRef(0);
@@ -157,8 +196,11 @@ export default function Sidebar({ libraryReady, libraryGeneration, refreshKey, a
     document.documentElement.classList.remove("olooper-library-pointer-drag");
   }, []);
 
-  const refresh = () => Promise.all([libraryList(), libraryPlaylists(), libraryLooperOrder()])
+  const refresh = () => {
+    const sequence = ++refreshSequence.current;
+    return Promise.all([libraryList(), libraryPlaylists(), libraryLooperOrder()])
     .then(([next, nextPlaylists, nextLooperOrder]) => {
+      if (sequence !== refreshSequence.current) return;
       setError(null);
       setTracks(next);
       setPlaylists(nextPlaylists);
@@ -166,7 +208,14 @@ export default function Sidebar({ libraryReady, libraryGeneration, refreshKey, a
       setCatalogLoaded(true);
       setSelectedIds((ids) => ids.filter((id) => next.some((track) => track.id === id)));
     })
-    .catch((e) => setError(String(e)));
+    .catch((e) => { if (sequence === refreshSequence.current) setError(String(e)); });
+  };
+
+  const owned = <T,>(request: Promise<T>, apply: (value: T) => void | Promise<void>) => {
+    const owner = refreshOwner.current;
+    void request.then((value) => { if (owner === refreshOwner.current) return apply(value); })
+      .catch((cause) => { if (owner === refreshOwner.current) setError(String(cause)); });
+  };
 
   useEffect(() => {
     if (previousLibraryGeneration.current === libraryGeneration) return;
@@ -181,6 +230,10 @@ export default function Sidebar({ libraryReady, libraryGeneration, refreshKey, a
     midiNavigationStateRef.current = initialMidiNavigation;
     setMidiNavigationState(initialMidiNavigation);
     setActiveId(null);
+    setLoadingId(null);
+    setConvertingId(null);
+    setCreatePlaylistBusy(false);
+    setMetadataBusy(false);
     setSelectedIds([]);
     setContextMenu(null);
     setGroupMenu(null);
@@ -188,6 +241,10 @@ export default function Sidebar({ libraryReady, libraryGeneration, refreshKey, a
     setPlaylistTrackId(null);
     setCreatePlaylistOpen(false);
     setEditingTrack(null);
+    metadataRequest.current += 1;
+    setBpmBase(null);
+    setBpmAnalysisBusy(false);
+    setBpmAnalysisError(null);
     setMetadataError(null);
     setBpmConfirmed(false);
     tapTempoTimes.current = [];
@@ -200,13 +257,13 @@ export default function Sidebar({ libraryReady, libraryGeneration, refreshKey, a
 
   useEffect(() => {
     if (libraryReady) refresh();
-  }, [libraryReady, refreshKey]);
+  }, [libraryReady, refreshKey, libraryGeneration]);
 
   useEffect(() => {
     const updateBpm = (event: Event) => {
-      const { trackId, bpm, source = "serato" } = (event as CustomEvent<{ trackId: number; bpm: number; source?: string }>).detail;
+      const { trackId, bpm, source, confidence } = (event as CustomEvent<import("../tauri").TrackBpmUpdate>).detail;
       setTracks((current) => current.map((track) => track.id === trackId
-        ? { ...track, bpm, bpm_source: source, bpm_confidence: null }
+        ? { ...track, bpm, bpm_source: source !== undefined ? source : track.bpm_source, bpm_confidence: confidence !== undefined ? confidence : track.bpm_confidence }
         : track));
     };
     window.addEventListener("olooper:track-bpm", updateBpm);
@@ -227,12 +284,14 @@ export default function Sidebar({ libraryReady, libraryGeneration, refreshKey, a
 
   useEffect(() => {
     const revealTrack = (event: Event) => {
-      const { trackId, sourceHash } = (event as CustomEvent<{ trackId: number; sourceHash: string }>).detail;
+      const { trackId, sourceHash, preserveCollection } = (event as CustomEvent<{
+        trackId: number; sourceHash: string; preserveCollection?: boolean;
+      }>).detail;
       if (!Number.isSafeInteger(trackId) || typeof sourceHash !== "string") return;
       const reveal = () => {
         setActiveId(trackId);
         const track = tracks.find((item) => item.id === trackId);
-        setSelectedGroup(track ? groupKey(track) : sourceHash);
+        if (!preserveCollection) setSelectedGroup(track ? groupKey(track) : sourceHash);
         setLibraryRevealGeneration((generation) => generation + 1);
       };
       if (tracks.some((track) => track.id === trackId)) reveal();
@@ -244,7 +303,12 @@ export default function Sidebar({ libraryReady, libraryGeneration, refreshKey, a
 
   useEffect(() => {
     if (activeId === null) return;
-    document.querySelector<HTMLElement>(`[data-library-track-id="${activeId}"]`)?.scrollIntoView({ block: "nearest" });
+    const node = listRef.current;
+    const index = visibleTracksRef.current.findIndex((track) => track.id === activeId);
+    if (!node || index < 0) return;
+    if (index * TRACK_ROW_HEIGHT < node.scrollTop) node.scrollTop = index * TRACK_ROW_HEIGHT;
+    else if ((index + 1) * TRACK_ROW_HEIGHT > node.scrollTop + node.clientHeight) node.scrollTop = (index + 1) * TRACK_ROW_HEIGHT - node.clientHeight;
+    setViewport({ top: node.scrollTop, height: node.clientHeight });
   }, [activeId, libraryRevealGeneration, selectedGroup]);
 
   useEffect(() => {
@@ -252,29 +316,33 @@ export default function Sidebar({ libraryReady, libraryGeneration, refreshKey, a
     const sourceHashes = [...new Set(tracks
       .filter((track) => track.source_type !== "custom")
       .map((track) => track.source_hash))];
+    const liveHashes = new Set(sourceHashes);
+    for (const hash of coverCache.current.keys()) {
+      if (!liveHashes.has(hash)) coverCache.current.delete(hash);
+    }
+    setCovers(Object.fromEntries(coverCache.current));
     const missing = sourceHashes.filter((sourceHash) => !coverCache.current.has(sourceHash));
     if (missing.length === 0) return;
     let cancelled = false;
-    Promise.all(missing.map(async (sourceHash) => {
-      try {
-        const cover = await libraryGroupCover(sourceHash);
-        if (cover) coverCache.current.set(sourceHash, cover);
-        return [sourceHash, cover] as const;
-      } catch {
-        return [sourceHash, null] as const;
-      }
-    })).then((loaded) => {
-      if (cancelled) return;
-      setCovers((current) => {
-        const next = { ...current };
-        for (const [sourceHash, cover] of loaded) {
-          if (cover) next[sourceHash] = cover;
+    let nextIndex = 0;
+    const load = async () => {
+      while (!cancelled && nextIndex < missing.length) {
+        const sourceHash = missing[nextIndex++];
+        try {
+          const cover = await libraryGroupCover(sourceHash);
+          if (!cancelled && libraryGeneration === refreshOwner.current && cover) coverCache.current.set(sourceHash, cover);
+        } catch {
+          // A missing cover must not prevent the remaining groups from loading.
         }
-        return next;
-      });
+      }
+    };
+    // Bound image reads/base64 IPC instead of issuing one command per looper.
+    Promise.all(Array.from({ length: Math.min(4, missing.length) }, load)).then(() => {
+      if (cancelled) return;
+      setCovers(Object.fromEntries(coverCache.current));
     });
     return () => { cancelled = true; };
-  }, [libraryReady, tracks]);
+  }, [libraryReady, tracks, libraryGeneration]);
 
   useEffect(() => {
     if (contextMenu === null && groupMenu === null && playlistMenu === null) return;
@@ -295,7 +363,8 @@ export default function Sidebar({ libraryReady, libraryGeneration, refreshKey, a
   }, [looperPaneWidth]);
   useEffect(() => { localStorage.setItem("olooper.library.selectedGroup", selectedGroup); }, [selectedGroup]);
 
-  const looperGroups = Object.values(tracks.reduce<Record<string, Track[]>>((result, track) => {
+  const looperPositions = useMemo(() => new Map(looperOrder.map((hash, index) => [hash, index])), [looperOrder]);
+  const looperGroups = useMemo(() => Object.values(tracks.reduce<Record<string, Track[]>>((result, track) => {
     (result[groupKey(track)] ??= []).push(track);
     return result;
   }, {})).sort((left, right) => {
@@ -303,45 +372,55 @@ export default function Sidebar({ libraryReady, libraryGeneration, refreshKey, a
     const rightHash = groupKey(right[0]);
     if (leftHash === IMPORTED_AUDIO_GROUP_KEY) return rightHash === IMPORTED_AUDIO_GROUP_KEY ? 0 : 1;
     if (rightHash === IMPORTED_AUDIO_GROUP_KEY) return -1;
-    const leftPosition = looperOrder.indexOf(leftHash);
-    const rightPosition = looperOrder.indexOf(rightHash);
+    const leftPosition = looperPositions.get(leftHash) ?? -1;
+    const rightPosition = looperPositions.get(rightHash) ?? -1;
     if (leftPosition < 0 && rightPosition < 0) return left[0].id - right[0].id;
     if (leftPosition < 0) return 1;
     if (rightPosition < 0) return -1;
     return leftPosition - rightPosition;
-  });
-  const filtered = tracks.filter((track) => {
+  }), [tracks, looperPositions]);
+  const filtered = useMemo(() => tracks.filter((track) => {
     const needle = search.toLowerCase();
     const matchesSearch = !search || track.title.toLowerCase().includes(needle) || groupName(track).toLowerCase().includes(needle) || track.tags.toLowerCase().includes(needle);
     const matchesSource = sourceFilter === "all" || track.source_type === sourceFilter;
     const matchesBpm = bpmFilter === "all" || (track.bpm !== null && (bpmFilter === "low" ? track.bpm < 100 : bpmFilter === "mid" ? track.bpm <= 130 : track.bpm > 130));
     const matchesDuration = durationFilter === "all" || (durationFilter === "short" ? track.duration_ms < 10_000 : durationFilter === "mid" ? track.duration_ms <= 30_000 : track.duration_ms > 30_000);
     return matchesSearch && matchesSource && matchesBpm && matchesDuration;
-  });
-  const sorted = [...filtered].sort((a, b) => {
+  }), [tracks, search, sourceFilter, bpmFilter, durationFilter]);
+  const sorted = useMemo(() => [...filtered].sort((a, b) => {
     if (sort === "bpm" && a.bpm !== b.bpm) {
       if (a.bpm === null) return 1;
       if (b.bpm === null) return -1;
       return (a.bpm - b.bpm) * (bpmDescending ? -1 : 1);
     }
     return a.title.localeCompare(b.title);
-  });
+  }), [filtered, sort, bpmDescending]);
   const selectedPlaylistId = selectedGroup.startsWith(PLAYLIST_PREFIX)
     ? Number(selectedGroup.slice(PLAYLIST_PREFIX.length))
     : null;
   const selectedPlaylist = selectedPlaylistId === null
     ? undefined
     : playlists.find((playlist) => playlist.id === selectedPlaylistId);
-  const filteredById = new Map(filtered.map((track) => [track.id, track]));
-  const selectedTracks = selectedPlaylist
+  const filteredById = useMemo(() => new Map(filtered.map((track) => [track.id, track])), [filtered]);
+  const selectedTracks = useMemo(() => selectedPlaylist
     ? selectedPlaylist.track_ids.flatMap((id) => {
       const track = filteredById.get(id);
       return track ? [track] : [];
     })
     : sorted.filter((track) => selectedGroup === ALL_GROUP
-      || (selectedGroup === FAVORITES_GROUP ? track.favorite : groupKey(track) === selectedGroup));
-  const tracksById = new Map(tracks.map((track) => [track.id, track]));
-  const midiCollections = [
+       || (selectedGroup === FAVORITES_GROUP ? track.favorite : groupKey(track) === selectedGroup)), [selectedPlaylist, filteredById, sorted, selectedGroup]);
+  const tracksById = useMemo(() => new Map(tracks.map((track) => [track.id, track])), [tracks]);
+  visibleTracksRef.current = selectedTracks;
+  const firstVisible = Math.max(0, Math.min(Math.floor(viewport.top / TRACK_ROW_HEIGHT) - 6, selectedTracks.length - 1));
+  const lastVisible = Math.min(selectedTracks.length, firstVisible + Math.ceil(viewport.height / TRACK_ROW_HEIGHT) + 12);
+  const midiCollections = useMemo(() => {
+    const byGroup = new Map<string, number[]>();
+    for (const track of sorted) {
+      const key = groupKey(track);
+      const ids = byGroup.get(key) ?? [];
+      ids.push(track.id); byGroup.set(key, ids);
+    }
+    return [
     { key: ALL_GROUP, trackIds: sorted.map((track) => track.id) },
     { key: FAVORITES_GROUP, trackIds: sorted.filter((track) => track.favorite).map((track) => track.id) },
     ...playlists.map((playlist) => ({
@@ -350,9 +429,10 @@ export default function Sidebar({ libraryReady, libraryGeneration, refreshKey, a
     })),
     ...looperGroups.map((group) => ({
       key: groupKey(group[0]),
-      trackIds: sorted.filter((track) => groupKey(track) === groupKey(group[0])).map((track) => track.id),
+      trackIds: byGroup.get(groupKey(group[0])) ?? [],
     })),
   ];
+  }, [sorted, playlists, filteredById, looperGroups]);
   const focusedMidiCollection = midiCollections[midiNavigationState.collectionIndex];
   const focusedMidiCollectionKey = midiNavigationState.level === "collections"
     ? focusedMidiCollection?.key
@@ -364,6 +444,26 @@ export default function Sidebar({ libraryReady, libraryGeneration, refreshKey, a
     document.querySelector<HTMLElement>('[data-midi-navigation-selected="true"]')
       ?.scrollIntoView({ block: "nearest", inline: "nearest" });
   }, [focusedMidiCollectionKey, focusedMidiTrackId]);
+
+  // Warm the same loop the Next button will play after the current one has
+  // finished loading, so sequential switches hit the decoded cache.
+  useEffect(() => {
+    if (!libraryReady || activeId === null || activeTrackId !== activeId) return;
+    const playable = selectedTracks.filter((track) => track.exists);
+    if (playable.length < 2) return;
+    const index = playable.findIndex((track) => track.id === activeId);
+    const target = playable[index < 0 ? 0 : (index + 1) % playable.length];
+    if (!target || target.id === activeId) return;
+    const generation = ++nextPrefetchGeneration.current;
+    const timer = window.setTimeout(() => {
+      if (generation !== nextPrefetchGeneration.current) return;
+      void playerPrefetch(target.id).catch(() => {});
+    }, 500);
+    return () => {
+      window.clearTimeout(timer);
+      nextPrefetchGeneration.current += 1;
+    };
+  }, [activeId, activeTrackId, libraryReady, selectedTracks]);
   const selectCollection = (key: string) => {
     setSelectedGroup(key);
     const collectionIndex = midiCollections.findIndex((collection) => collection.key === key);
@@ -413,9 +513,15 @@ export default function Sidebar({ libraryReady, libraryGeneration, refreshKey, a
     // the library data has arrived.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [catalogLoaded]);
-  const hasPlayableTracks = selectedTracks.some((track) => track.exists);
-  const favoritesCount = tracks.filter((track) => track.favorite).length;
+  const hasPlayableTracks = useMemo(() => selectedTracks.some((track) => track.exists), [selectedTracks]);
+  const favoritesCount = useMemo(() => tracks.filter((track) => track.favorite).length, [tracks]);
   const selectedLooper = looperGroups.find((group) => groupKey(group[0]) === selectedGroup)?.[0];
+  const showLooperColumn = selectedGroup === ALL_GROUP || selectedGroup === FAVORITES_GROUP || selectedPlaylist !== undefined;
+
+  useEffect(() => {
+    onRegisterRandomScope(selectedLooper?.source_hash ?? null);
+    return () => onRegisterRandomScope(null);
+  }, [onRegisterRandomScope, selectedLooper?.source_hash]);
 
   useEffect(() => {
     if (
@@ -434,11 +540,7 @@ export default function Sidebar({ libraryReady, libraryGeneration, refreshKey, a
 
   const playTrack = async (track: Track, resumeAfterLoad = true) => {
     if (!track.exists) {
-      if ((track.source_type === "swf" || track.source_type === "exe") && track.audio_storage === "embedded") {
-        setMissingSourcePrompt({ sourceHash: track.source_hash, name: groupName(track), path: track.file_path });
-      } else {
-        setError(`Audio file is missing: ${track.file_path}`);
-      }
+      setMissingSourcePrompt({ sourceHash: track.source_hash, name: groupName(track), path: track.file_path, trackId: track.id });
       return;
     }
     onTrackLoading();
@@ -465,6 +567,7 @@ export default function Sidebar({ libraryReady, libraryGeneration, refreshKey, a
       setLoadingId(null);
       playerSetDiagnostics(track.loop_origin, track.loop_quality).catch(() => {});
       const finalStatus = resumeAfterLoad ? await playerPlay() : await playerStatus();
+      if (loadSeq.current !== my || finalStatus.path !== track.playback_path) return;
       onTrackSelected(track, finalStatus);
       if (resumeAfterLoad) libraryMarkPlayed(track.id).then(refresh).catch(() => {});
     } catch (e) {
@@ -472,6 +575,15 @@ export default function Sidebar({ libraryReady, libraryGeneration, refreshKey, a
       setLoadingId(null);
       setActiveId(previousId); // keep the previous (still sounding) track
       setError(String(e));
+      // Availability may have changed since the catalog was last rendered.
+      try {
+        const fresh = await libraryList();
+        if (loadSeq.current !== my) return;
+        const missing = fresh.find((item) => item.id === track.id);
+        if (missing && !missing.exists) {
+          setMissingSourcePrompt({ sourceHash: track.source_hash, name: groupName(track), path: track.file_path, trackId: track.id });
+        }
+      } catch { /* Keep the original load error visible. */ }
     }
   };
 
@@ -502,11 +614,12 @@ export default function Sidebar({ libraryReady, libraryGeneration, refreshKey, a
   }, [hasPlayableTracks, libraryReady, onRegisterTrackNavigation]);
 
   const deleteTrack = (id: number) => {
-    libraryRemove(id).then(refresh).catch((e) => { refresh(); setError(String(e)); });
+    owned(libraryRemove(id), refresh);
     setContextMenu(null);
   };
 
   const convertWavToMp3 = async (track: Track) => {
+    const owner = refreshOwner.current;
     if (!window.confirm(`Convert “${track.title}” to MP3 at 320 kbps and delete its managed WAV copy after verification? The original source will be kept.`)) return;
     setConvertingId(track.id);
     setContextMenu(null);
@@ -515,26 +628,27 @@ export default function Sidebar({ libraryReady, libraryGeneration, refreshKey, a
     try {
       if (isActive) {
         const status = await playerStatus();
+        if (owner !== refreshOwner.current || activeTrackIdRef.current !== track.id) return;
         wasPlaying = status.playing;
         if (wasPlaying) onTrackSelected(track, await playerPause());
       }
       const converted = await libraryConvertWavToMp3_320(track.id);
+      if (owner !== refreshOwner.current) return;
       await refresh();
       if (isActive && activeTrackIdRef.current === track.id) await playTrack(converted, wasPlaying);
     } catch (cause) {
+      if (owner !== refreshOwner.current) return;
       if (isActive && wasPlaying && activeTrackIdRef.current === track.id) {
         try { onTrackSelected(track, await playerPlay()); } catch { /* Keep the conversion error visible. */ }
       }
       setError(String(cause));
     } finally {
-      setConvertingId(null);
+      if (owner === refreshOwner.current) setConvertingId(null);
     }
   };
 
   const toggleFavorite = (track: Track) => {
-    librarySetFavorite(track.id, !track.favorite)
-      .then((updated) => setTracks((current) => current.map((item) => item.id === updated.id ? updated : item)))
-      .catch((e) => setError(String(e)));
+    owned(librarySetFavorite(track.id, !track.favorite), (updated) => setTracks((current) => current.map((item) => item.id === updated.id ? updated : item)));
   };
 
   const renameGroup = (sourceHash: string, currentName: string) => {
@@ -555,6 +669,7 @@ export default function Sidebar({ libraryReady, libraryGeneration, refreshKey, a
   };
 
   const submitPlaylistCreation = async (event: React.FormEvent<HTMLFormElement>) => {
+    const owner = refreshOwner.current;
     event.preventDefault();
     const name = createPlaylistName.trim();
     if (!name) {
@@ -566,21 +681,25 @@ export default function Sidebar({ libraryReady, libraryGeneration, refreshKey, a
     try {
       if (playlistFormMode === "rename" && editingPlaylistId !== null) {
         await libraryRenamePlaylist(editingPlaylistId, name);
+        if (owner !== refreshOwner.current) return;
         await refresh();
         setCreatePlaylistOpen(false);
         return;
       }
       const playlist = await libraryCreatePlaylist(name);
+      if (owner !== refreshOwner.current) return;
       if (createPlaylistTrackId !== null) {
         await libraryAddTrackToPlaylist(playlist.id, createPlaylistTrackId);
+        if (owner !== refreshOwner.current) return;
       }
       await refresh();
+      if (owner !== refreshOwner.current) return;
       setSelectedGroup(`${PLAYLIST_PREFIX}${playlist.id}`);
       setCreatePlaylistOpen(false);
     } catch (cause) {
-      setCreatePlaylistError(String(cause));
+      if (owner === refreshOwner.current) setCreatePlaylistError(String(cause));
     } finally {
-      setCreatePlaylistBusy(false);
+      if (owner === refreshOwner.current) setCreatePlaylistBusy(false);
     }
   };
 
@@ -596,12 +715,10 @@ export default function Sidebar({ libraryReady, libraryGeneration, refreshKey, a
 
   const deletePlaylist = (playlist: Playlist) => {
     if (!window.confirm(`Delete playlist “${playlist.name}”? Tracks in the library will not be removed.`)) return;
-    libraryRemovePlaylist(playlist.id)
-      .then(() => {
+    owned(libraryRemovePlaylist(playlist.id), () => {
         if (selectedGroup === `${PLAYLIST_PREFIX}${playlist.id}`) setSelectedGroup(FAVORITES_GROUP);
         return refresh();
-      })
-      .catch((cause) => setError(String(cause)));
+      });
     setPlaylistMenu(null);
   };
 
@@ -624,15 +741,18 @@ export default function Sidebar({ libraryReady, libraryGeneration, refreshKey, a
   };
 
   const addTracksToPlaylist = (playlistId: number, trackIds: number[]) => {
+    const owner = refreshOwner.current;
     const playlist = playlists.find((item) => item.id === playlistId);
     if (!playlist) return;
     void (async () => {
       try {
         let added = 0;
         for (const id of trackIds) {
+          if (owner !== refreshOwner.current) return;
           if (await libraryAddTrackToPlaylist(playlist.id, id)) added++;
         }
         await refresh();
+        if (owner !== refreshOwner.current) return;
         setError(added === 0 ? "Those loops are already in this playlist." : null);
       } catch (cause) {
         setError(String(cause));
@@ -863,7 +983,14 @@ export default function Sidebar({ libraryReady, libraryGeneration, refreshKey, a
     }
   };
 
-  const editTrack = (track: Track) => {
+  const editTrack = (track: Track, focus: "title" | "bpm" = "title") => {
+    metadataRequest.current += 1;
+    bpmDraftRevision.current = 0;
+    setMetadataSession((session) => session + 1);
+    setMetadataFocus(focus);
+    setBpmBase(track.bpm !== null && validBpm(track.bpm) ? { bpm: track.bpm, origin: "current" } : null);
+    setBpmAnalysisBusy(false);
+    setBpmAnalysisError(null);
     tapTempoTimes.current = [];
     setTapTempoCount(0);
     setTapTempoEstimate(null);
@@ -874,12 +1001,60 @@ export default function Sidebar({ libraryReady, libraryGeneration, refreshKey, a
     setContextMenu(null);
   };
 
+  const closeTrackEditor = () => {
+    metadataRequest.current += 1;
+    setEditingTrack(null);
+    setBpmAnalysisBusy(false);
+  };
+
+  useEffect(() => {
+    if (!editingTrack || (editingTrack.bpm !== null
+      && (editingTrack.bpm_source !== "analyzed" || editingTrack.bpm_confidence === null))) return;
+    const request = ++metadataRequest.current;
+    const owner = refreshOwner.current;
+    const revision = bpmDraftRevision.current;
+    const id = editingTrack.id;
+    const current = () => request === metadataRequest.current && owner === refreshOwner.current;
+    setBpmAnalysisBusy(true);
+    setBpmAnalysisError(null);
+    void libraryAnalyzeBpm(id).then((suggestion) => {
+      if (!current() || bpmDraftRevision.current !== revision || suggestion.track_id !== id) return;
+      if (suggestion.bpm === null || !validBpm(suggestion.bpm)) {
+        setBpmAnalysisError("No tempo suggestion found. Enter a BPM or use Tap tempo.");
+        return;
+      }
+      setBpmBase({
+        bpm: suggestion.bpm,
+        origin: "detected",
+        confidence: suggestion.confidence,
+        loop: suggestion.assumed_meter === "4/4" && suggestion.bars !== null ? {
+          frames: suggestion.duration_frames, rate: suggestion.sample_rate, bars: suggestion.bars,
+        } : undefined,
+      });
+    }).catch((cause) => {
+      if (current() && bpmDraftRevision.current === revision) setBpmAnalysisError(`Tempo analysis failed: ${String(cause)}`);
+    }).finally(() => { if (current()) setBpmAnalysisBusy(false); });
+    return () => { if (request === metadataRequest.current) metadataRequest.current += 1; };
+  }, [editingTrack, metadataSession, libraryGeneration]);
+
+  const chooseBpm = (bpm: number) => {
+    bpmDraftRevision.current += 1;
+    setBpmConfirmed(true);
+    resetTempoTaps();
+    setMetadataDraft((draft) => ({ ...draft, bpm: String(bpm) }));
+    setMetadataError(null);
+    setBpmAnalysisError(null);
+  };
+
   const tapTempo = () => {
     const result = recordTempoTap(tapTempoTimes.current, performance.now());
     tapTempoTimes.current = result.taps;
     setTapTempoCount(result.taps.length);
     setTapTempoEstimate(result.bpm);
     if (result.bpm !== null) {
+      bpmDraftRevision.current += 1;
+      setBpmBase({ bpm: result.bpm, origin: "tapped" });
+      setBpmAnalysisError(null);
       setBpmConfirmed(true);
       setMetadataDraft((draft) => ({ ...draft, bpm: String(result.bpm) }));
       setMetadataError(null);
@@ -893,6 +1068,7 @@ export default function Sidebar({ libraryReady, libraryGeneration, refreshKey, a
   };
 
   const saveTrackMetadata = async (event: React.FormEvent<HTMLFormElement>) => {
+    const owner = refreshOwner.current;
     event.preventDefault();
     if (!editingTrack) return;
     const title = metadataDraft.title.trim();
@@ -912,8 +1088,9 @@ export default function Sidebar({ libraryReady, libraryGeneration, refreshKey, a
     setMetadataError(null);
     try {
       const updated = await libraryUpdateMetadata(editingTrack.id, title, bpm, metadataDraft.tags.trim(), confirmManualBpm);
+      if (owner !== refreshOwner.current) return;
       setTracks((current) => current.map((track) => track.id === updated.id ? updated : track));
-      setEditingTrack(null);
+      closeTrackEditor();
       if (updated.id === activeTrackId && updated.bpm !== null) {
         window.dispatchEvent(new CustomEvent("olooper:track-bpm", {
           detail: {
@@ -926,17 +1103,17 @@ export default function Sidebar({ libraryReady, libraryGeneration, refreshKey, a
       }
       if (updated.audio_storage === "extracted"
         && updated.bpm !== null
-        && (updated.bpm !== editingTrack.bpm || confirmManualBpm)) {
+        && confirmManualBpm) {
         try {
           await librarySyncSeratoMetadata(editingTrack.id);
         } catch (cause) {
-          setError(`Metadata saved in oLooper, but Serato BPM sync failed: ${String(cause)}`);
+          if (owner === refreshOwner.current) setError(`Metadata saved in oLooper, but Serato BPM sync failed: ${String(cause)}`);
         }
       }
     } catch (cause) {
-      setMetadataError(String(cause));
+      if (owner === refreshOwner.current) setMetadataError(String(cause));
     } finally {
-      setMetadataBusy(false);
+      if (owner === refreshOwner.current) setMetadataBusy(false);
     }
   };
 
@@ -954,9 +1131,9 @@ export default function Sidebar({ libraryReady, libraryGeneration, refreshKey, a
 
   const confirmRemoveMissingSource = () => {
     if (!missingSourcePrompt) return;
-    const { sourceHash } = missingSourcePrompt;
+    const { trackId } = missingSourcePrompt;
     setMissingSourcePrompt(null);
-    libraryRemoveLooper(sourceHash).then(refresh).catch((cause) => { refresh(); setError(String(cause)); });
+    libraryRemove(trackId).then(refresh).catch((cause) => { refresh(); setError(String(cause)); });
   };
 
   const openTrackMenu = (event: React.MouseEvent, trackId: number) => {
@@ -985,7 +1162,7 @@ export default function Sidebar({ libraryReady, libraryGeneration, refreshKey, a
     setMenuPosition({ x: event.clientX, y: event.clientY });
   };
 
-  const totalDuration = selectedTracks.reduce((sum, track) => sum + track.duration_ms, 0);
+  const totalDuration = useMemo(() => selectedTracks.reduce((sum, track) => sum + track.duration_ms, 0), [selectedTracks]);
 
   const exportSelected = async () => {
     const destination = await pickDirectory();
@@ -1001,10 +1178,7 @@ export default function Sidebar({ libraryReady, libraryGeneration, refreshKey, a
     <aside className="relative flex min-h-0 flex-1 flex-col bg-surface">
       <div className="flex min-h-0 flex-1">
         <nav aria-label="Looper library" style={{ width: looperPaneWidth }} className="flex shrink-0 flex-col border-r border-border bg-surface">
-          <div className="flex items-center justify-between border-b border-border px-3 py-2">
-            <span className="text-[10px] font-semibold uppercase tracking-wider text-text-secondary">Library</span>
-            <span className="text-[10px] tabular-nums text-text-secondary">{tracks.length}</span>
-          </div>
+          <LibraryViewTabs selected="local" onSelect={onLibraryViewChange} className="shrink-0 border-b border-border/60 p-1" />
           <div className="min-h-0 flex-1 overflow-y-auto p-1.5">
             <button
               onClick={() => selectCollection(ALL_GROUP)}
@@ -1151,12 +1325,15 @@ export default function Sidebar({ libraryReady, libraryGeneration, refreshKey, a
             </h2>
             <input type="search" aria-label="Search tracks" placeholder="Search tracks, loopers or tags…" value={search} onChange={(e) => setSearch(e.target.value)} className="min-w-24 flex-1 rounded-lg border border-border bg-app px-3 py-2 text-xs text-text placeholder:text-text-secondary focus:border-accent" />
             {hasFilters && <button onClick={clearFilters} className="toolbar-button">Clear filters</button>}
+            <button onClick={() => requestBpmReanalysis({ kind: "library" }, "All tracks")} title="Reanalyze automatic BPMs across the entire library, ignoring filters; confirmed BPMs are preserved" className="toolbar-button">Reanalyze all BPM</button>
+            {selectedPlaylist && <button onClick={() => requestBpmReanalysis({ kind: "playlist", playlist_id: selectedPlaylist.id }, selectedPlaylist.name)} className="toolbar-button">Reanalyze playlist BPM</button>}
+            {selectedLooper && selectedLooper.source_type !== "custom" && <button onClick={() => requestBpmReanalysis({ kind: "looper", source_hash: selectedLooper.source_hash }, groupName(selectedLooper))} className="toolbar-button">Reanalyze looper BPM</button>}
             <select value={sourceFilter} onChange={(e) => setSourceFilter(e.target.value)} aria-label="Filter source" className="rounded border border-border bg-elevated px-2 py-1 text-[10px] text-text"><option value="all">Source</option><option value="swf">SWF</option><option value="exe">EXE</option><option value="custom">Audio</option><option value="tablist">Tablist</option></select>
             <select value={bpmFilter} onChange={(e) => setBpmFilter(e.target.value)} aria-label="Filter BPM" className="rounded border border-border bg-elevated px-2 py-1 text-[10px] text-text"><option value="all">BPM</option><option value="low">&lt;100</option><option value="mid">100–130</option><option value="high">&gt;130</option></select>
             <select value={durationFilter} onChange={(e) => setDurationFilter(e.target.value)} aria-label="Filter duration" className="rounded border border-border bg-elevated px-2 py-1 text-[10px] text-text"><option value="all">Length</option><option value="short">&lt;10s</option><option value="mid">10–30s</option><option value="long">&gt;30s</option></select>
             <button disabled={selectedIds.length === 0} onClick={exportSelected} className="rounded bg-accent px-2 py-1 text-[10px] font-medium text-white disabled:opacity-40">Export {selectedIds.length || ""}</button>
           </div>
-          <div className="grid grid-cols-[minmax(0,1fr)_4.5rem_4rem_4.5rem] gap-2 border-b border-border bg-elevated/50 px-3 py-1.5 text-[10px] font-medium uppercase tracking-wider text-text-secondary sm:grid-cols-[minmax(0,1fr)_5rem_5rem_5rem]">
+          <div className={`grid ${showLooperColumn ? TRACK_COLUMNS_WITH_LOOPER : TRACK_COLUMNS} gap-2 border-b border-border bg-elevated/50 px-3 py-1.5 text-[10px] font-medium uppercase tracking-wider text-text-secondary`}>
             {selectedPlaylist
               ? <span>Playlist order</span>
               : <button
@@ -1165,6 +1342,7 @@ export default function Sidebar({ libraryReady, libraryGeneration, refreshKey, a
                 className="truncate text-left hover:text-text"
                 title="Sort loops alphabetically"
               >Loop{sort === "alphabetical" ? " ↑" : ""}</button>}
+            {showLooperColumn && <span className="truncate text-left">Looper</span>}
             {selectedPlaylist
               ? <span className="text-right">BPM</span>
               : <button
@@ -1179,7 +1357,7 @@ export default function Sidebar({ libraryReady, libraryGeneration, refreshKey, a
             <span className="text-right">Length</span>
             <span className="text-right">Actions</span>
           </div>
-          <div className="min-h-0 flex-1 overflow-y-auto">
+          <div ref={listRef} onScroll={(event) => setViewport({ top: event.currentTarget.scrollTop, height: event.currentTarget.clientHeight })} className="min-h-0 flex-1 overflow-y-auto">
             {!libraryReady && <div className="empty-state">
               <h3 className="text-base font-semibold text-text">Your practice space starts here</h3>
               <p>Choose a folder for your library, then bring in your favorite loops.</p>
@@ -1197,9 +1375,11 @@ export default function Sidebar({ libraryReady, libraryGeneration, refreshKey, a
                     : <button className="toolbar-button" onClick={() => setSelectedGroup(ALL_GROUP)}>Browse all tracks</button>}
               </div>
             )}
-            {selectedTracks.map((track) => (
+            <div style={{ height: firstVisible * TRACK_ROW_HEIGHT }} aria-hidden="true" />
+            {selectedTracks.slice(firstVisible, lastVisible).map((track) => (
               <div
                 key={track.id}
+                style={{ height: TRACK_ROW_HEIGHT }}
                 data-library-track-id={track.id}
                 onPointerDown={(event) => beginTrackPointerDrag(event, track)}
                 onPointerMove={movePointerDrag}
@@ -1221,7 +1401,7 @@ export default function Sidebar({ libraryReady, libraryGeneration, refreshKey, a
                   if (event.key === " ") { event.preventDefault(); setActiveId(track.id); }
                 }}
                 data-midi-navigation-selected={focusedMidiTrackId === track.id || undefined}
-                className={`grid w-full select-none grid-cols-[minmax(0,1fr)_4.5rem_4rem_4.5rem] items-center gap-2 border-b border-border/50 px-3 py-2 text-left text-xs transition-colors ${track.exists ? "cursor-grab active:cursor-grabbing" : "cursor-pointer opacity-50"} sm:grid-cols-[minmax(0,1fr)_5rem_5rem_5rem] ${draggingTrackIds.includes(track.id) ? "opacity-60" : focusedMidiTrackId === track.id ? "bg-accent/25 text-accent ring-1 ring-inset ring-accent/70" : activeId === track.id ? "bg-accent/10 text-accent" : "text-text hover:bg-surface-hover"}`}
+                className={`grid h-11 max-h-11 w-full select-none ${showLooperColumn ? TRACK_COLUMNS_WITH_LOOPER : TRACK_COLUMNS} items-center gap-2 overflow-hidden border-b border-border/50 px-3 text-left text-xs transition-colors ${track.exists ? "cursor-grab active:cursor-grabbing" : "cursor-pointer opacity-50"} ${draggingTrackIds.includes(track.id) ? "opacity-60" : focusedMidiTrackId === track.id ? "bg-accent/25 text-accent ring-1 ring-inset ring-accent/70" : activeId === track.id ? "bg-accent/10 text-accent" : "text-text hover:bg-surface-hover"}`}
               >
                 <span className="flex min-w-0 items-center gap-2">
                   <input type="checkbox" checked={selectedIds.includes(track.id)} onClick={(event) => event.stopPropagation()} onChange={() => setSelectedIds((ids) => ids.includes(track.id) ? ids.filter((id) => id !== track.id) : [...ids, track.id])} aria-label={`Select ${track.title}`} />
@@ -1233,7 +1413,7 @@ export default function Sidebar({ libraryReady, libraryGeneration, refreshKey, a
                   >{loadingId === track.id ? "…" : "▶"}</button>
                     <span className="min-w-0">
                       <span className="flex min-w-0 items-center gap-1">
-                        <span className="block min-w-0 truncate font-medium">{track.title}</span>
+                        <span className="block min-w-0 truncate whitespace-nowrap text-[10px] font-medium">{track.title}</span>
                         <span className="shrink-0 rounded bg-border/70 px-1 py-0.5 text-[8px] uppercase tracking-wide text-text-secondary">{track.codec}</span>
                         {track.audio_storage === "embedded" && <span className="shrink-0 rounded bg-accent/10 px-1 py-0.5 text-[8px] uppercase tracking-wide text-accent">Source</span>}
                       </span>
@@ -1241,13 +1421,26 @@ export default function Sidebar({ libraryReady, libraryGeneration, refreshKey, a
                       {convertingId === track.id && <span className="block text-[9px] text-accent">Converting to MP3 320…</span>}
                   </span>
                 </span>
-                <span className={`flex items-center justify-end gap-1 text-right text-[11px] tabular-nums ${track.bpm ? "text-success" : "text-text-secondary"}`}>
-                  {track.bpm ? `${Math.round(track.bpm)} bpm` : "--"}
+                {showLooperColumn && (
+                  <span className="min-w-0 truncate text-[10px] text-text-secondary" title={groupName(track)}>{groupName(track)}</span>
+                )}
+                <span data-bpm-cell="" onPointerDown={(event) => event.stopPropagation()} onDoubleClick={(event) => { event.stopPropagation(); editTrack(track, "bpm"); }} className={`flex min-w-0 items-center justify-end gap-1 whitespace-nowrap text-right text-[11px] tabular-nums ${track.bpm ? "text-success" : "text-text-secondary"}`}>
+                  <button
+                    type="button"
+                    aria-label={`Edit BPM for ${track.title}`}
+                    title="Double-click to edit BPM; focus and press Enter or Space to edit with the keyboard"
+                    className="shrink-0 whitespace-nowrap rounded px-0.5 hover:bg-border focus-visible:outline-accent"
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      if (event.detail === 0) editTrack(track, "bpm");
+                      else setActiveId(track.id);
+                    }}
+                  >{track.bpm ? `${Math.round(track.bpm)} bpm` : "--"}</button>
                   {track.bpm === null && (
-                    <button onClick={(event) => { event.stopPropagation(); editTrack(track); }} title="No BPM estimate; enter it manually" aria-label={`Set BPM for ${track.title}`} className="rounded px-1 text-[9px] text-text-secondary hover:bg-border hover:text-text">Set</button>
+                    <button onClick={(event) => { event.stopPropagation(); editTrack(track, "bpm"); }} onDoubleClick={(event) => event.stopPropagation()} title="No BPM estimate; enter it manually" aria-label={`Set BPM for ${track.title}`} className="rounded px-1 text-[9px] text-text-secondary hover:bg-border hover:text-text">Set</button>
                   )}
                   {track.bpm_source === "analyzed" && track.bpm_confidence !== null && track.bpm_confidence < BPM_REVIEW_THRESHOLD && (
-                    <button onClick={(event) => { event.stopPropagation(); editTrack(track); }} title={`Low-confidence BPM (${Math.round(track.bpm_confidence * 100)}%). Click to review or correct.`} aria-label={`Review uncertain BPM for ${track.title}`} className="rounded px-1 text-[10px] text-warning hover:bg-warning/10">⚠</button>
+                    <button onClick={(event) => { event.stopPropagation(); editTrack(track, "bpm"); }} onDoubleClick={(event) => event.stopPropagation()} title={`Low-confidence BPM (${Math.round(track.bpm_confidence * 100)}%). Click to review or correct.`} aria-label={`Review uncertain BPM for ${track.title}`} className="rounded px-1 text-[10px] text-warning hover:bg-warning/10">⚠</button>
                   )}
                 </span>
                 <span className="text-right text-[11px] tabular-nums text-text-secondary">{(track.duration_ms / 1000).toFixed(1)}s</span>
@@ -1275,6 +1468,7 @@ export default function Sidebar({ libraryReady, libraryGeneration, refreshKey, a
                 </span>
               </div>
             ))}
+            <div style={{ height: Math.max(0, selectedTracks.length - lastVisible) * TRACK_ROW_HEIGHT }} aria-hidden="true" />
           </div>
           <div className="flex justify-between border-t border-border px-3 py-1.5 text-[10px] text-text-secondary">
             <span>{selectedTracks.length} loop{selectedTracks.length === 1 ? "" : "s"}</span>
@@ -1328,7 +1522,9 @@ export default function Sidebar({ libraryReady, libraryGeneration, refreshKey, a
             onClick={(event) => event.stopPropagation()}
           >
             <button onClick={() => { libraryGroupDirectory(groupMenu).then(revealInFileManager).catch((e: unknown) => setError(String(e))); setGroupMenu(null); }} className="w-full px-3 py-1.5 text-left text-xs text-text hover:bg-surface-hover">Open looper folder</button>
-            <button onClick={() => renameGroup(groupMenu, groupName(track))} className="w-full px-3 py-1.5 text-left text-xs text-text hover:bg-surface-hover">Rename looper</button>
+            <button onClick={() => { window.dispatchEvent(new CustomEvent("olooper:rescan-source-folder", { detail: groupMenu })); setGroupMenu(null); }} className="w-full px-3 py-1.5 text-left text-xs text-text hover:bg-surface-hover">Rescan source folder…</button>
+             <button onClick={() => renameGroup(groupMenu, groupName(track))} className="w-full px-3 py-1.5 text-left text-xs text-text hover:bg-surface-hover">Rename looper</button>
+             <button onClick={() => { requestBpmReanalysis({ kind: "looper", source_hash: groupMenu }, groupName(track)); setGroupMenu(null); }} className="w-full px-3 py-1.5 text-left text-xs text-text hover:bg-surface-hover">Reanalyze BPM</button>
             <button onClick={() => removeGroup(groupMenu, groupName(track))} className="w-full px-3 py-1.5 text-left text-xs text-danger hover:bg-danger/10">Remove group from library</button>
           </div>
         );
@@ -1361,13 +1557,14 @@ export default function Sidebar({ libraryReady, libraryGeneration, refreshKey, a
       {missingSourcePrompt && (
         <div className="fixed inset-0 z-[125] flex items-center justify-center bg-black/65 p-4 backdrop-blur-sm" onMouseDown={(event) => { if (event.target === event.currentTarget) setMissingSourcePrompt(null); }}>
           <section role="dialog" aria-modal="true" aria-labelledby="missing-looper-title" className="w-full max-w-md rounded-lg border border-border bg-surface p-5 shadow-2xl">
-            <h2 id="missing-looper-title" className="text-sm font-semibold text-text">Looper not found</h2>
+            <h2 id="missing-looper-title" className="text-sm font-semibold text-text">Audio not found</h2>
             <p className="mt-3 text-xs leading-relaxed text-text-secondary">“{missingSourcePrompt.name}” may have been moved, deleted, or be on a disconnected drive.</p>
             <p className="mt-2 break-all rounded bg-elevated p-2 font-mono text-[10px] text-text-secondary">{missingSourcePrompt.path}</p>
-            <p className="mt-3 text-xs leading-relaxed text-text-secondary">Would you like to remove this looper and its tracks from the library? The original file will never be deleted.</p>
+            <p className="mt-3 text-xs leading-relaxed text-text-secondary">Rescan its source folder to find changes and remove missing audio entries. Existing extracted loops are kept. Reconnect disconnected drives before rescanning.</p>
             <div className="mt-5 flex justify-end gap-2">
               <button autoFocus onClick={() => setMissingSourcePrompt(null)} className="dialog-close">Cancel</button>
-              <button onClick={confirmRemoveMissingSource} className="rounded bg-danger px-3 py-2 text-xs font-medium text-white hover:bg-danger/85">Remove from library</button>
+              <button onClick={() => { window.dispatchEvent(new CustomEvent("olooper:rescan-source-folder", { detail: missingSourcePrompt.sourceHash })); setMissingSourcePrompt(null); }} className="toolbar-button">Rescan source folder…</button>
+              <button onClick={confirmRemoveMissingSource} className="rounded bg-danger px-3 py-2 text-xs font-medium text-white hover:bg-danger/85">Remove this track</button>
             </div>
           </section>
         </div>
@@ -1432,7 +1629,7 @@ export default function Sidebar({ libraryReady, libraryGeneration, refreshKey, a
         <div
           className="fixed inset-0 z-[110] flex items-center justify-center bg-app/75 p-4 backdrop-blur-sm"
           onMouseDown={(event) => {
-            if (event.target === event.currentTarget && !metadataBusy) setEditingTrack(null);
+            if (event.target === event.currentTarget && !metadataBusy) closeTrackEditor();
           }}
         >
           <form
@@ -1440,13 +1637,13 @@ export default function Sidebar({ libraryReady, libraryGeneration, refreshKey, a
             aria-modal="true"
             aria-labelledby="edit-track-metadata-title"
             onSubmit={(event) => void saveTrackMetadata(event)}
-            className="w-full max-w-md rounded-lg border border-border bg-surface p-5 shadow-2xl"
+            className="max-h-[90vh] w-full max-w-md overflow-y-auto rounded-lg border border-border bg-surface p-5 shadow-2xl"
           >
             <h2 id="edit-track-metadata-title" className="mb-4 text-base font-semibold text-text">Edit metadata</h2>
             <label className="mb-3 block text-xs text-text-secondary">
               Loop title
               <input
-                autoFocus
+                data-dialog-initial-focus={metadataFocus === "title" ? "" : undefined}
                 value={metadataDraft.title}
                 onChange={(event) => setMetadataDraft((draft) => ({ ...draft, title: event.target.value }))}
                 disabled={metadataBusy}
@@ -1457,13 +1654,18 @@ export default function Sidebar({ libraryReady, libraryGeneration, refreshKey, a
               BPM <span className="text-text-secondary/70">(leave empty to keep current)</span>
               <input
                 type="number"
+                data-dialog-initial-focus={metadataFocus === "bpm" ? "" : undefined}
                 min={20}
                 max={300}
                 step="any"
                 value={metadataDraft.bpm}
                 onChange={(event) => {
+                  bpmDraftRevision.current += 1;
                   resetTempoTaps();
                   setBpmConfirmed(true);
+                  setBpmAnalysisError(null);
+                  const value = Number(event.target.value);
+                  if (event.target.value.trim() && validBpm(value)) setBpmBase({ bpm: value, origin: "entered" });
                   setMetadataDraft((draft) => ({ ...draft, bpm: event.target.value }));
                 }}
                 disabled={metadataBusy}
@@ -1473,6 +1675,22 @@ export default function Sidebar({ libraryReady, libraryGeneration, refreshKey, a
                 <span className="mt-1 block text-[10px] text-warning">Low-confidence estimate ({Math.round(editingTrack.bpm_confidence * 100)}%). Adjust it here if needed.</span>
               )}
             </label>
+            <fieldset className="mb-3 rounded border border-border p-2" disabled={metadataBusy}>
+              <legend className="px-1 text-[10px] text-text-secondary">Tempo options</legend>
+              <div className="flex flex-wrap gap-2">
+                {bpmOptions(bpmBase).map((option) => (
+                  <button key={option.kind} type="button" disabled={metadataBusy} aria-pressed={metadataDraft.bpm.trim() !== "" && Number(metadataDraft.bpm) === option.bpm}
+                    onClick={() => chooseBpm(option.bpm)}
+                    className={`rounded px-2 py-1.5 text-[11px] disabled:opacity-40 ${Number(metadataDraft.bpm) === option.bpm ? "bg-accent/20 text-accent" : "bg-elevated text-text hover:bg-border"}`}
+                  >{option.label}</button>
+                ))}
+              </div>
+              {bpmAnalysisBusy && <p role="status" className="mt-2 text-[10px] text-text-secondary">Analyzing tempo…</p>}
+              {!bpmBase && !bpmAnalysisBusy && !bpmAnalysisError && <p className="text-[10px] text-text-secondary">Enter a BPM or use Tap tempo to see options.</p>}
+              {bpmBase?.loop && <p className="mt-2 text-[10px] text-text-secondary">4/4 loop · {(bpmBase.loop.frames / bpmBase.loop.rate).toFixed(3)} s · {bpmBase.loop.bars} bars at {formatBpm(bpmBase.bpm)} BPM</p>}
+              {bpmBase?.origin === "detected" && bpmBase.confidence !== null && bpmBase.confidence !== undefined && bpmBase.confidence < BPM_REVIEW_THRESHOLD && <p className="mt-1 text-[10px] text-warning">Suggested tempo is uncertain. Listen and choose the appropriate tempo.</p>}
+              {bpmAnalysisError && <p role="status" className="mt-2 text-[10px] text-warning">{bpmAnalysisError} <button type="button" disabled={metadataBusy} onClick={() => setMetadataSession((session) => session + 1)} className="underline">Retry tempo analysis</button></p>}
+            </fieldset>
             <div className="-mt-2 mb-4 flex items-center gap-2">
               <button
                 type="button"
@@ -1503,7 +1721,7 @@ export default function Sidebar({ libraryReady, libraryGeneration, refreshKey, a
             <div className="flex justify-end gap-2">
               <button
                 type="button"
-                onClick={() => setEditingTrack(null)}
+                onClick={closeTrackEditor}
                 disabled={metadataBusy}
                 className="dialog-close"
               >Cancel</button>
@@ -1520,3 +1738,5 @@ export default function Sidebar({ libraryReady, libraryGeneration, refreshKey, a
     </aside>
   );
 }
+
+export default memo(Sidebar);

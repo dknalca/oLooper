@@ -38,6 +38,8 @@ pub enum SwfError {
     LengthMismatch { declared: u32, actual: usize },
     Decompress(String),
     BadRect,
+    ResourceLimit,
+    Cancelled,
     TagOverrun,
 }
 
@@ -63,6 +65,8 @@ impl fmt::Display for SwfError {
             ),
             Self::Decompress(e) => write!(f, "SWF decompression failed: {e}"),
             Self::BadRect => write!(f, "SWF frame-size record is malformed"),
+            Self::ResourceLimit => write!(f, "SWF audio exceeds the working memory budget"),
+            Self::Cancelled => write!(f, "import cancelled"),
             Self::TagOverrun => write!(f, "SWF tag overruns the file"),
         }
     }
@@ -85,7 +89,7 @@ pub struct Sound {
     /// Raw sample count from `DefineSound`.
     pub sample_count: u32,
     /// MP3 `SeekSamples` prefix (not audio); frames exclude it.
-    pub seek_samples: u16,
+    pub seek_samples: i16,
     /// Leading non-frame bytes stripped before the first frame
     /// (e.g. zero padding some authoring tools prepend). Frames are
     /// preserved byte-identical; stripping is de-containering, not transcoding.
@@ -198,6 +202,9 @@ fn body_bytes(data: &[u8]) -> Result<(u8, Vec<u8>), SwfError> {
     if declared < 8 {
         return Err(SwfError::TooSmall);
     }
+    if declared as usize > crate::memory::working_budget(MAX_SWF_LEN as usize) {
+        return Err(SwfError::ResourceLimit);
+    }
     match &magic {
         b"FWS" => {
             if data.len() < declared as usize {
@@ -215,9 +222,18 @@ fn body_bytes(data: &[u8]) -> Result<(u8, Vec<u8>), SwfError> {
             let expected = declared as usize - 8;
             let dec = flate2::read::ZlibDecoder::new(&data[8..]);
             let mut out = Vec::new();
-            dec.take((expected + 1) as u64)
-                .read_to_end(&mut out)
-                .map_err(|e| SwfError::Decompress(e.to_string()))?;
+            let mut reader = dec.take((expected + 1) as u64);
+            let mut chunk = [0u8; 64 * 1024];
+            loop {
+                crate::check_cancelled().map_err(|_| SwfError::Cancelled)?;
+                let count = reader
+                    .read(&mut chunk)
+                    .map_err(|e| SwfError::Decompress(e.to_string()))?;
+                if count == 0 {
+                    break;
+                }
+                out.extend_from_slice(&chunk[..count]);
+            }
             if out.len() != expected {
                 return Err(SwfError::LengthMismatch {
                     declared,
@@ -297,6 +313,9 @@ fn wav_from_adpcm(payload: &[u8], flags: u8, sample_count: u32) -> Option<Vec<u8
     let mut index = Vec::with_capacity(channels);
     let mut pcm = Vec::with_capacity(total.checked_mul(channels)?.checked_mul(2)?);
     for frame in 0..total {
+        if frame % 4096 == 0 && crate::check_cancelled().is_err() {
+            return None;
+        }
         // SWF ADPCM emits the predictor as the first frame of each block,
         // followed by 4095 delta frames (4096 output frames in total).
         if frame % 4096 == 0 {
@@ -349,7 +368,7 @@ fn wav_from_adpcm(payload: &[u8], flags: u8, sample_count: u32) -> Option<Vec<u8
     Some(wav)
 }
 
-fn parse_define_sound(tag: &[u8]) -> Result<Sound, SkippedSound> {
+fn parse_define_sound(tag: &[u8], remaining: usize) -> Result<Sound, SkippedSound> {
     let bad = |reason: &'static str| SkippedSound {
         id: tag.first().copied().unwrap_or(0) as u16
             | ((tag.get(1).copied().unwrap_or(0) as u16) << 8),
@@ -370,6 +389,15 @@ fn parse_define_sound(tag: &[u8]) -> Result<Sound, SkippedSound> {
         });
     }
     if format == FORMAT_ADPCM {
+        let channels = if tag[2] & 1 != 0 { 2usize } else { 1 };
+        if (sample_count as usize)
+            .saturating_mul(channels)
+            .saturating_mul(2)
+            .saturating_add(44)
+            > remaining
+        {
+            return Err(bad("ADPCM sound exceeds the container audio budget"));
+        }
         let Some(frames) = wav_from_adpcm(&tag[7..], tag[2], sample_count) else {
             return Err(SkippedSound {
                 id,
@@ -395,6 +423,9 @@ fn parse_define_sound(tag: &[u8]) -> Result<Sound, SkippedSound> {
         });
     }
     let payload = &tag[9..];
+    if payload.len() > remaining {
+        return Err(bad("sound exceeds the container audio budget"));
+    }
     let Some(start) = mp3_frame_start(payload) else {
         return Err(SkippedSound {
             id,
@@ -407,7 +438,7 @@ fn parse_define_sound(tag: &[u8]) -> Result<Sound, SkippedSound> {
         format,
         codec: "mp3".to_string(),
         sample_count,
-        seek_samples: u16::from_le_bytes([tag[7], tag[8]]),
+        seek_samples: i16::from_le_bytes([tag[7], tag[8]]),
         trimmed_leading: start,
         frames: payload[start..].to_vec(),
     })
@@ -416,7 +447,7 @@ fn parse_define_sound(tag: &[u8]) -> Result<Sound, SkippedSound> {
 struct StreamSound {
     id: u16,
     sample_count: u32,
-    seek_samples: u16,
+    seek_samples: i16,
     frames: Vec<u8>,
 }
 
@@ -446,8 +477,33 @@ pub fn parse(data: &[u8]) -> Result<SwfSounds, SwfError> {
 }
 
 /// Playback must not decode unrelated ADPCM sounds or embedded covers.
+#[cfg(test)]
 pub(crate) fn parse_sound(data: &[u8], id: u16) -> Result<SwfSounds, SwfError> {
-    parse_mode(data, ParseMode::Sound(id))
+    SoundSource::new(data)?.parse_sound(id)
+}
+
+/// Reusable decompressed container. Selected playback still parses all tag
+/// bounds, but never decompresses the movie or decodes unrelated sounds again.
+pub(crate) struct SoundSource {
+    version: u8,
+    body: Vec<u8>,
+}
+
+impl SoundSource {
+    pub(crate) fn new(data: &[u8]) -> Result<Self, SwfError> {
+        let _work = crate::memory::work_guard();
+        let (version, body) = body_bytes(data)?;
+        Ok(Self { version, body })
+    }
+
+    pub(crate) fn memory_bytes(&self) -> usize {
+        self.body.capacity()
+    }
+
+    pub(crate) fn parse_sound(&self, id: u16) -> Result<SwfSounds, SwfError> {
+        let _work = crate::memory::work_guard();
+        parse_body(self.version, &self.body, ParseMode::Sound(id))
+    }
 }
 
 /// Validate container/tag bounds without materializing audio or images.
@@ -473,16 +529,22 @@ impl ParseMode {
 }
 
 fn parse_mode(data: &[u8], mode: ParseMode) -> Result<SwfSounds, SwfError> {
+    let _work = crate::memory::work_guard();
     let (version, body) = body_bytes(data)?;
+    parse_body(version, &body, mode)
+}
 
+fn parse_body(version: u8, body: &[u8], mode: ParseMode) -> Result<SwfSounds, SwfError> {
     // Skip FrameSize RECT + FrameRate (2) + FrameCount (2).
-    let mut off = rect_len(&body)?;
+    let mut off = rect_len(body)?;
     off = off
         .checked_add(4)
         .filter(|&o| o <= body.len())
         .ok_or(SwfError::TagOverrun)?;
 
     let mut sounds = Vec::new();
+    let audio_budget = crate::memory::working_budget(128 * 1024 * 1024);
+    let mut retained_bytes = 0usize;
     let mut skipped = Vec::new();
     let mut jpeg_tables: Option<Vec<u8>> = None;
     let mut cover_candidates: Vec<Vec<u8>> = Vec::new();
@@ -490,15 +552,19 @@ fn parse_mode(data: &[u8], mode: ParseMode) -> Result<SwfSounds, SwfError> {
     let mut next_stream_id = 0x8000u16;
     let mut ended = false;
     while off < body.len() {
+        if sounds.len() + skipped.len() >= 4096 {
+            return Err(SwfError::ResourceLimit);
+        }
+        crate::check_cancelled().map_err(|_| SwfError::Cancelled)?;
         if body.len() - off < 2 {
             return Err(SwfError::TagOverrun);
         }
-        let head = u16le_at(&body, off)?;
+        let head = u16le_at(body, off)?;
         off += 2;
         let code = head >> 6;
         let mut len = (head & 0x3F) as usize;
         if len == 0x3F {
-            len = u32le_at(&body, off)? as usize;
+            len = u32le_at(body, off)? as usize;
             off += 4;
         }
         let end = off.checked_add(len).ok_or(SwfError::TagOverrun)?;
@@ -519,8 +585,11 @@ fn parse_mode(data: &[u8], mode: ParseMode) -> Result<SwfSounds, SwfError> {
         }
         match code {
             TAG_DEFINE_SOUND if mode.includes(u16le_at(tag, 0).unwrap_or(0)) => {
-                match parse_define_sound(tag) {
-                    Ok(s) => sounds.push(s),
+                match parse_define_sound(tag, audio_budget.saturating_sub(retained_bytes)) {
+                    Ok(s) => {
+                        retained_bytes += s.frames.len();
+                        sounds.push(s);
+                    }
                     Err(sk) => skipped.push(sk),
                 }
             }
@@ -536,7 +605,7 @@ fn parse_mode(data: &[u8], mode: ParseMode) -> Result<SwfSounds, SwfError> {
                     stream = Some(StreamSound {
                         id: next_stream_id,
                         sample_count: 0,
-                        seek_samples: u16::from_le_bytes([tag[4], tag[5]]),
+                        seek_samples: i16::from_le_bytes([tag[4], tag[5]]),
                         frames: Vec::new(),
                     });
                     next_stream_id = next_stream_id.wrapping_add(1);
@@ -559,6 +628,11 @@ fn parse_mode(data: &[u8], mode: ParseMode) -> Result<SwfSounds, SwfError> {
                             .saturating_add(u16::from_le_bytes([tag[0], tag[1]]) as u32);
                         let payload = &tag[4..];
                         if let Some(start) = mp3_frame_start(payload) {
+                            let added = payload.len() - start;
+                            if retained_bytes.saturating_add(added) > audio_budget {
+                                return Err(SwfError::ResourceLimit);
+                            }
+                            retained_bytes += added;
                             active.frames.extend_from_slice(&payload[start..]);
                         }
                     }
@@ -599,7 +673,7 @@ fn decodable_cover(bytes: &[u8]) -> bool {
     let mut limits = image::Limits::default();
     limits.max_image_width = Some(8192);
     limits.max_image_height = Some(8192);
-    limits.max_alloc = Some(128 * 1024 * 1024);
+    limits.max_alloc = Some(crate::memory::working_budget(128 * 1024 * 1024) as u64);
     reader.limits(limits);
     reader.decode().is_ok()
 }

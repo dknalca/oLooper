@@ -1,6 +1,6 @@
 # Agent Instructions
 
-oLooper is a Tauri 2 app: React/TypeScript frontend in `src/`, Rust backend in `src-tauri/` (MSRV 1.87). The root package is the frontend; use pnpm and `pnpm-lock.yaml` despite the existing `package-lock.json`. CI uses Node 24 and pnpm 12.9.1.
+oLooper is a Tauri 2 app: React/TypeScript frontend in `src/`, Rust backend in `src-tauri/` (MSRV 1.89, raised with user approval for patched dependencies). The root package is the frontend; use pnpm and the single `pnpm-lock.yaml`. CI uses Node 24 and pnpm 12.9.1.
 
 ## Commands
 
@@ -13,7 +13,7 @@ oLooper is a Tauri 2 app: React/TypeScript frontend in `src/`, Rust backend in `
 
 ## Architecture and constraints
 
-- Backend commands/setup are in `src-tauri/src/lib.rs`; audio engine in `src-tauri/src/player/`; import parsers in `src-tauri/src/import/`; waveform/BPM analysis in `waveform.rs` and `analysis.rs`. SQLite schema and migrations are in `library/mod.rs` (current schema v10; add migrations there).
+- Backend commands/setup are in `src-tauri/src/lib.rs`; audio engine in `src-tauri/src/player/`; import parsers in `src-tauri/src/import/`; waveform analysis in `waveform.rs`; generic/duration-aware tempo detection in `analysis.rs` / `analysis_loop.rs`. Individual BPM preview and batch reanalysis are in `library/bpm.rs` and `bpm_jobs.rs`. Linked source folders/reconciliation are in `library/folders.rs` (spec 280, ADR 0024). SQLite schema and migrations are in `library/mod.rs` (current schema v11; add migrations there).
 - Keep frontend Tauri command/dialog wrappers and typed IPC contracts in `src/tauri.ts`, in sync with Rust DTOs and command registration in `src-tauri/src/lib.rs`. Drag/drop in `src/components/ImportBar.tsx` is the current `getCurrentWebview` exception.
 - Imports enqueue on the `olooper-import` worker with a separate SQLite connection; command return is not job completion. Subscribe before enqueueing via the wait helpers in `src/tauri.ts` to avoid missing fast completions. Final `olooper:import-progress` events carry `report` (SWF/EXE) or `custom_report` (custom audio). Preserve SQLite WAL and busy timeout for worker/read concurrency.
 - The selected library root owns the catalog DB, managed audio/covers, copied SWF/EXE sources, and derived caches. Playlists reference ordered track IDs and never copy audio. Waveforms cache under `<library>/.olooper-cache/waveforms/`.
@@ -21,5 +21,6 @@ oLooper is a Tauri 2 app: React/TypeScript frontend in `src/`, Rust backend in `
 - Managed audio tags are the source of truth for CUEs, not SQLite. CUE 1 is fixed at track start. Preserve Serato saved loops; do not expose loop-slot editing. MP3/WAV/AIFF update legacy `Markers_` while preserving existing ID3 `Markers2`; stage and validate writes before replacing managed files (ADR 0014).
 - Never execute SWF/EXE projectors. Treat imported files as untrusted: retain parsing bounds/size checks, path sanitization, and validated/atomic writes. Removing a library entry must not delete original SWF/EXE inputs or external custom-audio sources.
 - For non-trivial features, update/add a spec in `specs/`; record lasting architectural decisions in `docs/adr/`. Add regression coverage for parsing, persistence, serialization, and security-sensitive changes.
+- Release v0.8.0 includes the earlier unreleased features and DOC-A01–DOC-A06 corrections; see `docs/release-0.8.0.md`. The dated audit/validation records are historical evidence; don't describe build/smoke checks as physical-device validation.
 - `src-tauri/gen/` is generated and gitignored; `src-tauri/icons/` is committed and required to compile. Keep local data/artifacts (`loopersFlash/`, `audios/`, `library/`, `.dev/`, `oLooper*.app/`, `dist/`) out of commits.
 - Version bumps span `package.json`, `src-tauri/Cargo.toml`, and `src-tauri/tauri.conf.json`; release workflows validate the tag against the Tauri config version.

@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { ownSubscription } from "../subscription";
 import {
   cancelImport,
   importTablistAndWait,
@@ -10,11 +11,13 @@ import {
   type TablistCatalogLooper,
   type TablistImportCount,
 } from "../tauri";
+import LibraryViewTabs, { type LibraryView } from "./LibraryViewTabs";
 
 interface Props {
   libraryReady: boolean;
   refreshKey: number;
   onImported: () => void;
+  onLibraryViewChange: (view: LibraryView) => void;
 }
 
 const PAGE_SIZE = 24;
@@ -37,7 +40,7 @@ interface CatalogContextMenu {
   y: number;
 }
 
-export default function TablistCatalog({ libraryReady, refreshKey, onImported }: Props) {
+export default function TablistCatalog({ libraryReady, refreshKey, onImported, onLibraryViewChange }: Props) {
   const [searchInput, setSearchInput] = useState("");
   const [query, setQuery] = useState("");
   const [pageNumber, setPageNumber] = useState(0);
@@ -105,11 +108,9 @@ export default function TablistCatalog({ libraryReady, refreshKey, onImported }:
   }, [libraryReady, refreshKey]);
 
   useEffect(() => {
-    let unlisten: (() => void) | undefined;
-    listenImportProgress((next) => {
+    return ownSubscription(listenImportProgress((next) => {
       if (next.job_id === activeJobId.current) setProgress(next);
-    }).then((off) => { unlisten = off; }).catch((reason: unknown) => setError(String(reason)));
-    return () => unlisten?.();
+    }), (reason: unknown) => setError(String(reason)));
   }, []);
 
   useEffect(() => {
@@ -150,6 +151,7 @@ export default function TablistCatalog({ libraryReady, refreshKey, onImported }:
       onImported();
     } catch (reason) {
       setImportError(String(reason));
+      onImported();
     } finally {
       activeJobId.current = null;
       setActiveLooper(null);
@@ -224,8 +226,8 @@ export default function TablistCatalog({ libraryReady, refreshKey, onImported }:
 
   return (
     <aside className="flex min-h-0 flex-1 flex-col bg-surface">
-      <div className="flex items-center gap-2 border-b border-border px-4 py-2">
-        <span className="shrink-0 text-xs font-medium uppercase tracking-wider text-text-secondary">Tablist catalog</span>
+      <div className="flex min-w-0 flex-wrap items-center gap-2 border-b border-border px-2 py-1.5">
+        <LibraryViewTabs selected="tablist" onSelect={onLibraryViewChange} className="w-52 shrink-0" />
         <input
           type="search"
           aria-label="Search Tablist loopers"
@@ -233,7 +235,7 @@ export default function TablistCatalog({ libraryReady, refreshKey, onImported }:
           value={searchInput}
           onChange={(event) => setSearchInput(event.target.value)}
           disabled={activeLooper !== null || randomLoading}
-          className="min-w-0 flex-1 rounded border border-border bg-elevated px-2.5 py-1 text-xs text-text placeholder:text-text-secondary/50 focus:border-accent focus:outline-none disabled:opacity-50"
+          className="min-w-24 flex-1 rounded border border-border bg-elevated px-2.5 py-1 text-xs text-text placeholder:text-text-secondary/50 focus:border-accent focus:outline-none disabled:opacity-50"
         />
         <button
           onClick={() => void downloadRandomLooper()}

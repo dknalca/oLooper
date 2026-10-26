@@ -55,7 +55,12 @@ fn wav_buf() -> crate::player::LoopBuffer {
     crate::player::decode_bytes(&v).unwrap()
 }
 
-fn add_test_looper_track(lib: &Library, root: &Path, title: &str, source_hash: &str) -> i64 {
+pub(crate) fn add_test_looper_track(
+    lib: &Library,
+    root: &Path,
+    title: &str,
+    source_hash: &str,
+) -> i64 {
     let audio = root.join("Custom Loops").join(format!("{title}.wav"));
     std::fs::write(&audio, title.as_bytes()).unwrap();
     let (id, added) = lib
@@ -98,7 +103,7 @@ fn wav_id3_tag(path: &Path) -> Tag {
 fn migrate_starts_at_current_schema() {
     let root = tmp_root("migrate");
     let lib = Library::open(&root).unwrap();
-    assert_eq!(lib.schema_version().unwrap(), 10);
+    assert_eq!(lib.schema_version().unwrap(), 11);
     assert!(root.join("Custom Loops").is_dir());
     assert!(root.join("olooper.db").is_file());
     std::fs::remove_dir_all(&root).ok();
@@ -131,7 +136,7 @@ fn migration_v6_adds_empty_playlists_without_changing_tracks() {
 
     let conn = Connection::open(root.join("olooper.db")).unwrap();
     conn.execute_batch(
-        "DROP TABLE playlist_tracks; DROP TABLE playlists; DROP TABLE looper_order; \
+        "DROP TABLE linked_folder_sources; DROP TABLE linked_folders; DROP TABLE playlist_tracks; DROP TABLE playlists; DROP TABLE looper_order; \
          ALTER TABLE tracks DROP COLUMN audio_storage; ALTER TABLE tracks DROP COLUMN source_managed; \
          PRAGMA user_version=6;",
     )
@@ -139,7 +144,7 @@ fn migration_v6_adds_empty_playlists_without_changing_tracks() {
     drop(conn);
 
     let migrated = Library::open(&root).unwrap();
-    assert_eq!(migrated.schema_version().unwrap(), 10);
+    assert_eq!(migrated.schema_version().unwrap(), 11);
     assert!(migrated.list_playlists().unwrap().is_empty());
     assert_eq!(migrated.list_tracks().unwrap()[0].id, track_id);
     std::fs::remove_dir_all(root).ok();
@@ -154,13 +159,13 @@ fn migration_v7_adds_looper_order_and_preserves_existing_groups() {
 
     let conn = Connection::open(root.join("olooper.db")).unwrap();
     conn.execute_batch(
-        "DROP TABLE looper_order; ALTER TABLE tracks DROP COLUMN audio_storage; ALTER TABLE tracks DROP COLUMN source_managed; PRAGMA user_version=7;",
+        "DROP TABLE linked_folder_sources; DROP TABLE linked_folders; DROP TABLE looper_order; ALTER TABLE tracks DROP COLUMN audio_storage; ALTER TABLE tracks DROP COLUMN source_managed; PRAGMA user_version=7;",
     )
         .unwrap();
     drop(conn);
 
     let migrated = Library::open(&root).unwrap();
-    assert_eq!(migrated.schema_version().unwrap(), 10);
+    assert_eq!(migrated.schema_version().unwrap(), 11);
     assert_eq!(
         migrated.list_looper_order().unwrap(),
         vec!["looper-order-first"]
@@ -177,12 +182,12 @@ fn migration_v8_defaults_existing_tracks_to_extracted_audio() {
     drop(lib);
 
     let conn = Connection::open(root.join("olooper.db")).unwrap();
-    conn.execute_batch("ALTER TABLE tracks DROP COLUMN audio_storage; ALTER TABLE tracks DROP COLUMN source_managed; PRAGMA user_version=8;")
+    conn.execute_batch("DROP TABLE linked_folder_sources; DROP TABLE linked_folders; ALTER TABLE tracks DROP COLUMN audio_storage; ALTER TABLE tracks DROP COLUMN source_managed; PRAGMA user_version=8;")
         .unwrap();
     drop(conn);
 
     let migrated = Library::open(&root).unwrap();
-    assert_eq!(migrated.schema_version().unwrap(), 10);
+    assert_eq!(migrated.schema_version().unwrap(), 11);
     let track = migrated.get_track(track_id).unwrap().unwrap();
     assert_eq!(track.audio_storage, "extracted");
     assert!(track.source_managed);
@@ -1082,8 +1087,10 @@ fn metadata_only_edits_preserve_analyzed_bpm_and_manual_sync_beats_stale_tags() 
         .unwrap();
     assert!(added);
 
-    let mut tagged = SeratoMetadata::default();
-    tagged.bpm = Some(100.0);
+    let tagged = SeratoMetadata {
+        bpm: Some(100.0),
+        ..SeratoMetadata::default()
+    };
     serato::write_audio_file(&audio, &tagged, buffer.duration_ms() as i64).unwrap();
     lib.update_bpm(track_id, 100.0, Some(0.2), false).unwrap();
 
@@ -1107,6 +1114,19 @@ fn metadata_only_edits_preserve_analyzed_bpm_and_manual_sync_beats_stale_tags() 
     assert_eq!(manual.bpm_source.as_deref(), Some("manual"));
     assert_eq!(manual.bpm_confidence, None);
 
+    // Reproduce a player/CUE read between manual SQL confirmation and sync.
+    drop(lib);
+    let lib = Library::open(&root).unwrap();
+    assert_eq!(lib.get_serato_metadata(track_id).unwrap().bpm, Some(120.0));
+    lib.set_serato_cue(track_id, 2, Some(50)).unwrap();
+    assert_eq!(
+        lib.get_track(track_id)
+            .unwrap()
+            .unwrap()
+            .bpm_source
+            .as_deref(),
+        Some("manual")
+    );
     lib.sync_serato_metadata(track_id).unwrap();
     let from_file = serato::read_audio_file(&audio).unwrap().metadata;
     assert_eq!(from_file.bpm, Some(120.0));
@@ -1121,6 +1141,38 @@ fn metadata_only_edits_preserve_analyzed_bpm_and_manual_sync_beats_stale_tags() 
         Some("manual")
     );
     std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn cue_writes_preserve_automatic_provenance_and_do_not_create_a_protected_bpm_tag() {
+    let directory = tempfile::tempdir().unwrap();
+    let lib = Library::open(directory.path()).unwrap();
+    let id = add_test_looper_track(&lib, directory.path(), "automatic", "auto-hash");
+    let path = PathBuf::from(lib.get_track(id).unwrap().unwrap().file_path);
+    std::fs::write(&path, Library::loop_buffer_to_wav(&wav_buf())).unwrap();
+    lib.update_bpm(id, 111.0, Some(0.2), false).unwrap();
+    let snapshot = lib
+        .serato_metadata_snapshot(id, Some((2, Some(50))))
+        .unwrap();
+    assert_eq!(snapshot.bpm_source.as_deref(), Some("analyzed"));
+    assert_eq!(snapshot.bpm_confidence, Some(0.2));
+    assert_eq!(snapshot.metadata.bpm, Some(111.0));
+    assert_eq!(serato::read_audio_file(&path).unwrap().metadata.bpm, None);
+    lib.sync_serato_metadata(id).unwrap();
+    assert_eq!(serato::read_audio_file(&path).unwrap().metadata.bpm, None);
+    assert!(!matches!(
+        lib.reanalyze_bpm_track(id).unwrap(),
+        BpmOutcome::Protected
+    ));
+    assert!(serato::read_audio_file(&path)
+        .unwrap()
+        .metadata
+        .cues
+        .iter()
+        .any(|cue| cue.slot == 2 && cue.position_ms == 50));
+    let json = serde_json::to_value(snapshot).unwrap();
+    assert_eq!(json["bpm_source"], "analyzed");
+    assert_eq!(json["bpm"], 111.0);
 }
 
 #[test]
@@ -1467,7 +1519,11 @@ fn source_playback_matches_import_pcm_for_compressed_swf_and_projector_mp3() {
     tag.extend_from_slice(&encoded);
     let swf = cws_file(10, &swf_tag(14, &tag));
     let parsed = crate::import::swf::parse(&swf).unwrap();
-    let expected = prepare_sound(&parsed.sounds[0]).unwrap().buffer;
+    let prepared = prepare_sound(&parsed.sounds[0], true).unwrap();
+    let embedded = prepare_sound(&parsed.sounds[0], false).unwrap();
+    assert!(embedded.file_bytes.is_empty());
+    assert_eq!(embedded.buffer.samples, prepared.buffer.samples);
+    let expected = prepared.buffer;
     assert_eq!(expected.frames(), 400);
     let mut exe = vec![0; 128];
     exe[..2].copy_from_slice(b"MZ");
@@ -1566,7 +1622,7 @@ fn embedded_import_lists_tracks_and_decodes_from_the_managed_source_without_audi
 
     let request = lib.playback_request(track.id).unwrap();
     let decoded = request.decode().unwrap();
-    let expected = prepare_sound(&parsed.sounds[0]).unwrap().buffer;
+    let expected = prepare_sound(&parsed.sounds[0], true).unwrap().buffer;
     assert_eq!(decoded.samples, expected.samples);
     assert_eq!(decoded.rate, expected.rate);
     assert_eq!(decoded.channels, expected.channels);
@@ -1980,6 +2036,142 @@ fn custom_import_beat_gets_bpm() {
 }
 
 #[test]
+fn reanalysis_updates_existing_loops_without_touching_audio_or_confirmed_bpm() {
+    let directory = tempfile::tempdir().unwrap();
+    let lib = Library::open(directory.path()).unwrap();
+    let source = directory.path().join("perfect.wav");
+    let rate = 8000;
+    let mut samples = vec![0i16; 76800]; // Four bars at exactly 100 BPM.
+    for beat in 0..16 {
+        samples[beat * 4800] = 30000;
+    }
+    write_wav(&source, &samples, rate);
+    let report = lib.import_custom(&[source.to_string_lossy().to_string()]);
+    let id = report[0].track_id.unwrap();
+    lib.update_bpm(id, 97.0, Some(0.2), false).unwrap();
+    let original = lib.get_track(id).unwrap().unwrap();
+    let bytes = std::fs::read(&original.file_path).unwrap();
+    assert!(matches!(
+        lib.reanalyze_bpm_track(id).unwrap(),
+        BpmOutcome::Updated(_)
+    ));
+    let updated = lib.get_track(id).unwrap().unwrap();
+    assert_eq!(updated.bpm, Some(100.0));
+    assert_eq!(updated.bpm_source.as_deref(), Some("analyzed"));
+    assert_eq!(updated.loop_start_frame, original.loop_start_frame);
+    assert_eq!(updated.loop_end_frame, original.loop_end_frame);
+    assert_eq!(std::fs::read(&original.file_path).unwrap(), bytes);
+    lib.update_metadata(id, &updated.title, Some(50.0), "", true)
+        .unwrap();
+    assert!(matches!(
+        lib.reanalyze_bpm_track(id).unwrap(),
+        BpmOutcome::Protected
+    ));
+    assert_eq!(lib.get_track(id).unwrap().unwrap().bpm, Some(50.0));
+    drop(lib);
+    assert_eq!(
+        Library::open(directory.path())
+            .unwrap()
+            .get_track(id)
+            .unwrap()
+            .unwrap()
+            .bpm,
+        Some(50.0)
+    );
+}
+
+#[test]
+fn bpm_scope_uses_hash_and_playlist_references_not_names_or_screen_filters() {
+    let directory = tempfile::tempdir().unwrap();
+    let lib = Library::open(directory.path()).unwrap();
+    let first = add_test_looper_track(&lib, directory.path(), "one", "hash-a");
+    let second = add_test_looper_track(&lib, directory.path(), "two", "hash-b");
+    let playlist = lib.create_playlist("Practice").unwrap();
+    lib.add_track_to_playlist(playlist.id, first).unwrap();
+    lib.add_track_to_playlist(playlist.id, first).unwrap();
+    assert_eq!(
+        lib.bpm_scope_ids(&crate::bpm_jobs::BpmScope::Playlist {
+            playlist_id: playlist.id
+        })
+        .unwrap(),
+        vec![first]
+    );
+    assert_eq!(
+        lib.bpm_scope_ids(&crate::bpm_jobs::BpmScope::Looper {
+            source_hash: "hash-b".into()
+        })
+        .unwrap(),
+        vec![second]
+    );
+    assert_eq!(
+        lib.bpm_scope_ids(&crate::bpm_jobs::BpmScope::Library)
+            .unwrap(),
+        vec![first, second]
+    );
+    assert!(lib
+        .bpm_scope_ids(&crate::bpm_jobs::BpmScope::Looper {
+            source_hash: "absent".into()
+        })
+        .is_err());
+}
+
+#[test]
+fn title_only_save_preserves_a_tempo_updated_since_the_editor_was_opened() {
+    let directory = tempfile::tempdir().unwrap();
+    let lib = Library::open(directory.path()).unwrap();
+    let id = add_test_looper_track(&lib, directory.path(), "beat", "hash");
+    lib.update_bpm(id, 98.0, Some(0.2), false).unwrap();
+    // The draft still contains 98, but reanalysis has committed 100 meanwhile.
+    lib.update_bpm(id, 100.0, Some(0.4), false).unwrap();
+    let updated = lib
+        .update_metadata(id, "New title", Some(98.0), "practice", false)
+        .unwrap();
+    assert_eq!(updated.title, "New title");
+    assert_eq!(updated.bpm, Some(100.0));
+    assert_eq!(updated.bpm_confidence, Some(0.4));
+    assert_eq!(updated.bpm_source.as_deref(), Some("analyzed"));
+    // An explicitly chosen same-value ×1 still confirms the tempo as manual.
+    let confirmed = lib
+        .update_metadata(id, "New title", Some(100.0), "practice", true)
+        .unwrap();
+    assert_eq!(confirmed.bpm_source.as_deref(), Some("manual"));
+    assert_eq!(confirmed.bpm_confidence, None);
+}
+
+#[test]
+fn tablist_unknown_bpm_uses_exact_duration_while_known_catalog_bpm_stays_protected() {
+    let directory = tempfile::tempdir().unwrap();
+    let lib = Library::open(directory.path()).unwrap();
+    let source = directory.path().join("perfect.wav");
+    let mut samples = vec![0i16; 76800];
+    for beat in 0..16 {
+        samples[beat * 4800] = 30000;
+    }
+    write_wav(&source, &samples, 8000);
+    let bytes = std::fs::read(source).unwrap();
+    for (name, known) in [("detected", None), ("catalog", Some(123.5))] {
+        let report = lib.import_tablist_track(
+            "Pack",
+            "pack-hash",
+            "https://tablist.net/looper/test",
+            name,
+            name,
+            "wav",
+            &bytes,
+            known,
+        );
+        assert!(report.added, "{:?}", report.error);
+        assert_eq!(report.bpm, known.or(Some(100.0)));
+        if known.is_some() {
+            assert!(matches!(
+                lib.reanalyze_bpm_track(report.track_id.unwrap()).unwrap(),
+                BpmOutcome::Protected
+            ));
+        }
+    }
+}
+
+#[test]
 fn custom_import_garbage_fails_per_file() {
     let root = tmp_root("custom-garbage");
     let lib = Library::open(&root).unwrap();
@@ -2070,9 +2262,244 @@ fn random_track_skips_the_current_track_when_another_is_playable() {
     let second = lib.import_one_custom(second_path.to_str().unwrap());
     assert!(first.added && second.added);
 
-    let random = lib.random_track(first.track_id).unwrap().unwrap();
+    let random = lib.random_track(first.track_id, None).unwrap().unwrap();
     assert_eq!(random.id, second.track_id.unwrap());
 
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn concurrent_cue_writes_preserve_both_slots() {
+    let root = tempfile::tempdir().unwrap();
+    let lib = Library::open(root.path()).unwrap();
+    let input = root.path().join("input.wav");
+    write_wav(&input, &[1000; 16000], 8000);
+    let id = lib
+        .import_one_custom(input.to_str().unwrap())
+        .track_id
+        .unwrap();
+    lib.get_serato_metadata(id).unwrap();
+    for _ in 0..6 {
+        lib.set_serato_cue(id, 2, None).unwrap();
+        lib.set_serato_cue(id, 3, None).unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = [2, 3]
+                .into_iter()
+                .map(|slot| {
+                    let barrier = barrier.clone();
+                    let path = root.path().to_path_buf();
+                    scope.spawn(move || {
+                        let connection = Library::open(&path).unwrap();
+                        barrier.wait();
+                        connection
+                            .set_serato_cue(id, slot, Some(slot * 100))
+                            .unwrap();
+                    })
+                })
+                .collect();
+            for handle in handles {
+                handle.join().unwrap();
+            }
+        });
+        let metadata = lib.get_serato_metadata(id).unwrap();
+        assert!([2, 3]
+            .iter()
+            .all(|slot| metadata.cues.iter().any(|cue| cue.slot == *slot)));
+    }
+}
+
+#[test]
+fn reopening_recovers_audio_staged_before_catalog_commit() {
+    let root = tempfile::tempdir().unwrap();
+    let lib = Library::open(root.path()).unwrap();
+    let input = root.path().join("input.wav");
+    write_wav(&input, &[1000; 16000], 8000);
+    let id = lib
+        .import_one_custom(input.to_str().unwrap())
+        .track_id
+        .unwrap();
+    let track = lib.get_track(id).unwrap().unwrap();
+    let staged = lib
+        .quarantine_files(&[PathBuf::from(&track.file_path)])
+        .unwrap()
+        .unwrap();
+    drop(lib);
+    let reopened = Library::open(root.path()).unwrap();
+    assert!(reopened.get_track(id).unwrap().unwrap().exists);
+    assert!(!staged.directory.exists());
+}
+
+#[test]
+fn reopening_purges_quarantine_after_catalog_commit() {
+    let root = tempfile::tempdir().unwrap();
+    let lib = Library::open(root.path()).unwrap();
+    let input = root.path().join("input.wav");
+    write_wav(&input, &[1000; 16000], 8000);
+    let id = lib
+        .import_one_custom(input.to_str().unwrap())
+        .track_id
+        .unwrap();
+    let track = lib.get_track(id).unwrap().unwrap();
+    let staged = lib
+        .quarantine_files(&[PathBuf::from(&track.file_path)])
+        .unwrap()
+        .unwrap();
+    lib.conn
+        .execute("DELETE FROM tracks WHERE id=?1", [id])
+        .unwrap();
+    drop(lib);
+    let reopened = Library::open(root.path()).unwrap();
+    assert!(reopened.get_track(id).unwrap().is_none());
+    assert!(!staged.directory.exists());
+}
+
+#[test]
+fn signed_mp3_seek_inserts_leading_padding_without_wrapping() {
+    let buffer = crate::player::LoopBuffer {
+        samples: vec![100, 200, 300, 400],
+        channels: 1,
+        rate: 8000,
+    };
+    let trimmed = Library::trim_mp3_buffer(&buffer, -3, 5).unwrap();
+    assert_eq!(trimmed.samples, [0, 0, 0, 100, 200]);
+    assert_eq!(
+        Library::trim_mp3_buffer(&buffer, 2, 2).unwrap().samples,
+        [300, 400]
+    );
+}
+
+#[test]
+fn practice_region_survives_reopen_without_losing_fractional_ms_frames() {
+    let root = tempfile::tempdir().unwrap();
+    let lib = Library::open(root.path()).unwrap();
+    let input = root.path().join("input.wav");
+    write_wav(&input, &[1000; 16000], 8000);
+    let id = lib
+        .import_one_custom(input.to_str().unwrap())
+        .track_id
+        .unwrap();
+    let track = lib.get_track(id).unwrap().unwrap();
+    let status = crate::player::PlayerStatus {
+        path: Some(track.playback_path),
+        total_frames: track.total_frames as usize,
+        loop_start_frame: 11,
+        loop_end_frame: track.total_frames as usize - 1,
+        loop_enabled: false,
+        ..crate::player::PlayerStatus::empty()
+    };
+    lib.persist_practice(&status).unwrap();
+    drop(lib);
+    let reopened = Library::open(root.path()).unwrap();
+    let request = reopened.playback_request(id).unwrap();
+    let buffer = request.decode().unwrap();
+    assert_eq!(
+        request.region(&buffer),
+        (11, buffer.frames() as u64 - 1, false)
+    );
+}
+
+#[test]
+fn recovery_rejects_manifest_paths_outside_the_library() {
+    let root = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let sentinel = outside.path().join("sentinel.wav");
+    std::fs::write(&sentinel, b"original").unwrap();
+    let lib = Library::open(root.path()).unwrap();
+    let audio = root.path().join("Custom Loops/test.wav");
+    std::fs::write(&audio, b"managed").unwrap();
+    let staged = lib.quarantine_files(&[audio]).unwrap().unwrap();
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(staged.directory.join("manifest.json")).unwrap())
+            .unwrap();
+    manifest["moved"][0][0] = serde_json::json!(sentinel);
+    std::fs::write(
+        staged.directory.join("manifest.json"),
+        serde_json::to_vec(&manifest).unwrap(),
+    )
+    .unwrap();
+    drop(lib);
+    assert!(Library::open(root.path()).is_err());
+    assert_eq!(std::fs::read(sentinel).unwrap(), b"original");
+    assert!(staged.directory.join("asset-0").is_file());
+}
+
+#[test]
+fn windows_metadata_recovery_runs_before_canonicalizing_missing_audio() {
+    let root = tempfile::tempdir().unwrap();
+    let lib = Library::open(root.path()).unwrap();
+    let input = root.path().join("input.wav");
+    write_wav(&input, &[1000; 16000], 8000);
+    let id = lib
+        .import_one_custom(input.to_str().unwrap())
+        .track_id
+        .unwrap();
+    let track = lib.get_track(id).unwrap().unwrap();
+    let audio = PathBuf::from(&track.file_path);
+    let backup = audio.with_file_name(format!(
+        "{}.serato-backup-test",
+        audio.file_name().unwrap().to_string_lossy()
+    ));
+    std::fs::rename(&audio, &backup).unwrap();
+    assert!(!lib.get_track(id).unwrap().unwrap().exists);
+    lib.recover_metadata_files().unwrap();
+    assert!(lib.get_track(id).unwrap().unwrap().exists);
+    assert!(!backup.exists());
+    assert!(lib.playback_request(id).unwrap().decode().is_ok());
+}
+
+#[cfg(unix)]
+#[test]
+fn derived_cache_rejects_an_escaping_parent_symlink() {
+    let root = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let lib = Library::open(root.path()).unwrap();
+    std::os::unix::fs::symlink(outside.path(), root.path().join(".olooper-cache")).unwrap();
+    assert!(lib
+        .cache_directory(&[".olooper-cache", "waveforms"])
+        .is_err());
+    assert!(!outside.path().join("waveforms").exists());
+}
+
+#[test]
+fn random_track_can_be_limited_to_the_current_looper() {
+    let root = tmp_root("random-looper-scope");
+    let lib = Library::open(&root).unwrap();
+    let audio = Library::loop_buffer_to_wav(&wav_buf());
+    let add = |source_hash: &str, remote_id: &str, title: &str| {
+        lib.import_tablist_track(
+            "Looper",
+            source_hash,
+            "https://tablist.net/looper/example",
+            remote_id,
+            title,
+            "wav",
+            &audio,
+            Some(120.0),
+        )
+    };
+    let first = add("looper-a", "a-1", "A1");
+    let second = add("looper-a", "a-2", "A2");
+    let other = add("looper-b", "b-1", "B1");
+    assert!(first.added && second.added && other.added);
+
+    let random = lib.random_track(None, Some("looper-a")).unwrap().unwrap();
+    assert!([first.track_id.unwrap(), second.track_id.unwrap()].contains(&random.id));
+    assert_eq!(
+        lib.random_track(first.track_id, Some("looper-a"))
+            .unwrap()
+            .unwrap()
+            .id,
+        second.track_id.unwrap()
+    );
+    assert_eq!(
+        lib.random_track(None, Some("looper-b"))
+            .unwrap()
+            .unwrap()
+            .id,
+        other.track_id.unwrap()
+    );
+    assert!(lib.random_track(None, Some("missing")).unwrap().is_none());
     std::fs::remove_dir_all(&root).ok();
 }
 

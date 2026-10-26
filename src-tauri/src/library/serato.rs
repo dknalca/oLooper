@@ -402,6 +402,9 @@ fn check_supported_path(path: &Path) -> Result<MarkerContainer, String> {
     if !path.is_file() {
         return Err("library audio file is missing".to_string());
     }
+    if fs::metadata(path).map_err(|error| error.to_string())?.len() > 512 * 1024 * 1024 {
+        return Err("audio metadata input exceeds the 512 MiB limit".into());
+    }
     Ok(container)
 }
 
@@ -681,7 +684,7 @@ fn copy_to_temporary_file(path: &Path) -> Result<PathBuf, String> {
     let copy_result = (|| -> Result<(), String> {
         let mut source =
             File::open(path).map_err(|error| format!("cannot read audio file: {error}"))?;
-        io::copy(&mut source, &mut output)
+        crate::bounded_io::copy(&mut source, &mut output, 512 * 1024 * 1024)
             .map_err(|error| format!("cannot copy audio for Serato metadata: {error}"))?;
         output
             .sync_all()
@@ -1586,7 +1589,7 @@ fn parse_markers(data: &[u8]) -> Result<ExistingMarkers, String> {
         track_color: Some(data[expected - 4..expected].try_into().unwrap()),
         ..ExistingMarkers::default()
     };
-    for entry in data[6..expected - 4].chunks_exact(MARKER_BYTES) {
+    for entry in data[6..expected - 4].as_chunks::<MARKER_BYTES>().0 {
         let entry = entry.to_vec();
         match entry[20] {
             0 | 1 => parsed.cues.push(entry),
@@ -1628,7 +1631,7 @@ fn parse_markers_mp4(data: &[u8]) -> Result<ExistingMarkers, String> {
         mp4_footer: Some(data[expected - 1]),
         ..ExistingMarkers::default()
     };
-    for raw in data[6..expected - 5].chunks_exact(MP4_MARKER_BYTES) {
+    for raw in data[6..expected - 5].as_chunks::<MP4_MARKER_BYTES>().0 {
         let start = u32::from_be_bytes(raw[..4].try_into().unwrap());
         let end = u32::from_be_bytes(raw[4..8].try_into().unwrap());
         let marker_type = raw[17];
@@ -1709,7 +1712,7 @@ fn build_markers_mp4(id3_data: &[u8]) -> Result<Vec<u8>, String> {
 }
 
 #[cfg(any(target_os = "windows", test))]
-fn recover_replacement(destination: &Path) -> Result<(), String> {
+pub(super) fn recover_replacement(destination: &Path) -> Result<(), String> {
     if destination.exists() {
         return Ok(());
     }
@@ -1721,12 +1724,51 @@ fn recover_replacement(destination: &Path) -> Result<(), String> {
         .and_then(|stem| stem.to_str())
         .ok_or_else(|| "Serato audio path has no valid file name".to_string())?;
     let prefix = format!("{stem}.serato-backup-");
+    let exact_prefix = format!(
+        "{}.serato-backup-",
+        destination
+            .file_name()
+            .ok_or("invalid recovery filename")?
+            .to_string_lossy()
+    );
     let mut backups = fs::read_dir(parent)
         .map_err(|error| format!("cannot inspect Serato recovery backups: {error}"))?
         .filter_map(Result::ok)
         .filter(|entry| {
-            entry.file_name().to_string_lossy().starts_with(&prefix)
-                && entry.file_type().is_ok_and(|kind| kind.is_file())
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !entry.file_type().is_ok_and(|kind| kind.is_file()) {
+                return false;
+            }
+            if name.starts_with(&exact_prefix) {
+                return true;
+            }
+            if !name.starts_with(&prefix) {
+                return false;
+            }
+            // Old backups omitted the extension: only recover matching audio,
+            // never another missing file with the same stem.
+            let mut header = [0u8; 12];
+            if File::open(entry.path())
+                .and_then(|mut file| file.read_exact(&mut header))
+                .is_err()
+            {
+                return false;
+            }
+            match destination
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase()
+                .as_str()
+            {
+                "wav" => &header[..4] == b"RIFF" && &header[8..12] == b"WAVE",
+                "aif" | "aiff" | "aifc" => &header[..4] == b"FORM",
+                "mp3" => &header[..3] == b"ID3" || (header[0] == 0xff && header[1] & 0xe0 == 0xe0),
+                "m4a" | "mp4" => &header[4..8] == b"ftyp",
+                "flac" => &header[..4] == b"fLaC",
+                "ogg" | "oga" => &header[..4] == b"OggS",
+                _ => false,
+            }
         })
         .collect::<Vec<_>>();
     backups.sort_by_key(|entry| {
@@ -1747,16 +1789,31 @@ fn recover_replacement(destination: &Path) -> Result<(), String> {
 }
 
 fn replace_file(temporary: &Path, destination: &Path) -> Result<(), String> {
+    OpenOptions::new()
+        .write(true)
+        .open(temporary)
+        .and_then(|file| file.sync_all())
+        .map_err(|error| format!("cannot flush updated audio metadata: {error}"))?;
     #[cfg(not(target_os = "windows"))]
     {
-        fs::rename(temporary, destination)
-            .map_err(|error| format!("cannot replace library audio with Serato metadata: {error}"))
+        fs::rename(temporary, destination).map_err(|error| {
+            format!("cannot replace library audio with Serato metadata: {error}")
+        })?;
+        super::recovery::sync_directory(
+            destination
+                .parent()
+                .ok_or("audio has no parent directory")?,
+        )
     }
     #[cfg(target_os = "windows")]
     {
         recover_replacement(destination)?;
-        let backup = destination.with_extension(format!(
-            "serato-backup-{}-{}",
+        let backup = destination.with_file_name(format!(
+            "{}.serato-backup-{}-{}",
+            destination
+                .file_name()
+                .ok_or("invalid audio filename")?
+                .to_string_lossy(),
             std::process::id(),
             TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
         ));
@@ -1821,7 +1878,7 @@ mod tests {
         ));
         fs::create_dir_all(&directory).unwrap();
         let destination = directory.join("loop.wav");
-        let backup = directory.join("loop.serato-backup-test-1");
+        let backup = directory.join("loop.wav.serato-backup-test-1");
         fs::write(&backup, b"original audio").unwrap();
 
         recover_replacement(&destination).unwrap();

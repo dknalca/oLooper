@@ -36,6 +36,10 @@ computation; rendering is canvas-only (no audio decoding per frame).
    discards its result (`"track changed …"` error) if the user already
    selected another track. Peak computation never blocks track loading or
    transport.
+9. Paint at most 30 frames per second during playback and skip unchanged paused
+   frames and hidden documents. Position interpolation respects playback speed.
+   Round physical canvas dimensions before comparing them to avoid repeated
+   backing-buffer allocation at fractional display scale factors.
 
 ## Supported inputs
 

@@ -16,22 +16,25 @@ slots.
    (dedup on `(source_hash, source_sound_id)`), reported as "already imported".
 3. Track list survives restarts with no re-analysis; missing or moved files are
    flagged per-track (`exists: false`), never silently dropped or duplicated.
-4. BPM remains catalog metadata and is mirrored to the audio file as ID3 `TBPM`.
-   CUEs are persisted in supported audio files and re-read when a track is
-   opened, so changes made in Serato are reflected in oLooper.
+4. BPM is catalog metadata. Automatic analysis stores its value/confidence in
+   SQLite. Only an explicitly confirmed manual value is intended to synchronize
+   to managed-audio tags (`TBPM` for ID3). Tag/provenance precedence follows spec
+   130; a concurrency edge remains open in the
+   [2026-10-26 follow-up](../docs/documentation-review-2026-10-26.md). CUEs are
+   persisted in supported audio files and read when a track opens.
 5. Each track supports four hot cues. CUE 1 is fixed at the start of the track.
    The audio file is their source of truth; legacy schema-v6 cue positions are
    migrated to the file on first read. Existing Serato saved loops are retained
    but are not managed by oLooper.
-6. The left pane lists **ALL**, **Favoritos**, playlists, then looper groups.
+6. The left pane lists **ALL**, **Favorites**, playlists, then looper groups.
    ALL contains each catalog track exactly once. Selecting ALL or a group shows
    its matching tracks; search, source/BPM/duration filters, sorting, playback,
    navigation, and export operate on the selected set. Tracks show name,
-   duration, BPM, and a review indicator for low-confidence analyzed BPM.
-   Automatically analyzed BPM is normalized by octave into 65–150 BPM;
-   user-entered BPM is never changed. The active track's group is selected
-   automatically only while browsing a source group. The pane divider remains
-   resizable and its width is saved between launches.
+    duration, BPM, and a review indicator for low-confidence analyzed BPM.
+    Generic automatic BPM is normalized by octave into 65–150 BPM; SWF/EXE and
+    explicit reanalysis use duration-aware 4/4 candidates (20–300 BPM) in spec
+    260. The active track's group is selected only while browsing a source group.
+    The pane divider remains resizable and its width is saved between launches.
 7. Playlists are ordered sets of unique track references. Users can create,
    rename, delete, add/remove tracks, and change order. Playlist membership does
    not copy audio or change owning groups; playback navigation follows playlist
@@ -47,6 +50,16 @@ slots.
    its original input file is not touched.
 11. Each loop has a Play button beside its name; double-clicking a row also starts
    playback.
+12. Random playback follows the current library scope: inside a looper it picks
+    only from that looper; in **ALL** it picks across the complete library.
+    Whenever possible, it avoids repeating the currently playing track.
+    Revealing the chosen track preserves the current collection.
+13. The library can reanalyze eligible BPMs for the selected looper, playlist, or
+    full catalog. Scope is independent of visible filters; confirmed, externally
+    known, and file-authored values are protected. Progress and cancellation are
+    non-blocking (spec 270).
+14. Double-clicking a BPM value or missing-value placeholder opens that track's
+    metadata editor with focus on BPM without starting playback (spec 260).
 
 ## Supported inputs
 
@@ -57,8 +70,9 @@ slots.
 
 - `ImportReport { looper, added, already_there, failed, track_ids }` for SWF/EXE
   imports; custom audio returns per-file results.
-- `Track { id, title, file_path, exists, duration_ms, bpm?, cue/loop…,
-  provenance… }` for UI and player handoff (`player_load(track.file_path)`).
+- `Track { id, title, file_path, playback_path, exists, duration_ms, bpm?,
+  cue/loop…, provenance… }` for UI. Library playback loads by ID with
+  `player_load_library_track(id)` so embedded tracks need not materialize audio.
 - `SeratoMetadata { cues, loops, bpm }` for audio-file marker data.
 
 ## Failure behavior
@@ -74,7 +88,7 @@ slots.
 
 ## Persistence behavior
 
-- Schema versioned through v8 via `PRAGMA user_version`; forward migrations are
+- Schema is currently v11 via `PRAGMA user_version`; forward migrations are
   transactional and covered by temporary-database tests. Downgrades are unsupported.
 - `updated_at` bumps on every user edit; `imported_at` never changes.
 - Foreign keys enforced via `PRAGMA foreign_keys = ON`.
@@ -84,6 +98,11 @@ slots.
 - rusqlite/bundled: no system SQLite required; identical on all platforms.
 - Library paths are stored with track metadata; missing files are flagged rather
   than silently removed. Changing the library root does not migrate its contents.
+- Single-track lookups query by primary key instead of loading/stat-ing the full
+  catalog. Scoped random selection filters the source hash in SQLite.
+- Cover loading uses at most four concurrent requests per batch. Cancelled
+  batches stop scheduling work and cannot repopulate another library's cache;
+  removed groups release cached covers.
 
 ## Security implications
 
@@ -103,14 +122,16 @@ slots.
 - [x] Cue/loop edit → restart → edit preserved.
 - [x] Temp-DB tests: migrate, CRUD, dedup conflict, atomicity (no partial rows).
 - [x] Loop slots: CRUD works, cascade delete on track removal, schema migration v1→v2.
-- [ ] Library pane lists ALL, Favoritos, playlists, and source groups while
+- [x] Library pane lists ALL, Favorites, playlists, and source groups while
   preserving existing favorites and group behavior.
 - [x] Play button and double-click start the selected track.
-- [ ] ALL contains every track once; filters, playback, navigation, and export use
+- [x] Random playback stays within the selected looper, or spans the catalog in
+  ALL.
+- [x] ALL contains every track once; filters, playback, navigation, and export use
   the full catalog.
 - [x] Playlist references, order, migration, and foreign-key cleanup persist
   without copying/deleting audio or changing group ownership.
-- [ ] Source-looper order persists through restart; drag-reordering does not
+- [x] Source-looper order persists through restart; drag-reordering does not
   change group ownership or audio paths.
 
 ## Non-goals

@@ -5,10 +5,16 @@ import Player from "./components/Player";
 import Waveform from "./components/Waveform";
 import ImportBar from "./components/ImportBar";
 import TablistCatalog from "./components/TablistCatalog";
-import MidiSettingsDialog, { MIDI_ACTIONS } from "./components/MidiSettingsDialog";
+import MidiSettingsDialog from "./components/MidiSettingsDialog";
 import AudioSettingsDialog from "./components/AudioSettingsDialog";
+import BpmReanalysisPanel from "./components/BpmReanalysisPanel";
+import AppPreferencesDialog from "./components/AppPreferencesDialog";
+import IdleCoverScreensaver, { type ActiveCoverState } from "./components/IdleCoverScreensaver";
+import { readIdleCoverEnabled, readIdleCoverDelayMinutes, saveIdleCoverEnabled, saveIdleCoverDelayMinutes, idleCoverDelayMs } from "./appPreferences";
 import StartupIntro from "./components/StartupIntro";
 import useKeyboardShortcuts from "./hooks/useKeyboardShortcuts";
+import { ownSubscription } from "./subscription";
+import useModalFocus from "./hooks/useModalFocus";
 import {
   libraryRandomTrack,
   libraryList,
@@ -23,9 +29,9 @@ import {
   midiDisconnect,
   midiSetLed,
   playerLoadTrack,
-  playerUnload,
   playerPause,
   playerPlay,
+  playerPrefetch,
   playerSetVolume,
   playerSetDiagnostics,
   playerStatus as getPlayerStatus,
@@ -41,10 +47,11 @@ import { firstMidiStartTrack } from "./midiPlayback";
 import { normalizeStereoPair } from "./audioOutputPreferences";
 import { copySourcePreference } from "./importFlow";
 import { midiEncoderDirection } from "./midiLibraryNavigation";
+import { takeRandomCandidate, type RandomCandidate } from "./randomCandidate";
+import { MIDI_MAP_STORAGE_KEY, readMidiMaps, type MidiBindings } from "./midiMaps";
 
 type TrackNavigator = (direction: -1 | 1) => void;
 type MidiLibraryCommand = "up" | "down" | "intro" | "back";
-type MidiBindings = Partial<Record<MidiAction, MidiBinding>>;
 
 function readAudioSelection(): AudioOutputSelection {
   try {
@@ -72,45 +79,32 @@ function readAudioSelection(): AudioOutputSelection {
   return { deviceName: null, firstChannel: 0, sampleRate: null, bufferFrames: null };
 }
 
-function readMidiBindings(): MidiBindings {
-  try {
-    const parsed: unknown = JSON.parse(localStorage.getItem("olooper.midi.bindings") ?? "{}");
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
-    const values = parsed as Record<string, unknown>;
-    const bindings: MidiBindings = {};
-    for (const { id } of MIDI_ACTIONS) {
-      const value = values[id];
-      if (!value || typeof value !== "object") continue;
-      const binding = value as Partial<MidiBinding>;
-      if (
-        typeof binding.inputId === "string" && typeof binding.inputName === "string"
-        && (binding.kind === "note" || binding.kind === "cc")
-        && Number.isInteger(binding.channel) && binding.channel! >= 1 && binding.channel! <= 16
-        && Number.isInteger(binding.number) && binding.number! >= 0 && binding.number! <= 127
-      ) bindings[id] = binding as MidiBinding;
-    }
-    return bindings;
-  } catch {
-    return {};
-  }
-}
-
 function sameMidiBinding(left: MidiBinding, right: MidiBinding): boolean {
   return left.inputId === right.inputId && left.kind === right.kind
     && left.channel === right.channel && left.number === right.number;
 }
 
 export default function App() {
+  useModalFocus();
   const [libraryReady, setLibraryReady] = useState(false);
   const [libraryGeneration, setLibraryGeneration] = useState(0);
+  const libraryGenerationRef = useRef(libraryGeneration);
+  libraryGenerationRef.current = libraryGeneration;
   const [startupIntroDone, setStartupIntroDone] = useState(false);
   const [refreshKey, setRefreshKey] = useState(0);
   const [playerStatus, setPlayerStatus] = useState<PlayerStatus | null>(null);
   const [activeTrackId, setActiveTrackId] = useState<number | null>(null);
   const [trackOpenGeneration, setTrackOpenGeneration] = useState(0);
   const [activeTrack, setActiveTrack] = useState<Track | null>(null);
-  const [activeCover, setActiveCover] = useState<string | null>(null);
+  const [activeCoverState, setActiveCoverState] = useState<ActiveCoverState | null>(null);
+  const activeCover = activeCoverState?.generation === libraryGeneration && activeCoverState.sourceHash === activeTrack?.source_hash ? activeCoverState.src : null;
+  const coverRef = useRef<HTMLDivElement>(null);
+  const [preferencesOpen, setPreferencesOpen] = useState(false);
+  const [idleCoverEnabled, setIdleCoverEnabled] = useState(readIdleCoverEnabled);
+  const [idleCoverDelayMinutes, setIdleCoverDelayMinutes] = useState(readIdleCoverDelayMinutes);
+  const [preferenceError, setPreferenceError] = useState<string | null>(null);
   const [trackNavigator, setTrackNavigator] = useState<TrackNavigator | null>(null);
+  const [randomScopeHash, setRandomScopeHash] = useState<string | null>(null);
   const [libraryView, setLibraryView] = useState<"local" | "tablist">("local");
   const libraryViewRef = useRef(libraryView);
   libraryViewRef.current = libraryView;
@@ -124,10 +118,16 @@ export default function App() {
   const [audioStartupError, setAudioStartupError] = useState<string | null>(null);
   const [midiInputId, setMidiInputId] = useState<string | null>(() => localStorage.getItem("olooper.midi.input"));
   const [midiOutputId, setMidiOutputId] = useState<string | null>(() => localStorage.getItem("olooper.midi.output"));
-  const [midiBindings, setMidiBindings] = useState<MidiBindings>(readMidiBindings);
+  const [midiMaps, setMidiMaps] = useState(() => readMidiMaps(localStorage));
+  const midiBindings = midiMaps.bindings;
+  const setMidiBindings = useCallback((update: (current: MidiBindings) => MidiBindings) => {
+    setMidiMaps((current) => ({ ...current, bindings: update(current.bindings) }));
+  }, []);
   const [midiLearningAction, setMidiLearningAction] = useState<MidiAction | null>(null);
   const [midiLearningConflict, setMidiLearningConflict] = useState<MidiAction | null>(null);
   const randomLoadGeneration = useRef(0);
+  const randomPrefetchGeneration = useRef(0);
+  const randomCandidate = useRef<RandomCandidate | null>(null);
   const libraryRootRef = useRef<string | null>(null);
   const midiBindingsRef = useRef(midiBindings);
   const previousLedBindingsRef = useRef(midiBindings);
@@ -140,7 +140,7 @@ export default function App() {
 
   const onLibraryReady = useCallback((root: string) => {
     const previousRoot = libraryRootRef.current;
-    const switched = previousRoot !== null && previousRoot !== root;
+    const switched = previousRoot !== null;
     libraryRootRef.current = root;
     setLibraryReady(true);
     setRefreshKey((key) => key + 1);
@@ -151,13 +151,11 @@ export default function App() {
     randomLoadGeneration.current += 1;
     setActiveTrackId(null);
     setActiveTrack(null);
-    setActiveCover(null);
+    setActiveCoverState(null);
     setTrackOpenGeneration((generation) => generation + 1);
     setPlayerStatus(null);
     setLibraryView("local");
     setLibraryGeneration((generation) => generation + 1);
-    playerUnload()
-      .catch((cause) => setAudioStartupError(`Could not unload the previous library track: ${String(cause)}`));
   }, []);
   const finishStartupIntro = useCallback(() => setStartupIntroDone(true), []);
 
@@ -198,14 +196,14 @@ export default function App() {
       const { trackId, bpm, source, confidence } = (event as CustomEvent<{
         trackId: number;
         bpm: number;
-        source?: string;
+   source?: string | null;
         confidence?: number | null;
       }>).detail;
       if (trackId === activeTrackId) {
         setActiveTrack((current) => current?.id === trackId ? {
           ...current,
           bpm,
-          bpm_source: source ?? current.bpm_source,
+           bpm_source: source !== undefined ? source : current.bpm_source,
           bpm_confidence: confidence !== undefined
             ? confidence
             : source === "manual" ? null : current.bpm_confidence,
@@ -218,19 +216,24 @@ export default function App() {
 
   useEffect(() => {
     if (!playerStatus?.loaded || !activeTrack || activeTrack.source_type === "custom") {
-      setActiveCover(null);
+      setActiveCoverState(null);
       return;
     }
     let cancelled = false;
-    setActiveCover(null);
+    const owner = { sourceHash: activeTrack.source_hash, generation: libraryGeneration };
+    setActiveCoverState({ ...owner, src: null, pending: true });
     libraryGroupCover(activeTrack.source_hash)
-      .then((cover) => { if (!cancelled) setActiveCover(cover); })
-      .catch(() => { if (!cancelled) setActiveCover(null); });
+      .then((cover) => { if (!cancelled) setActiveCoverState({ ...owner, src: cover, pending: false }); })
+      .catch(() => { if (!cancelled) setActiveCoverState({ ...owner, src: null, pending: false }); });
     return () => { cancelled = true; };
-  }, [activeTrack?.source_hash, activeTrack?.source_type, playerStatus?.loaded]);
+  }, [activeTrack?.source_hash, activeTrack?.source_type, playerStatus?.loaded, libraryGeneration]);
 
   const registerTrackNavigator = useCallback((navigate: TrackNavigator | null) => {
     setTrackNavigator(() => navigate);
+  }, []);
+
+  const registerRandomScope = useCallback((sourceHash: string | null) => {
+    setRandomScopeHash(sourceHash);
   }, []);
 
   const registerMidiLibraryNavigator = useCallback((navigate: ((command: MidiLibraryCommand) => void) | null) => {
@@ -239,21 +242,29 @@ export default function App() {
 
   const onTrackLoading = useCallback(() => {
     randomLoadGeneration.current += 1;
+    setPlayerStatus((current) => current ? { ...current, loading: true } : current);
   }, []);
 
   const playRandomTrack = useCallback(async () => {
     const generation = ++randomLoadGeneration.current;
-    const track = await libraryRandomTrack(activeTrackId);
-    if (!track) throw new Error("No playable tracks in the library");
+    const scope = libraryView === "local" ? randomScopeHash : null;
+    const key = `${libraryGeneration}|${libraryView}|${scope ?? ""}`;
+    const prepared = randomCandidate.current;
+    randomCandidate.current = null;
+    const track = takeRandomCandidate(prepared, key, activeTrackId)
+      ?? await libraryRandomTrack(activeTrackId, scope);
+    if (!track) throw new Error("No playable tracks in the current selection");
     if (generation !== randomLoadGeneration.current) return;
 
     let status = await playerLoadTrack(track.id);
+    if (generation !== randomLoadGeneration.current) return;
     setPlayerStatus(status);
     const deadline = Date.now() + 120_000;
     while (status.loading && Date.now() < deadline) {
       await new Promise((resolve) => window.setTimeout(resolve, 150));
       if (generation !== randomLoadGeneration.current) return;
       status = await getPlayerStatus();
+      if (generation !== randomLoadGeneration.current) return;
       setPlayerStatus(status);
     }
     if (generation !== randomLoadGeneration.current) return;
@@ -267,9 +278,36 @@ export default function App() {
     setPlayerStatus(playing);
     setTrackOpenGeneration((current) => current + 1);
     window.dispatchEvent(new CustomEvent("olooper:reveal-library-track", {
-      detail: { trackId: track.id, sourceHash: track.source_hash },
+      detail: { trackId: track.id, sourceHash: track.source_hash, preserveCollection: true },
     }));
-  }, [activeTrackId]);
+  }, [activeTrackId, libraryGeneration, libraryView, randomScopeHash]);
+
+  // Prepare the next random target while the current loop plays, so button,
+  // timer and MIDI presses can consume a decoded buffer immediately.
+  useEffect(() => {
+    randomCandidate.current = null;
+    if (!libraryReady || !playerStatus?.loaded || playerStatus.loading || activeTrackId === null) return;
+    const generation = ++randomPrefetchGeneration.current;
+    const scope = libraryView === "local" ? randomScopeHash : null;
+    const key = `${libraryGeneration}|${libraryView}|${scope ?? ""}`;
+    const timer = window.setTimeout(() => {
+      void (async () => {
+        try {
+          const track = await libraryRandomTrack(activeTrackId, scope);
+          if (generation !== randomPrefetchGeneration.current || !track || !track.exists || track.id === activeTrackId) return;
+          const queued = await playerPrefetch(track.id);
+          if (generation !== randomPrefetchGeneration.current || !queued) return;
+          randomCandidate.current = { track, key };
+        } catch {
+          // Prefetch is best effort; Random still queries on demand.
+        }
+      })();
+    }, 500);
+    return () => {
+      window.clearTimeout(timer);
+      randomPrefetchGeneration.current += 1;
+    };
+  }, [activeTrackId, libraryGeneration, libraryReady, libraryView, playerStatus?.loaded, playerStatus?.loading, randomScopeHash]);
 
   const playFirstLibraryTrack = useCallback(async () => {
     const generation = ++randomLoadGeneration.current;
@@ -279,12 +317,14 @@ export default function App() {
     if (!track) return;
 
     let status = await playerLoadTrack(track.id);
+    if (generation !== randomLoadGeneration.current) return;
     setPlayerStatus(status);
     const deadline = Date.now() + 120_000;
     while (status.loading && Date.now() < deadline) {
       await new Promise((resolve) => window.setTimeout(resolve, 150));
       if (generation !== randomLoadGeneration.current) return;
       status = await getPlayerStatus();
+      if (generation !== randomLoadGeneration.current) return;
       setPlayerStatus(status);
     }
     if (generation !== randomLoadGeneration.current) return;
@@ -330,7 +370,7 @@ export default function App() {
       return;
     }
     if (action === "random-loop") {
-      playRandomTrack().catch(() => {});
+      window.dispatchEvent(new Event("olooper:random-loop"));
       return;
     }
     if (action === "play-pause" && !playerStatus?.loaded) {
@@ -367,8 +407,8 @@ export default function App() {
   }, [onImported]);
 
   useEffect(() => {
-    localStorage.setItem("olooper.midi.bindings", JSON.stringify(midiBindings));
-  }, [midiBindings]);
+    localStorage.setItem(MIDI_MAP_STORAGE_KEY, JSON.stringify(midiMaps));
+  }, [midiMaps]);
 
   useEffect(() => {
     activeMidiCcControlsRef.current.clear();
@@ -500,21 +540,21 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    let unlisten: (() => void) | undefined;
-    listenAppMenuCommand((command) => {
+    return ownSubscription(listenAppMenuCommand((command) => {
       if (command === "show-shortcuts") {
         setShortcutsOpen(true);
       } else if (command === "midi-options") {
         setMidiOptionsOpen(true);
       } else if (command === "audio-options") {
         setAudioOptionsOpen(true);
+      } else if (command === "preferences") {
+        setPreferencesOpen(true);
       } else if (command === "choose-library") {
         window.dispatchEvent(new Event("olooper:choose-library"));
       } else {
         window.dispatchEvent(new CustomEvent("olooper:import-command", { detail: command }));
       }
-    }).then((dispose) => { unlisten = dispose; }).catch(() => {});
-    return () => unlisten?.();
+    }));
   }, []);
 
   useEffect(() => {
@@ -528,18 +568,41 @@ export default function App() {
 
   return (
     <div className="workspace h-screen flex flex-col text-text overflow-hidden">
-      <TopBar onLibraryReady={onLibraryReady} playing={playerStatus?.playing ?? false} trackBpm={activeTrack?.bpm ?? null} onAudioOptions={() => setAudioOptionsOpen(true)} onMidiOptions={() => setMidiOptionsOpen(true)} onShortcuts={() => setShortcutsOpen(true)}>
+      <TopBar onLibraryReady={onLibraryReady} playing={playerStatus?.playing ?? false} trackBpm={activeTrack?.bpm ?? null} onAudioOptions={() => setAudioOptionsOpen(true)} onMidiOptions={() => setMidiOptionsOpen(true)} onShortcuts={() => setShortcutsOpen(true)} onPreferences={() => setPreferencesOpen(true)}>
         <ImportBar onImported={onImported} />
       </TopBar>
 
       <main className="flex flex-1 min-h-0 flex-col">
+        <BpmReanalysisPanel
+          libraryRoot={libraryRootRef.current}
+          libraryGeneration={libraryGeneration}
+          onFinished={() => {
+            onImported();
+            const root = libraryRootRef.current;
+            const generation = libraryGeneration;
+            // Progress is coalesced: refresh the active row once at completion
+            // even when its individual update wasn't an emitted snapshot.
+            void libraryList().then((tracks) => {
+              if (root !== libraryRootRef.current || generation !== libraryGenerationRef.current) return;
+              setActiveTrack((current) => current ? tracks.find((track) => track.id === current.id) ?? current : current);
+            }).catch(() => {});
+          }}
+          onUpdated={(track, owner) => {
+            if (owner.libraryRoot !== libraryRootRef.current || owner.libraryGeneration !== libraryGeneration) return;
+            setActiveTrack((current) => current?.id === track.id ? track : current);
+            if (track.bpm !== null) window.dispatchEvent(new CustomEvent("olooper:track-bpm", {
+              detail: { trackId: track.id, bpm: track.bpm, source: track.bpm_source, confidence: track.bpm_confidence },
+            }));
+          }}
+        />
         <div className="h-1/5 min-h-36 shrink-0 p-3">
-          <Waveform refreshKey={refreshKey} status={playerStatus} trackTitle={activeTrack?.title ?? null} trackCover={activeCover} trackId={activeTrack?.id ?? null} showCover={playerStatus?.loaded === true && activeTrack !== null} loopEditing={loopEditing} onStatusChange={setPlayerStatus} />
+          <Waveform refreshKey={refreshKey} status={playerStatus} trackTitle={activeTrack?.title ?? null} trackCover={activeCover} coverRef={coverRef} trackId={activeTrack?.id ?? null} playbackPath={activeTrack?.playback_path} showCover={playerStatus?.loaded === true && activeTrack !== null} loopEditing={loopEditing} onStatusChange={setPlayerStatus} />
         </div>
               <Player
                 status={playerStatus}
                 trackId={activeTrackId}
                 audioStorage={activeTrack?.audio_storage ?? "extracted"}
+                playbackPath={activeTrack?.playback_path}
           trackOpenGeneration={trackOpenGeneration}
           canRandom={libraryReady}
           onRandomTrack={playRandomTrack}
@@ -551,36 +614,6 @@ export default function App() {
           onStatusChange={setPlayerStatus}
         />
         <section className="library-workspace">
-          <div className="flex shrink-0 items-center gap-2 border-b border-border/60 p-2" role="tablist" aria-label="Library views" onKeyDown={(event) => {
-            if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
-            event.preventDefault();
-            const next = event.key === "Home" ? "local" : event.key === "End" ? "tablist" : libraryView === "local" ? "tablist" : "local";
-            setLibraryView(next);
-            document.getElementById(`view-${next}`)?.focus();
-          }}>
-            <button
-              role="tab"
-              id="view-local"
-              aria-controls="library-panel"
-              tabIndex={libraryView === "local" ? 0 : -1}
-              aria-selected={libraryView === "local"}
-              onClick={() => setLibraryView("local")}
-              className="view-tab"
-            >
-              My Library
-            </button>
-            <button
-              role="tab"
-              id="view-tablist"
-              aria-controls="library-panel"
-              tabIndex={libraryView === "tablist" ? 0 : -1}
-              aria-selected={libraryView === "tablist"}
-              onClick={() => setLibraryView("tablist")}
-              className="view-tab"
-            >
-              Discover loopers
-            </button>
-          </div>
           <div id="library-panel" role="tabpanel" aria-labelledby={`view-${libraryView}`} className="flex min-h-0 flex-1 flex-col">
             {libraryView === "local" ? (
               <Sidebar
@@ -588,13 +621,15 @@ export default function App() {
                 libraryGeneration={libraryGeneration}
                 refreshKey={refreshKey}
                 activeTrackId={activeTrackId}
+                onLibraryViewChange={setLibraryView}
                 onRegisterTrackNavigation={registerTrackNavigator}
+                onRegisterRandomScope={registerRandomScope}
                 onRegisterMidiLibraryNavigation={registerMidiLibraryNavigator}
                 onTrackLoading={onTrackLoading}
                 onTrackSelected={onTrackSelected}
               />
             ) : (
-              <TablistCatalog libraryReady={libraryReady} refreshKey={refreshKey} onImported={onImported} />
+              <TablistCatalog libraryReady={libraryReady} refreshKey={refreshKey} onImported={onImported} onLibraryViewChange={setLibraryView} />
             )}
           </div>
         </section>
@@ -628,6 +663,7 @@ export default function App() {
                 <ShortcutRow keys="→ / ←" action="Enter / play selection or go back" />
                 <ShortcutRow keys="⇧ + ← / →" action="Seek 5 seconds" />
                 <ShortcutRow keys="L" action="Toggle looping" />
+                <ShortcutRow keys="R" action="Play the next random loop" />
                 <ShortcutRow keys="1–4" action="Recall a cue; save an empty cue at the current position" />
                 <ShortcutRow keys="Shift + 2–4" action="Clear a saved cue" />
                 <ShortcutRow keys="Shift + 1" action="Return to the fixed start cue" />
@@ -636,6 +672,7 @@ export default function App() {
               <section aria-label="Application shortcuts">
                 <h3 className="mb-2 text-[10px] font-semibold uppercase tracking-wider text-text-secondary">Application</h3>
                 <ShortcutRow keys="⌘ / Ctrl + O" action="Open File → Import Files…" />
+                <ShortcutRow keys="⌘ + ," action="Open oLooper → Preferences…" />
                 <ShortcutRow keys="⌘ / Ctrl + W" action="Close window" />
                 <ShortcutRow keys="⌘ / Ctrl + Q" action="Quit oLooper" />
                 <ShortcutRow keys="⌘ + Z / ⇧⌘ + Z · Ctrl + Z / Ctrl + Y" action="Undo / redo text edits" />
@@ -651,6 +688,13 @@ export default function App() {
         inputId={midiInputId}
         outputId={midiOutputId}
         bindings={midiBindings}
+        maps={midiMaps}
+        onMapsChange={(next) => {
+          setMidiLearningAction(null);
+          setMidiLearningConflict(null);
+          activeMidiCcControlsRef.current.clear();
+          setMidiMaps(next);
+        }}
         learningAction={midiLearningAction}
         conflictAction={midiLearningConflict}
         onInputIdChange={setMidiInputId}
@@ -691,6 +735,31 @@ export default function App() {
         onClose={() => setAudioOptionsOpen(false)}
       />
       {!startupIntroDone && <StartupIntro onComplete={finishStartupIntro} />}
+      <AppPreferencesDialog
+        open={preferencesOpen}
+        idleCoverEnabled={idleCoverEnabled}
+        idleCoverDelayMinutes={idleCoverDelayMinutes}
+        error={preferenceError}
+        onIdleCoverChange={(enabled) => {
+          setIdleCoverEnabled(enabled);
+          setPreferenceError(saveIdleCoverEnabled(enabled));
+        }}
+        onIdleCoverDelayChange={(minutes) => {
+          setIdleCoverDelayMinutes(minutes);
+          setPreferenceError(saveIdleCoverDelayMinutes(minutes));
+        }}
+        onClose={() => setPreferencesOpen(false)}
+      />
+      <IdleCoverScreensaver
+        enabled={idleCoverEnabled}
+        delayMs={idleCoverDelayMs(idleCoverDelayMinutes)}
+        ready={libraryReady && startupIntroDone}
+        libraryGeneration={libraryGeneration}
+        track={activeTrack}
+        status={playerStatus}
+        cover={activeCoverState}
+        originRef={coverRef}
+      />
     </div>
   );
 }

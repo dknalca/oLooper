@@ -20,8 +20,9 @@ While the lock was held:
 - `ImportJob` carries the root, kind, paths, optional cover path, and job ID.
   The worker opens its own `Library` connection for each job.
 - Jobs run in enqueue order. Within SWF/EXE jobs, audio decode and BPM analysis
-  run in batches of up to four threads; filesystem writes and SQLite updates
-  remain serial and preserve source order (ADR 0010).
+  prepare one sound at a time under the shared working-memory guard; filesystem
+  writes and SQLite updates remain serial and preserve source order (ADR 0022,
+  superseding ADR 0010's worker count).
 - Each sound is decoded once; the PCM buffer is reused for MP3 trimming and BPM
   analysis.
 - Progress is emitted on `olooper:import-progress`. Final events carry an
@@ -44,8 +45,10 @@ While the lock was held:
 - `Library::open` sets WAL: open temp root, `PRAGMA journal_mode` == `wal`.
 - Two connections, one root: writer thread imports sounds while main handle
   calls `list_tracks()` concurrently; assert no `database is locked` errors.
-- Synthetic multi-sound import verifies bounded-parallel preparation still
-  stores tracks and report IDs in source order.
+- Synthetic multi-sound import verifies sequential, memory-guarded preparation
+  stores tracks and report IDs in source order. The test name
+  `parallel_sound_preparation_keeps_source_order_in_library` is historical; the
+  configured preparation worker count is one.
 
 ## Non-goals
 

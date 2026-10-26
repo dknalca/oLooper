@@ -16,6 +16,7 @@ export function getAppStatus(): Promise<AppStatus> {
 }
 
 export interface PlayerStatus {
+  generation: number;
   loaded: boolean;
   path: string | null;
   playing: boolean;
@@ -56,6 +57,11 @@ export function playerLoadTrack(trackId: number): Promise<PlayerStatus> {
   return invoke<PlayerStatus>("player_load_library_track", { id: trackId });
 }
 
+/** Decode a likely next track into the audio cache without switching playback. */
+export function playerPrefetch(trackId: number): Promise<boolean> {
+  return invoke<boolean>("player_prefetch", { id: trackId });
+}
+
 export function playerUnload(): Promise<PlayerStatus> {
   return invoke<PlayerStatus>("player_unload");
 }
@@ -92,8 +98,8 @@ export function playerSetLoop(startMs: number, endMs: number): Promise<PlayerSta
   return invoke<PlayerStatus>("player_set_loop", { startMs, endMs });
 }
 
-export function playerSetLoopSnapped(startMs: number, endMs: number): Promise<PlayerStatus> {
-  return invoke<PlayerStatus>("player_set_loop_snapped", { startMs, endMs });
+export function playerSetLoopSnapped(startMs: number, endMs: number, generation: number | null = null): Promise<PlayerStatus> {
+  return invoke<PlayerStatus>("player_set_loop_snapped", { startMs, endMs, generation });
 }
 
 export function playerSetLoopEnabled(enabled: boolean): Promise<PlayerStatus> {
@@ -295,6 +301,28 @@ export interface ImportProgress {
   custom_report: CustomReport[] | null;
 }
 
+export class ImportJobError extends Error {
+  readonly report: ImportReport | null;
+  readonly customReport: CustomReport[] | null;
+  constructor(readonly progress: ImportProgress) {
+    const added = progress.report?.added ?? progress.custom_report?.filter((report) => report.added).length ?? 0;
+    const summary = progress.report || progress.custom_report ? ` (${added} track(s) imported before failure)` : "";
+    super(`${progress.error ?? "Import failed"}${summary}`);
+    this.name = "ImportJobError";
+    this.report = progress.report;
+    this.customReport = progress.custom_report;
+  }
+}
+
+export function partialImportCounts(cause: unknown): { added: number; existing: number; failed: number } {
+  if (!(cause instanceof ImportJobError)) return { added: 0, existing: 0, failed: 0 };
+  return {
+    added: cause.report?.added ?? cause.customReport?.filter((item) => item.added).length ?? 0,
+    existing: cause.report?.already_there ?? cause.customReport?.filter((item) => item.error === "already in library").length ?? 0,
+    failed: cause.report?.failed.length ?? cause.customReport?.filter((item) => !item.added && item.error !== "already in library").length ?? 0,
+  };
+}
+
 let importJobSequence = 0;
 
 export function newImportJobId(): string {
@@ -375,8 +403,51 @@ export function libraryReorderPlaylist(playlistId: number, trackIds: number[]): 
   return invoke<void>("library_reorder_playlist", { playlistId, trackIds });
 }
 
-export function libraryRandomTrack(excludeId: number | null): Promise<Track | null> {
-  return invoke<Track | null>("library_random_track", { excludeId });
+export function libraryRandomTrack(excludeId: number | null, sourceHash: string | null): Promise<Track | null> {
+  return invoke<Track | null>("library_random_track", { excludeId, sourceHash });
+}
+
+export type BpmReanalysisScope =
+  | { kind: "library" }
+  | { kind: "looper"; source_hash: string }
+  | { kind: "playlist"; playlist_id: number };
+
+export interface BpmReanalysisReport {
+  total: number;
+  processed: number;
+  updated: number;
+  protected: number;
+  changed_since_start: number;
+  no_estimate: number;
+  failed: number;
+  unprocessed: number;
+  errors: string[];
+}
+
+export interface BpmReanalysisProgress {
+  job_id: string;
+  library_root: string;
+  state: "running" | "completed" | "cancelled" | "failed";
+  report: BpmReanalysisReport;
+  current_track_id: number | null;
+  updated_track: Track | null;
+  error: string | null;
+}
+
+export function reanalyzeBpm(scope: BpmReanalysisScope, jobId: string): Promise<string> {
+  return invoke<string>("reanalyze_bpm", { scope, jobId });
+}
+
+export function cancelBpmReanalysis(jobId: string): Promise<void> {
+  return invoke<void>("cancel_bpm_reanalysis", { jobId });
+}
+
+export function bpmReanalysisStatus(): Promise<BpmReanalysisProgress | null> {
+  return invoke<BpmReanalysisProgress | null>("bpm_reanalysis_status");
+}
+
+export function listenBpmReanalysisProgress(handler: (progress: BpmReanalysisProgress) => void): Promise<UnlistenFn> {
+  return listen<BpmReanalysisProgress>("olooper:bpm-reanalysis-progress", (event) => handler(event.payload));
 }
 
 function copyContainerOnImport(): boolean {
@@ -385,6 +456,40 @@ function copyContainerOnImport(): boolean {
 
 export function scanLooperFolder(path: string): Promise<string[]> {
   return invoke<string[]>("scan_looper_folder", { path });
+}
+
+export interface LinkedFolder {
+  id: number;
+  path: string;
+  extract_audio: boolean;
+  copy_source: boolean;
+  library_root: string;
+}
+
+export interface FolderScan {
+  folder: LinkedFolder;
+  paths: string[];
+  removed: number;
+  unchanged: number;
+}
+
+export const libraryLinkFolder = (path: string, extractAudio: boolean, copySource: boolean): Promise<LinkedFolder> =>
+  invoke("library_link_folder", { path, extractAudio, copySource });
+export const libraryLinkedFolders = (): Promise<LinkedFolder[]> => invoke("library_linked_folders");
+export const librarySourceFolders = (sourceHash: string): Promise<LinkedFolder[]> => invoke("library_source_folders", { sourceHash });
+export const libraryRescanFolder = (folder: LinkedFolder): Promise<FolderScan> =>
+  invoke("library_rescan_folder", { id: folder.id, libraryRoot: folder.library_root });
+
+export async function importLinkedFileAndWait(folder: LinkedFolder, path: string, jobId: string): Promise<ImportReport> {
+  const waiter = waitForImportDone(jobId);
+  try {
+    await waiter.ready;
+    await invoke("import_linked_file", { id: folder.id, libraryRoot: folder.library_root, path, jobId });
+    const done = await waiter.done;
+    if (done.error) throw new ImportJobError(done);
+    if (!done.report) throw new Error("import finished without a report");
+    return done.report;
+  } finally { waiter.cancel(); }
 }
 
 export function importSwf(path: string, jobId = importJobId(), extractAudio = true, copySource = copyContainerOnImport()): Promise<string> {
@@ -458,7 +563,7 @@ export async function importSwfAndWait(
     waiter.cancel();
     throw error;
   }
-  if (done.error) throw new Error(done.error);
+  if (done.error) throw new ImportJobError(done);
   if (done.report) return done.report;
   throw new Error("import finished without a report");
 }
@@ -487,7 +592,7 @@ export async function importExeAndWait(
     waiter.cancel();
     throw error;
   }
-  if (done.error) throw new Error(done.error);
+  if (done.error) throw new ImportJobError(done);
   if (done.report) return done.report;
   throw new Error("import finished without a report");
 }
@@ -510,6 +615,7 @@ export type AppMenuCommand =
   | "choose-library"
   | "show-shortcuts"
   | "audio-options"
+  | "preferences"
   | "midi-options";
 
 export function listenAppMenuCommand(
@@ -601,6 +707,14 @@ export function midiDisconnect(): Promise<void> {
   return invoke<void>("midi_disconnect");
 }
 
+export function midiImportMapFile(): Promise<string | null> {
+  return invoke<string | null>("midi_import_map_file");
+}
+
+export function midiExportMapFile(filename: string, contents: string): Promise<boolean> {
+  return invoke<boolean>("midi_export_map_file", { filename, contents });
+}
+
 export function listenMidiMessage(handler: (message: MidiMessage) => void): Promise<UnlistenFn> {
   return listen<MidiMessage>("olooper:midi-message", (event) => handler(event.payload));
 }
@@ -665,7 +779,7 @@ export async function importCustomAndWait(paths: string[], jobId = importJobId()
     waiter.cancel();
     throw error;
   }
-  if (done.error) throw new Error(done.error);
+  if (done.error) throw new ImportJobError(done);
   if (done.custom_report) return done.custom_report;
   throw new Error("import finished without a report");
 }
@@ -694,7 +808,7 @@ export async function importTablistAndWait(
     waiter.cancel();
     throw error;
   }
-  if (done.error) throw new Error(done.error);
+  if (done.error) throw new ImportJobError(done);
   if (done.custom_report) return done.custom_report;
   throw new Error("Tablist import finished without a report");
 }
@@ -733,9 +847,18 @@ export interface SeratoLoop {
 }
 
 export interface SeratoMetadata {
+  bpm_source?: string | null;
+  bpm_confidence?: number | null;
   cues: SeratoCue[];
   loops: SeratoLoop[];
   bpm: number | null;
+}
+
+export interface TrackBpmUpdate {
+  trackId: number;
+  bpm: number;
+  source?: string | null;
+  confidence?: number | null;
 }
 
 export function libraryGetSeratoMetadata(trackId: number): Promise<SeratoMetadata> {
@@ -756,6 +879,21 @@ export function librarySyncSeratoMetadata(trackId: number): Promise<void> {
 
 // --- Library management ---
 
+export interface TempoSuggestion {
+  track_id: number;
+  bpm: number | null;
+  confidence: number | null;
+  duration_frames: number;
+  sample_rate: number;
+  assumed_meter: "4/4" | null;
+  bars: number | null;
+}
+
+/** Preview only: no catalog/tag writes and no player commands. */
+export function libraryAnalyzeBpm(trackId: number): Promise<TempoSuggestion> {
+  return invoke<TempoSuggestion>("library_analyze_bpm", { id: trackId });
+}
+
 export function libraryRemove(trackId: number): Promise<boolean> {
   return invoke<boolean>("library_remove", { id: trackId });
 }
@@ -764,6 +902,7 @@ export function librarySetFavorite(trackId: number, favorite: boolean): Promise<
   return invoke<Track>("library_set_favorite", { id: trackId, favorite });
 }
 
+/** Without explicit BPM confirmation, keep the latest catalog tempo (not a stale draft). */
 export function libraryUpdateMetadata(
   trackId: number,
   title: string,

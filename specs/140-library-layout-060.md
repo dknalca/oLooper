@@ -1,5 +1,10 @@
 # 140 — Library Collections, Playlists, and BPM Review (0.6.0)
 
+> Historical 0.6.0 design snapshot. Current library behavior and acceptance
+> status are in [spec 010](010-library.md); duration-aware BPM analysis and
+> editor behavior are in [spec 260](260-loop-duration-bpm.md). Do not use the
+> unchecked items below as the current release checklist.
+
 ## Scope
 
 Reorganize the workspace to give the loop library more vertical room, make the

@@ -1,5 +1,10 @@
 # 130 — Serato CUE metadata sync
 
+> v0.8.0 resolves DOC-A01/DOC-A02: a durable pending-sync marker protects manual
+> BPM between confirmation and tag sync; CUE writes never create automatic BPM
+> tags. Historical follow-up descriptions below are superseded by
+> [the release record](../docs/release-0.8.0.md).
+
 ## Scope
 
 Share four CUE positions and BPM through tags embedded in oLooper-managed audio
@@ -16,8 +21,10 @@ the file is loaded again: [Cue Points](https://support.serato.com/hc/en-us/artic
    cleared.
 2. Opening a track in oLooper reads the first four CUEs and BPM from that file.
    Serato changes to these CUEs appear when the track is reopened in oLooper.
-3. BPM edits use the container's BPM tag. The **Audio tags** action can rewrite
-   the current CUEs and BPM at any time.
+3. An explicitly confirmed manual BPM is stored in the catalog and synchronized
+   to the supported managed-audio file. Automatic BPM estimates remain catalog
+   metadata until the user confirms one. The reanalysis/half-double workflows are
+   described in specs 260/270.
 4. After oLooper writes tags, reload the track in Serato or use **Rescan ID3
    Tags** so Serato rereads the file metadata.
 5. MP3, WAV, AIFF, FLAC, Ogg Vorbis, and M4A/MP4 library files have marker
@@ -41,14 +48,31 @@ the file is loaded again: [Cue Points](https://support.serato.com/hc/en-us/artic
   both `ID3 ` and `id3 ` chunks, merge ordinary frames and prefer lowercase
   markers when present, even when cleared; fall back to uppercase markers only
   if lowercase has none.
-- BPM is mirrored using `TBPM` for ID3, `BPM` for Vorbis comments, and `tmpo` for
-  MP4. This does not update Serato's proprietary beatgrid.
+- Only an explicitly confirmed manual BPM is synchronized using `TBPM` for ID3,
+  `BPM` for Vorbis comments, and `tmpo` for MP4. Automatic analysis remains in
+  the catalog; this does not update Serato's proprietary beatgrid.
 - CUEs are not written to SQLite. Existing schema-v6 `loop_slots` rows migrate
   only their cue positions before WAV normalization; old saved-loop boundaries
   are ignored and those rows are then deleted. Serato databases/crates are never
   read or modified.
 - Writes use a verified exclusive sibling temporary file and replace only the
-  library-managed audio copy.
+  library-managed audio copy. All metadata/removal operations on a library are
+  serialized by an exclusive library lease plus an in-process mutex, so
+  concurrent CUE edits cannot overwrite each other.
+- If a Windows replacement is interrupted, the backup name includes the full
+  audio filename (`<file>.serato-backup-*`). Recovery on the next metadata read
+  or library open restores only backups whose header matches the missing audio
+  format; legacy backups without the extension are validated the same way.
+
+### Follow-up audit issue (2026-10-26)
+
+The intended precedence above is not fully enforced yet. A possible ordering
+race between saving a manual BPM and a CUE/tag read can let a stale file `TBPM`
+replace the just-confirmed catalog BPM before tag synchronization. Also, writing
+a CUE may copy an automatic catalog BPM into file tags, after which batch
+reanalyze treats that tag as externally authoritative. Both cases were reproduced
+and are open findings in `docs/documentation-review-2026-10-26.md`; do not treat
+the intended provenance guarantees as fully verified until fixed and retested.
 
 ## Failure behavior
 

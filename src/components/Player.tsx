@@ -1,4 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { startPolling } from "../poll";
+import { createRandomPlayback } from "../randomPlayback";
 import {
   libraryGetSeratoMetadata,
   librarySetSeratoCue,
@@ -32,6 +34,7 @@ interface Props {
   status: PlayerStatus | null;
   trackId: number | null;
   audioStorage: "extracted" | "embedded";
+  playbackPath?: string | null;
   trackOpenGeneration: number;
   canRandom: boolean;
   onRandomTrack: () => Promise<void>;
@@ -43,7 +46,8 @@ interface Props {
   onStatusChange: (status: PlayerStatus) => void;
 }
 
-export default function Player({ status: st, trackId, audioStorage, trackOpenGeneration, canRandom, onRandomTrack, canNavigateTracks, onPreviousTrack, onNextTrack, loopEditing, onToggleLoopEditing, onStatusChange }: Props) {
+export default function Player({ status: st, trackId, audioStorage, playbackPath, trackOpenGeneration, canRandom, onRandomTrack, canNavigateTracks, onPreviousTrack, onNextTrack, loopEditing, onToggleLoopEditing, onStatusChange }: Props) {
+  const matchesPlayback = !playbackPath || st?.path === playbackPath;
   const [error, setError] = useState<string | null>(null);
   const scrubRef = useRef<HTMLDivElement>(null);
   const loopStartRef = useRef<HTMLInputElement>(null);
@@ -55,43 +59,27 @@ export default function Player({ status: st, trackId, audioStorage, trackOpenGen
   const [randomInterval, setRandomInterval] = useState<"2" | "5" | "custom">("2");
   const [customMinutes, setCustomMinutes] = useState("10");
   const [randomRemaining, setRandomRemaining] = useState<number | null>(null);
-  const [randomResetGeneration, setRandomResetGeneration] = useState(0);
+  const randomActionRef = useRef(onRandomTrack);
+  randomActionRef.current = onRandomTrack;
+  const [randomPlayback] = useState(() => createRandomPlayback({
+    action: () => randomActionRef.current(),
+    onRemaining: setRandomRemaining,
+    onSuccess: () => setError(null),
+    onError: (cause) => setError(`Random track: ${String(cause)}`),
+  }));
   const minutes = randomInterval === "custom" ? Number(customMinutes) : Number(randomInterval);
   const validInterval = Number.isFinite(minutes) && minutes >= 1 && minutes <= 1440;
 
   useEffect(() => {
-    if (!randomEnabled || !canRandom || !validInterval) {
-      setRandomRemaining(null);
-      return;
-    }
-    let cancelled = false;
-    let timeout = 0;
-    let ticker = 0;
-    const intervalMs = minutes * 60_000;
-    const schedule = () => {
-      const deadline = Date.now() + intervalMs;
-      const update = () => setRandomRemaining(Math.max(0, Math.ceil((deadline - Date.now()) / 1000)));
-      update();
-      ticker = window.setInterval(update, 250);
-      timeout = window.setTimeout(async () => {
-        window.clearInterval(ticker);
-        setRandomRemaining(0);
-        try {
-          await onRandomTrack();
-          setError(null);
-        } catch (reason) {
-          setError(`Random track: ${String(reason)}`);
-        }
-        if (!cancelled) schedule();
-      }, intervalMs);
-    };
-    schedule();
-    return () => {
-      cancelled = true;
-      window.clearTimeout(timeout);
-      window.clearInterval(ticker);
-    };
-  }, [randomEnabled, canRandom, validInterval, minutes, onRandomTrack, randomResetGeneration]);
+    randomPlayback.configure(randomEnabled && canRandom && validInterval ? minutes * 60_000 : null);
+    return () => randomPlayback.configure(null);
+  }, [randomEnabled, canRandom, validInterval, minutes, randomPlayback]);
+
+  useEffect(() => {
+    const random = () => { if (canRandom) void randomPlayback.trigger(); };
+    window.addEventListener("olooper:random-loop", random);
+    return () => window.removeEventListener("olooper:random-loop", random);
+  }, [canRandom, randomPlayback]);
 
   // CUEs live in the audio file, not the private catalog DB.
   const [cues, setCues] = useState<SeratoCue[]>([]);
@@ -101,12 +89,15 @@ export default function Player({ status: st, trackId, audioStorage, trackOpenGen
   const [seratoSyncMessage, setSeratoSyncMessage] = useState<string | null>(null);
   const [seratoSyncError, setSeratoSyncError] = useState(false);
   const statusRef = useRef(st);
+  const metadataOwner = useRef("");
+  metadataOwner.current = `${trackId}:${trackOpenGeneration}:${st?.generation ?? 0}:${st?.path ?? ""}`;
 
-  useEffect(() => { statusRef.current = st; }, [st]);
+  statusRef.current = st;
 
   useEffect(() => {
     setSeratoSyncMessage(null);
     setSeratoSyncError(false);
+    setSeratoSyncing(false);
   }, [trackId]);
 
   useEffect(() => {
@@ -128,32 +119,32 @@ export default function Player({ status: st, trackId, audioStorage, trackOpenGen
   }, [st?.output_error]);
 
   const run = useCallback(
-    (p: Promise<PlayerStatus>) =>
-      p.then((s) => {
+    (p: Promise<PlayerStatus>) => {
+      const owner = metadataOwner.current;
+      return p.then((s) => {
+        if (owner !== metadataOwner.current) return;
         onStatusChange(s);
         setError(s.output_error ? `Audio output: ${s.output_error}` : null);
-      }).catch((e) => setError(String(e))),
+      }).catch((e) => { if (owner === metadataOwner.current) setError(String(e)); });
+    },
     [onStatusChange],
   );
 
-  const playNextRandom = async () => {
-    try {
-      await onRandomTrack();
-      setError(null);
-      if (randomEnabled) setRandomResetGeneration((generation) => generation + 1);
-    } catch (cause) {
-      setError(`Random track: ${String(cause)}`);
-    }
-  };
+  const playNextRandom = randomPlayback.trigger;
 
   // Poll native position at 4 Hz while playing, and also while a
   // background job (decode/stretch) is pending so progress and async
   // errors surface without new event plumbing.
   useEffect(() => {
     if (!st?.playing && !st?.loading && !st?.pitch_preparing) return;
-    const id = setInterval(() => playerStatus().then(onStatusChange).catch(() => {}), 250);
-    return () => clearInterval(id);
-  }, [st?.playing, st?.loading, st?.pitch_preparing]);
+    let active = true;
+    const stop = startPolling(async () => {
+      const owner = metadataOwner.current;
+      const status = await playerStatus();
+      if (active && owner === metadataOwner.current) onStatusChange(status);
+    }, 250, false);
+    return () => { active = false; stop(); };
+  }, [st?.playing, st?.loading, st?.pitch_preparing, onStatusChange]);
 
   // Expose state to keyboard shortcuts hook.
   useEffect(() => {
@@ -161,12 +152,12 @@ export default function Player({ status: st, trackId, audioStorage, trackOpenGen
       exposePlayerState({
         position_ms: st.position_ms,
         playing: st.playing,
-        loaded: st.loaded,
+        loaded: st.loaded && !st.loading && matchesPlayback,
         loop_enabled: st.loop_enabled,
         duration_ms: st.duration_ms,
       });
-    }
-  }, [st]);
+    } else exposePlayerState({ position_ms: 0, playing: false, loaded: false, loop_enabled: false, duration_ms: 0 });
+  }, [st, matchesPlayback]);
 
   // Read markers from the audio file every time a track is opened.
   useEffect(() => {
@@ -174,7 +165,7 @@ export default function Player({ status: st, trackId, audioStorage, trackOpenGen
     setCues([]);
     setMetadataTrackId(null);
     setActiveCueSlot(null);
-    if (!trackId || !st?.loaded) {
+    if (!trackId || !st?.loaded || !matchesPlayback) {
       return () => { cancelled = true; };
     }
     libraryGetSeratoMetadata(trackId)
@@ -185,7 +176,7 @@ export default function Player({ status: st, trackId, audioStorage, trackOpenGen
         setError(null);
         if (metadata.bpm !== null) {
           window.dispatchEvent(new CustomEvent("olooper:track-bpm", {
-            detail: { trackId, bpm: metadata.bpm },
+            detail: { trackId, bpm: metadata.bpm, source: metadata.bpm_source, confidence: metadata.bpm_confidence } satisfies import("../tauri").TrackBpmUpdate,
           }));
         }
       })
@@ -193,10 +184,10 @@ export default function Player({ status: st, trackId, audioStorage, trackOpenGen
         if (!cancelled) setError(`Cannot read CUEs from audio file: ${String(cause)}`);
       });
     return () => { cancelled = true; };
-  }, [trackId, trackOpenGeneration, st?.path, st?.loaded]);
+  }, [trackId, trackOpenGeneration, st?.generation, st?.path, st?.loaded, matchesPlayback]);
 
   const scrub = (e: React.MouseEvent<HTMLDivElement>) => {
-    if (!scrubRef.current || !st?.loaded || st.duration_ms <= 0) return;
+    if (!scrubRef.current || !st?.loaded || st.loading || !matchesPlayback || st.duration_ms <= 0) return;
     const rect = scrubRef.current.getBoundingClientRect();
     const frac = Math.min(1, Math.max(0, (e.clientX - rect.left) / rect.width));
     playerSeek(Math.round(frac * st.duration_ms)).catch((e) => setError(String(e)));
@@ -209,7 +200,9 @@ export default function Player({ status: st, trackId, audioStorage, trackOpenGen
 
   useEffect(() => {
     if (!isScrubbing) return;
+    const owner = metadataOwner.current;
     const onMove = (e: MouseEvent) => {
+      if (owner !== metadataOwner.current || statusRef.current?.loading) return;
       if (!scrubRef.current || !st?.loaded || st.duration_ms <= 0) return;
       const rect = scrubRef.current.getBoundingClientRect();
       const frac = Math.min(1, Math.max(0, (e.clientX - rect.left) / rect.width));
@@ -228,39 +221,44 @@ export default function Player({ status: st, trackId, audioStorage, trackOpenGen
     setCues(metadata.cues);
     if (metadata.bpm !== null && trackId !== null) {
       window.dispatchEvent(new CustomEvent("olooper:track-bpm", {
-        detail: { trackId, bpm: metadata.bpm },
+        detail: { trackId, bpm: metadata.bpm, source: metadata.bpm_source, confidence: metadata.bpm_confidence } satisfies import("../tauri").TrackBpmUpdate,
       }));
     }
   };
 
   const saveCue = (slot: number) => {
-    if (!trackId || metadataTrackId !== trackId) return;
+    if (!trackId || metadataTrackId !== trackId || st?.loading || !matchesPlayback) return;
     const cueMs = statusRef.current?.position_ms ?? 0;
+    const owner = metadataOwner.current;
     librarySetSeratoCue(trackId, slot, cueMs)
       .then((metadata) => {
+        if (owner !== metadataOwner.current) return;
         applyMetadata(metadata);
         setActiveCueSlot(slot);
       })
-      .catch((cause) => setError(String(cause)));
+      .catch((cause) => { if (owner === metadataOwner.current) setError(String(cause)); });
   };
 
   const syncSeratoMetadata = useCallback(async (id: number) => {
+    const owner = metadataOwner.current;
     setSeratoSyncing(true);
     setSeratoSyncError(false);
     setSeratoSyncMessage("Writing CUEs and BPM to the audio file…");
     try {
       await librarySyncSeratoMetadata(id);
+      if (owner !== metadataOwner.current) return;
       setSeratoSyncMessage("Serato metadata synced. Reload this file in Serato to refresh it.");
     } catch (cause) {
+      if (owner !== metadataOwner.current) return;
       setSeratoSyncError(true);
       setSeratoSyncMessage(`Data is saved in oLooper, but Serato sync failed: ${String(cause)}`);
     } finally {
-      setSeratoSyncing(false);
+      if (owner === metadataOwner.current) setSeratoSyncing(false);
     }
   }, []);
 
   const loadCue = (slot: number) => {
-    if (metadataTrackId !== trackId) return;
+    if (metadataTrackId !== trackId || st?.loading || !matchesPlayback) return;
     const cue = cues.find((saved) => saved.slot === slot);
     if (!cue) return;
     setActiveCueSlot(slot);
@@ -268,13 +266,15 @@ export default function Player({ status: st, trackId, audioStorage, trackOpenGen
   };
 
   const clearCue = (slot: number) => {
-    if (!trackId || metadataTrackId !== trackId || slot === 1) return;
+    if (!trackId || metadataTrackId !== trackId || slot === 1 || st?.loading || !matchesPlayback) return;
+    const owner = metadataOwner.current;
     librarySetSeratoCue(trackId, slot, null)
       .then((metadata) => {
+        if (owner !== metadataOwner.current) return;
         applyMetadata(metadata);
         if (activeCueSlot === slot) setActiveCueSlot(null);
       })
-      .catch((cause) => setError(String(cause)));
+      .catch((cause) => { if (owner === metadataOwner.current) setError(String(cause)); });
   };
 
   const applyManualLoop = () => {
@@ -284,15 +284,19 @@ export default function Player({ status: st, trackId, audioStorage, trackOpenGen
       setError("Loop boundaries must be valid times in milliseconds.");
       return;
     }
-    run(playerSetLoopSnapped(start, end));
+    run(playerSetLoopSnapped(start, end, statusRef.current?.generation));
   };
 
   const detectLoop = () => {
+    const owner = metadataOwner.current;
+    const generation = statusRef.current?.generation;
     run(playerAutoLoop().then((result) => {
+      if (owner !== metadataOwner.current) throw new Error("Track changed during analysis");
       if (!result.candidate) throw new Error("No suitable loop found");
       return playerSetLoopSnapped(
         Math.round(result.candidate.start_frame * 1000 / result.sample_rate),
         Math.round(result.candidate.end_frame * 1000 / result.sample_rate),
+        generation,
       );
     }));
   };
@@ -300,7 +304,7 @@ export default function Player({ status: st, trackId, audioStorage, trackOpenGen
   useEffect(() => {
     const handleCueShortcut = (event: Event) => {
       const { slot, clear } = (event as CustomEvent<{ slot: number; clear: boolean }>).detail;
-      if (!trackId || !st?.loaded || !Number.isInteger(slot) || slot < 1 || slot > 4) return;
+      if (!trackId || !st?.loaded || st.loading || !matchesPlayback || !Number.isInteger(slot) || slot < 1 || slot > 4) return;
       if (audioStorage === "embedded" && slot !== 1) return;
       if (slot === 1) {
         loadCue(1);
@@ -319,7 +323,7 @@ export default function Player({ status: st, trackId, audioStorage, trackOpenGen
   }, [audioStorage, trackId, st?.loaded, metadataTrackId, cues, clearCue, loadCue, saveCue]);
 
   const posFrac = st?.loaded && st.duration_ms > 0 ? st.position_ms / st.duration_ms : 0;
-  const loaded = st?.loaded ?? false;
+  const loaded = (st?.loaded ?? false) && !st?.loading && matchesPlayback;
   const playing = st?.playing ?? false;
   // Async job errors arrive via status polling, not via the invoke that
   // started them; surface them in the same slot as command errors.
@@ -330,6 +334,20 @@ export default function Player({ status: st, trackId, audioStorage, trackOpenGen
       {/* Scrub bar */}
       <div
         ref={scrubRef}
+        role="slider"
+        tabIndex={loaded ? 0 : -1}
+        aria-label="Playback position"
+        aria-valuemin={0}
+        aria-valuemax={st?.duration_ms ?? 0}
+        aria-valuenow={st?.position_ms ?? 0}
+        aria-disabled={!loaded}
+        onKeyDown={(event) => {
+          if (!loaded) return;
+          const position = st?.position_ms ?? 0;
+          const target = event.key === "Home" ? 0 : event.key === "End" ? st?.duration_ms ?? 0
+            : event.key === "ArrowLeft" ? position - 1000 : event.key === "ArrowRight" ? position + 1000 : null;
+          if (target !== null) { event.preventDefault(); event.stopPropagation(); run(playerSeek(Math.max(0, Math.min(st?.duration_ms ?? 0, target)))); }
+        }}
         onMouseDown={onScrubDown}
         className={`relative h-2 overflow-hidden rounded-full cursor-pointer group ${loaded ? "bg-border" : "bg-border/50"}`}
       >
@@ -391,7 +409,7 @@ export default function Player({ status: st, trackId, audioStorage, trackOpenGen
               <rect x="2.5" y="2" width="1.5" height="12" />
             </svg>
           </TransportBtn>
-          <TransportBtn onClick={() => void playNextRandom()} disabled={!canRandom} title="Next random loop">
+          <TransportBtn onClick={() => void playNextRandom()} disabled={!canRandom} title="Next random loop (R)">
             <span className="text-[11px] font-bold">R</span>
           </TransportBtn>
         </div>
@@ -453,7 +471,7 @@ export default function Player({ status: st, trackId, audioStorage, trackOpenGen
                 <span className="mr-1 text-[9px] font-semibold uppercase tracking-wide text-text-secondary">CUE</span>
                 {CUE_SLOTS.map((slot) => {
                   const cue = cues.find((saved) => saved.slot === slot);
-                  const ready = metadataTrackId === trackId;
+                  const ready = metadataTrackId === trackId && loaded;
                   return (
                     <span key={slot} className="flex items-center">
                       <button
@@ -495,7 +513,7 @@ export default function Player({ status: st, trackId, audioStorage, trackOpenGen
             onClick={() => setRandomEnabled((enabled) => !enabled)}
             disabled={!canRandom || (!randomEnabled && !validInterval)}
             aria-pressed={randomEnabled}
-            title="Automatically play a random track from your local library at this interval"
+            title="Run Random automatically at this interval, using the current looper or All tracks"
             className={`rounded px-2 py-1 text-[10px] font-medium transition-colors disabled:opacity-30 ${randomEnabled ? "bg-success/20 text-success" : "bg-border text-text-secondary hover:text-text"}`}
           >
             {randomEnabled ? "Random ON" : "Random OFF"}

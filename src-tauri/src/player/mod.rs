@@ -21,8 +21,8 @@ pub const MAX_DURATION_MS: u64 = 15 * 60 * 1000;
 /// Inspection/read cap shared with the import pipeline.
 const MAX_INPUT_LEN: u64 = 512 * 1024 * 1024;
 /// Keep recently decoded practice loops hot without retaining unbounded PCM.
-const DECODE_CACHE_MAX_BYTES: usize = 128 * 1024 * 1024;
-const DECODE_CACHE_MAX_TRACKS: usize = 6;
+const DECODE_CACHE_MAX_BYTES: usize = 512 * 1024 * 1024;
+const DECODE_CACHE_MAX_TRACKS: usize = 32;
 
 /// Decoded, interleaved track audio.
 #[derive(Debug, Clone)]
@@ -415,7 +415,7 @@ pub struct OutputSelection {
 }
 
 fn validate_output_pair(first_channel: u16, channels: u16) -> Result<(), String> {
-    if first_channel % 2 != 0 {
+    if !first_channel.is_multiple_of(2) {
         return Err("stereo output must start on channel 1, 3, 5, etc.".to_string());
     }
     if first_channel.saturating_add(2) > channels {
@@ -552,10 +552,7 @@ fn choose_output_config(
         } else {
             preferred_sample_rate.clamp(range.min_sample_rate().0, range.max_sample_rate().0)
         };
-        let Some(config) = range
-            .clone()
-            .try_with_sample_rate(cpal::SampleRate(sample_rate))
-        else {
+        let Some(config) = (*range).try_with_sample_rate(cpal::SampleRate(sample_rate)) else {
             continue;
         };
         if let Some(frames) = requested_buffer_frames {
@@ -650,6 +647,8 @@ where
         .map_err(|error| format!("cannot open requested audio format: {error}"))
 }
 
+// Keep the CPAL callback configuration explicit at the hardware boundary.
+#[allow(clippy::too_many_arguments)]
 fn build_output_stream(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
@@ -768,7 +767,7 @@ fn select_output_config(selection: &OutputSelection) -> Result<SelectedOutputCon
         selection.sample_rate,
         selection.buffer_frames,
     ));
-    if selection.first_channel % 2 != 0 {
+    if !selection.first_channel.is_multiple_of(2) {
         let error = "stereo output must start on channel 1, 3, 5, etc.".to_string();
         crate::audio_log::write(&format!("output_selection_rejected reason={error}"));
         return Err(error);
@@ -957,6 +956,7 @@ fn output_selection_matches_device(
 
 /// Decode any rodio-supported bytes into a buffer. Hardware-free.
 pub fn decode_bytes(data: &[u8]) -> Result<LoopBuffer, String> {
+    let _work = crate::memory::work_guard();
     // rodio 0.20's Symphonia adapter panics when its MP4 reader requests a
     // seek during initialization for Tablist's M4A files. Decode ISO BMFF
     // directly through Symphonia instead of letting that adapter panic.
@@ -1050,6 +1050,7 @@ fn decode_isomp4(data: &[u8]) -> Result<LoopBuffer, String> {
     let mut samples = Vec::new();
     let (mut channels, mut rate) = (0u16, 0u32);
     loop {
+        crate::check_cancelled()?;
         let packet = match probed.format.next_packet() {
             Ok(packet) => packet,
             Err(SymphoniaError::IoError(_)) => break,
@@ -1063,6 +1064,18 @@ fn decode_isomp4(data: &[u8]) -> Result<LoopBuffer, String> {
             .map_err(|error| format!("cannot decode M4A packet: {error}"))?;
         channels = decoded.spec().channels.count() as u16;
         rate = decoded.spec().rate;
+        if channels == 0
+            || channels > 8
+            || rate == 0
+            || rate > 192_000
+            || decoded
+                .capacity()
+                .saturating_mul(channels as usize)
+                .saturating_mul(2)
+                > crate::memory::MAX_PCM_BYTES
+        {
+            return Err("decoded audio layout exceeds the resource limit".into());
+        }
         let mut interleaved = SampleBuffer::<i16>::new(decoded.capacity() as u64, *decoded.spec());
         interleaved.copy_interleaved_ref(decoded);
         let decoded_samples = interleaved.samples();
@@ -1074,6 +1087,11 @@ fn decode_isomp4(data: &[u8]) -> Result<LoopBuffer, String> {
         let end_sample = (frame_count - trim_end) * channels;
         let max_samples =
             (MAX_DURATION_MS as u128 * rate as u128 / 1000).saturating_mul(channels as u128);
+        if samples.len().saturating_add(end_sample - start_sample)
+            > crate::memory::working_budget(crate::memory::MAX_PCM_BYTES) / 2
+        {
+            return Err("decoded audio exceeds the PCM memory budget".into());
+        }
         if samples.len() as u128 + (end_sample - start_sample) as u128 > max_samples {
             return Err("track is over the 15 min practice limit".to_string());
         }
@@ -1099,14 +1117,25 @@ fn decode_isomp4(data: &[u8]) -> Result<LoopBuffer, String> {
 fn decode_owned(data: Vec<u8>) -> Result<LoopBuffer, String> {
     let dec = Decoder::new(Cursor::new(data)).map_err(|e| format!("cannot decode audio: {e}"))?;
     let (channels, rate) = (dec.channels(), dec.sample_rate());
-    if channels == 0 || rate == 0 {
+    if channels == 0 || channels > 8 || rate == 0 || rate > 192_000 {
         return Err("decoded stream has no channels or rate".to_string());
     }
     let max_samples =
         (MAX_DURATION_MS as u128 * rate as u128 / 1000).saturating_mul(channels as u128) as usize;
-    let samples: Vec<i16> = dec.take(max_samples.saturating_add(1)).collect();
+    let max_samples =
+        max_samples.min(crate::memory::working_budget(crate::memory::MAX_PCM_BYTES) / 2);
+    let mut samples = Vec::new();
+    for sample in dec.take(max_samples.saturating_add(1)) {
+        if samples.len() % 65536 == 0 {
+            crate::check_cancelled()?;
+        }
+        samples.push(sample);
+    }
     if samples.len() > max_samples {
         return Err("track is over the 15 min practice limit".to_string());
+    }
+    if samples.is_empty() {
+        return Err("audio contains no decodable frames".into());
     }
     let buf = LoopBuffer {
         samples,
@@ -1126,7 +1155,7 @@ pub fn ms_to_frames(ms: u64, rate: u32) -> usize {
     if rate == 0 {
         0
     } else {
-        (ms as u128 * rate as u128 / 1000) as usize
+        usize::try_from(ms as u128 * rate as u128 / 1000).unwrap_or(usize::MAX)
     }
 }
 
@@ -1269,6 +1298,7 @@ pub(crate) struct FileIdentity {
 pub(crate) struct AudioLoadRequest {
     key: String,
     source: AudioLoadSource,
+    practice: Option<(u64, u64, bool)>,
 }
 
 #[derive(Clone, Debug)]
@@ -1289,6 +1319,7 @@ impl AudioLoadRequest {
         Self {
             key,
             source: AudioLoadSource::File { path },
+            practice: None,
         }
     }
 
@@ -1307,11 +1338,24 @@ impl AudioLoadRequest {
                 sound_id,
                 source_hash,
             },
+            practice: None,
         }
     }
 
     fn key(&self) -> &str {
         &self.key
+    }
+
+    pub(crate) fn with_practice(mut self, start: u64, end: u64, enabled: bool) -> Self {
+        self.practice = Some((start, end, enabled));
+        self
+    }
+
+    pub(crate) fn region(&self, buffer: &LoopBuffer) -> (u64, u64, bool) {
+        let total = buffer.frames() as u64;
+        self.practice
+            .filter(|(start, end, _)| start < end && *end <= total)
+            .unwrap_or((0, total, true))
     }
 
     fn identity_path(&self) -> &str {
@@ -1355,6 +1399,12 @@ struct PendingLoad {
     identity: Option<FileIdentity>,
 }
 
+struct PendingPrefetch {
+    request: AudioLoadRequest,
+    identity: Option<FileIdentity>,
+    epoch: u64,
+}
+
 #[derive(Clone)]
 struct DecodedCacheEntry {
     path: String,
@@ -1391,6 +1441,7 @@ pub struct Player {
     /// WSOLA) can post completions to be applied on the audio thread.
     tx: std::sync::mpsc::Sender<EngineCmd>,
     pitch_seq: u64,
+    pitch_worker_running: bool,
 }
 
 impl Player {
@@ -1425,6 +1476,7 @@ impl Player {
             track: None,
             tx,
             pitch_seq: 0,
+            pitch_worker_running: false,
         })
     }
 
@@ -1723,7 +1775,29 @@ fn snap_zero_crossing(buf: &LoopBuffer, requested: usize) -> usize {
     })
 }
 
+fn frame_sample(buffer: &LoopBuffer, frame: usize) -> i16 {
+    let channels = buffer.channels.max(1) as usize;
+    let sum: i64 = (0..channels)
+        .map(|channel| {
+            buffer
+                .samples
+                .get(frame.saturating_mul(channels).saturating_add(channel))
+                .copied()
+                .unwrap_or(0) as i64
+        })
+        .sum();
+    (sum / channels as i64) as i16
+}
+
 fn stretch_buffer(buffer: &LoopBuffer, tempo: f32) -> Result<LoopBuffer, String> {
+    let _work = crate::memory::work_guard();
+    let budget = crate::memory::working_budget(crate::memory::MAX_PCM_BYTES);
+    if !tempo.is_finite()
+        || !(0.5..=2.0).contains(&tempo)
+        || buffer.samples.len().saturating_mul(16) > budget
+    {
+        return Err("pitch processing exceeds the working memory budget".into());
+    }
     let samples: Vec<f32> = buffer
         .samples
         .iter()
@@ -1790,7 +1864,7 @@ fn read_and_decode(path: &str) -> Result<LoopBuffer, String> {
         return Err("file exceeds the 512 MiB limit".to_string());
     }
     let size = meta.len();
-    let data = std::fs::read(path).map_err(|e| format!("cannot read file: {e}"))?;
+    let data = crate::bounded_io::read(path, MAX_INPUT_LEN)?;
     let read_ms = started.elapsed().as_millis();
     let decoded = std::time::Instant::now();
     let buf = decode_job(data);
@@ -2053,6 +2127,15 @@ impl Player {
     /// Returns instantly: current playback is untouched and the worker posts
     /// `EngineCmd::PitchReady` for the audio thread to apply or discard.
     fn request_stretch(&mut self) {
+        if self.pitch_worker_running {
+            if let Some(track) = self.track.as_mut() {
+                if track.pitch_lock {
+                    track.pitch_requested_speed = track.speed;
+                    track.pitch_pending = true;
+                }
+            }
+            return;
+        }
         let seq = self.pitch_seq + 1;
         let job = self.track.as_mut().and_then(|track| {
             if !track.pitch_lock {
@@ -2078,6 +2161,7 @@ impl Player {
             return;
         };
         self.pitch_seq = seq;
+        self.pitch_worker_running = true;
         let tx = self.tx.clone();
         if std::thread::Builder::new()
             .name("olooper-stretch".to_string())
@@ -2092,6 +2176,7 @@ impl Player {
             })
             .is_err()
         {
+            self.pitch_worker_running = false;
             // Never leave a stuck "preparing" state.
             if let Some(track) = self.track.as_mut() {
                 if track.pitch_job == seq {
@@ -2297,6 +2382,7 @@ impl Player {
                 let position = t.cursor.load(Ordering::Relaxed);
                 PlayerStatus {
                     loaded: true,
+                    generation: t.generation,
                     path: Some(t.path.clone()),
                     playing,
                     position_ms: frames_to_ms(position, t.buf.rate),
@@ -2328,6 +2414,7 @@ impl Player {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlayerStatus {
+    pub generation: u64,
     pub loaded: bool,
     pub path: Option<String>,
     pub playing: bool,
@@ -2363,6 +2450,7 @@ impl PlayerStatus {
     pub fn empty() -> Self {
         Self {
             loaded: false,
+            generation: 0,
             path: None,
             playing: false,
             position_ms: 0,
@@ -2414,6 +2502,13 @@ pub struct Engine {
     last_load_error: Option<String>,
     decoded_cache: VecDeque<DecodedCacheEntry>,
     decoded_cache_bytes: usize,
+    /// Best-effort background decodes for the next sequential and random
+    /// candidates. They never replace the playing track.
+    prefetch_queue: VecDeque<PendingPrefetch>,
+    prefetch_running: bool,
+    prefetch_active_path: Option<String>,
+    /// Bumped on unload so prefetched buffers from an old library are dropped.
+    prefetch_epoch: u64,
 }
 
 type Reply = std::sync::mpsc::Sender<Result<PlayerStatus, String>>;
@@ -2429,6 +2524,18 @@ pub(crate) enum EngineCmd {
     LoadReady {
         generation: u64,
         path: String,
+        request: AudioLoadRequest,
+        identity: Option<FileIdentity>,
+        result: Result<LoopBuffer, String>,
+    },
+    /// Queue one of the two look-ahead candidates without changing playback.
+    Prefetch {
+        request: AudioLoadRequest,
+        reply: std::sync::mpsc::Sender<Result<bool, String>>,
+    },
+    /// Posted by the prefetch worker.
+    PrefetchReady {
+        epoch: u64,
         request: AudioLoadRequest,
         identity: Option<FileIdentity>,
         result: Result<LoopBuffer, String>,
@@ -2483,6 +2590,7 @@ pub(crate) enum EngineCmd {
     SetLoopSnapped {
         start_ms: u64,
         end_ms: u64,
+        generation: Option<u64>,
         reply: Reply,
     },
     SetLoopEnabled {
@@ -2530,6 +2638,10 @@ impl Engine {
             last_load_error: None,
             decoded_cache: VecDeque::new(),
             decoded_cache_bytes: 0,
+            prefetch_queue: VecDeque::new(),
+            prefetch_running: false,
+            prefetch_active_path: None,
+            prefetch_epoch: 0,
         }
     }
 
@@ -2563,6 +2675,7 @@ impl Engine {
             let cmd = match rx.recv_timeout(wait) {
                 Ok(cmd) => cmd,
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    self.maintain_caches();
                     self.follow_system_default_output();
                     next_default_output_check =
                         std::time::Instant::now() + std::time::Duration::from_secs(1);
@@ -2579,7 +2692,19 @@ impl Engine {
                     request,
                     identity,
                     result,
-                } => self.cmd_load_ready(generation, path, request, identity, result),
+                } => {
+                    self.cmd_load_ready(generation, path, request, identity, result);
+                    self.start_next_prefetch();
+                }
+                EngineCmd::Prefetch { request, reply } => {
+                    let _ = reply.send(self.cmd_prefetch(request));
+                }
+                EngineCmd::PrefetchReady {
+                    epoch,
+                    request,
+                    identity,
+                    result,
+                } => self.cmd_prefetch_ready(epoch, request, identity, result),
                 EngineCmd::OutputFailed {
                     generation,
                     device_name,
@@ -2633,8 +2758,21 @@ impl Engine {
                 EngineCmd::SetLoopSnapped {
                     start_ms,
                     end_ms,
+                    generation,
                     reply,
                 } => {
+                    if generation.is_some_and(|generation| {
+                        self.pending_load.is_some()
+                            || self
+                                .player
+                                .as_ref()
+                                .and_then(|p| p.track.as_ref())
+                                .is_none_or(|t| t.generation != generation)
+                    }) {
+                        let _ =
+                            reply.send(Err("track changed before applying loop boundaries".into()));
+                        continue;
+                    }
                     let _ = reply.send(
                         self.ensure()
                             .and_then(|p| p.set_loop_snapped(start_ms, end_ms)),
@@ -2677,6 +2815,7 @@ impl Engine {
                 }
             }
             if std::time::Instant::now() >= next_default_output_check {
+                self.maintain_caches();
                 self.follow_system_default_output();
                 next_default_output_check =
                     std::time::Instant::now() + std::time::Duration::from_secs(1);
@@ -2827,6 +2966,12 @@ impl Engine {
         self.generation = self.generation.wrapping_add(1);
         self.pending_load = None;
         self.last_load_error = None;
+        self.prefetch_epoch = self.prefetch_epoch.wrapping_add(1);
+        self.prefetch_queue.clear();
+        self.prefetch_active_path = None;
+        // Virtual embedded IDs belong to a catalog, not globally to the app.
+        self.decoded_cache.clear();
+        self.decoded_cache_bytes = 0;
         *self
             .loaded_buffer
             .write()
@@ -2855,6 +3000,8 @@ impl Engine {
             .iter()
             .map(|entry| entry.buffer.memory_bytes())
             .sum();
+        let cache_budget = crate::memory::cache_budget(DECODE_CACHE_MAX_BYTES);
+        self.trim_decoded_cache(cache_budget);
         if let Some(index) = identity.as_ref().and_then(|identity| {
             self.decoded_cache
                 .iter()
@@ -2868,7 +3015,8 @@ impl Engine {
             self.decoded_cache_bytes = self
                 .decoded_cache_bytes
                 .saturating_sub(buffer.memory_bytes());
-            self.apply_loaded(path, generation, identity.take(), buffer);
+            let practice = request.region(&buffer);
+            self.apply_loaded(path, generation, identity.take(), buffer, Some(practice));
             return Ok(self.status());
         }
         self.pending_load = Some(PendingLoad {
@@ -2882,6 +3030,95 @@ impl Engine {
         }
         self.start_pending_decode();
         Ok(self.status())
+    }
+
+    /// Queue a look-ahead decode without touching the loaded track. Two
+    /// candidates can be pending: the running prefetch plus one waiting slot,
+    /// matching the sequential-next and random targets.
+    fn cmd_prefetch(&mut self, request: AudioLoadRequest) -> Result<bool, String> {
+        let path = request.key().to_string();
+        let identity = file_identity(request.identity_path());
+        if let Some(identity) = identity.as_ref() {
+            if self
+                .decoded_cache
+                .iter()
+                .any(|entry| decoded_cache_entry_matches(entry, &path, identity))
+            {
+                return Ok(true);
+            }
+        }
+        if self.prefetch_active_path.as_deref() == Some(path.as_str())
+            || self
+                .prefetch_queue
+                .iter()
+                .any(|pending| pending.request.key() == path)
+        {
+            return Ok(true);
+        }
+        if (self.prefetch_running || self.decode_running) && !self.prefetch_queue.is_empty() {
+            self.prefetch_queue.pop_front();
+        }
+        self.prefetch_queue.push_back(PendingPrefetch {
+            request,
+            identity,
+            epoch: self.prefetch_epoch,
+        });
+        self.start_next_prefetch();
+        Ok(true)
+    }
+
+    fn start_next_prefetch(&mut self) {
+        // Interactive loads and the current prefetch keep the single transient
+        // work slot; the queue is drained as soon as the engine is idle.
+        if self.prefetch_running || self.decode_running || self.pending_load.is_some() {
+            return;
+        }
+        let Some(pending) = self.prefetch_queue.pop_front() else {
+            return;
+        };
+        let PendingPrefetch {
+            request,
+            identity,
+            epoch,
+        } = pending;
+        self.prefetch_running = true;
+        self.prefetch_active_path = Some(request.key().to_string());
+        let tx = self.tx.clone();
+        if std::thread::Builder::new()
+            .name("olooper-prefetch".to_string())
+            .spawn(move || {
+                let result = request.decode();
+                let _ = tx.send(EngineCmd::PrefetchReady {
+                    epoch,
+                    request,
+                    identity,
+                    result,
+                });
+            })
+            .is_err()
+        {
+            self.prefetch_running = false;
+            self.prefetch_active_path = None;
+        }
+    }
+
+    fn cmd_prefetch_ready(
+        &mut self,
+        epoch: u64,
+        request: AudioLoadRequest,
+        identity: Option<FileIdentity>,
+        result: Result<LoopBuffer, String>,
+    ) {
+        self.prefetch_running = false;
+        self.prefetch_active_path = None;
+        if epoch == self.prefetch_epoch {
+            if let (Ok(buffer), Some(identity)) = (result, identity) {
+                if file_identity(request.identity_path()).as_ref() == Some(&identity) {
+                    self.cache_decoded(request.key().to_string(), identity, Arc::new(buffer));
+                }
+            }
+        }
+        self.start_next_prefetch();
     }
 
     fn start_pending_decode(&mut self) {
@@ -2941,7 +3178,8 @@ impl Engine {
             }
             Ok(buf) => buf,
         };
-        self.apply_loaded(path, generation, identity, Arc::new(buf));
+        let practice = request.region(&buf);
+        self.apply_loaded(path, generation, identity, Arc::new(buf), Some(practice));
     }
 
     fn apply_loaded(
@@ -2950,6 +3188,7 @@ impl Engine {
         generation: u64,
         identity: Option<FileIdentity>,
         buf: Arc<LoopBuffer>,
+        practice: Option<(u64, u64, bool)>,
     ) {
         let vol = self.pending_volume;
         let applied: Result<(String, u64, Arc<LoopBuffer>), String> = (|| {
@@ -2957,17 +3196,24 @@ impl Engine {
             p.sink = None; // hard stop of previous audio
             let original_buf = buf.clone();
             let total = buf.frames();
+            let (start_frame, end_frame, enabled) = practice
+                .and_then(|(start, end, enabled)| {
+                    let start = (start as usize).min(total);
+                    let end = (end as usize).min(total);
+                    (start < end).then_some((start, end, enabled))
+                })
+                .unwrap_or((0, total, true));
             p.track = Some(Loaded {
                 path,
                 generation,
                 buf,
                 original_buf,
-                start_frame: 0,
-                end_frame: total,
-                enabled: true,
+                start_frame,
+                end_frame,
+                enabled,
                 source: LoopSource::Manual,
-                resume_frame: 0,
-                cursor: Arc::new(AtomicUsize::new(0)),
+                resume_frame: start_frame,
+                cursor: Arc::new(AtomicUsize::new(start_frame)),
                 volume: vol,
                 speed: 1.0,
                 playback_speed: Arc::new(AtomicU32::new(1.0f32.to_bits())),
@@ -3015,6 +3261,7 @@ impl Engine {
     }
 
     fn cache_decoded(&mut self, path: String, identity: FileIdentity, buffer: Arc<LoopBuffer>) {
+        let budget = crate::memory::cache_budget(DECODE_CACHE_MAX_BYTES);
         self.decoded_cache.retain(|entry| entry.path != path);
         self.decoded_cache_bytes = self
             .decoded_cache
@@ -3022,11 +3269,12 @@ impl Engine {
             .map(|entry| entry.buffer.memory_bytes())
             .sum();
         let bytes = buffer.memory_bytes();
-        if bytes > DECODE_CACHE_MAX_BYTES {
+        self.trim_decoded_cache(budget);
+        if bytes > budget {
             return;
         }
         while self.decoded_cache.len() >= DECODE_CACHE_MAX_TRACKS
-            || self.decoded_cache_bytes.saturating_add(bytes) > DECODE_CACHE_MAX_BYTES
+            || self.decoded_cache_bytes.saturating_add(bytes) > budget
         {
             let Some(evicted) = self.decoded_cache.pop_front() else {
                 break;
@@ -3043,6 +3291,23 @@ impl Engine {
         });
     }
 
+    fn trim_decoded_cache(&mut self, budget: usize) {
+        while self.decoded_cache_bytes > budget {
+            let Some(evicted) = self.decoded_cache.pop_front() else {
+                break;
+            };
+            self.decoded_cache_bytes = self
+                .decoded_cache_bytes
+                .saturating_sub(evicted.buffer.memory_bytes());
+        }
+    }
+
+    fn maintain_caches(&mut self) {
+        self.trim_decoded_cache(crate::memory::cache_budget(DECODE_CACHE_MAX_BYTES));
+        crate::library::trim_source_cache();
+        self.start_next_prefetch();
+    }
+
     /// Swap in a stretched buffer only if track, speed, lock, and job all
     /// still match. Anything else means the user moved on → discard.
     fn cmd_pitch_ready(
@@ -3055,11 +3320,16 @@ impl Engine {
         let Some(p) = self.player.as_mut() else {
             return;
         };
+        p.pitch_worker_running = false;
         let Some(t) = p.track.as_mut() else {
             return;
         };
         if !pitch_job_current(t, track_generation, job, speed) {
-            return; // superseded → discard
+            if t.pitch_lock && t.pitch_pending {
+                t.pitch_pending = false;
+                p.request_stretch();
+            }
+            return;
         }
         if pitch_job_needs_replacement(t, speed) {
             // The running job is obsolete, but it was the only permitted
@@ -3191,6 +3461,17 @@ impl EngineClient {
         self.call(|reply| EngineCmd::Load { request, reply })
     }
 
+    /// Decode a look-ahead candidate into the shared decoded cache. Returns
+    /// whether it was queued or already cached; playback is never changed.
+    pub(crate) fn prefetch(&self, request: AudioLoadRequest) -> Result<bool, String> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.tx
+            .send(EngineCmd::Prefetch { request, reply: tx })
+            .map_err(|_| "audio engine stopped".to_string())?;
+        rx.recv_timeout(std::time::Duration::from_secs(5))
+            .map_err(|_| "audio engine did not acknowledge prefetch".to_string())?
+    }
+
     pub fn play(&self) -> Result<PlayerStatus, String> {
         self.call(|reply| EngineCmd::Play { reply })
     }
@@ -3236,9 +3517,19 @@ impl EngineClient {
     }
 
     pub fn set_loop_snapped(&self, start_ms: u64, end_ms: u64) -> Result<PlayerStatus, String> {
+        self.set_loop_snapped_for_generation(start_ms, end_ms, None)
+    }
+
+    pub fn set_loop_snapped_for_generation(
+        &self,
+        start_ms: u64,
+        end_ms: u64,
+        generation: Option<u64>,
+    ) -> Result<PlayerStatus, String> {
         self.call(|reply| EngineCmd::SetLoopSnapped {
             start_ms,
             end_ms,
+            generation,
             reply,
         })
     }
@@ -3273,6 +3564,9 @@ impl EngineClient {
         radius_frames: usize,
         max_points: usize,
     ) -> Result<super::SampleWindow, String> {
+        if !(1..=8192).contains(&max_points) || radius_frames > 192_000 {
+            return Err("sample window parameters exceed limits".into());
+        }
         let guard = self.loaded_buffer.read().map_err(|e| e.to_string())?;
         let (_, _, buf) = guard.as_ref().ok_or("nothing loaded")?;
         let total = buf.frames();
@@ -3330,18 +3624,21 @@ impl EngineClient {
         let snapped = snap_zero_crossing(buf, requested);
         // Compute discontinuity at the snapped boundary.
         let jump_amplitude = if snapped < total && requested < total {
-            (buf.samples[snapped] as f64 - buf.samples[requested] as f64).abs()
+            (frame_sample(buf, snapped) as f64 - frame_sample(buf, requested) as f64).abs()
         } else {
             0.0
         };
         let zero_crossing_found = snapped != requested
             || (snapped > 0
                 && snapped < total
-                && ((buf.samples[snapped - 1] as i32) * (buf.samples[snapped] as i32) <= 0));
+                && ((frame_sample(buf, snapped - 1) as i32) * (frame_sample(buf, snapped) as i32)
+                    <= 0));
         // Verify ordering after snap.
         let final_frame = match boundary {
             "start" => snapped.min(other_boundary_frame.saturating_sub(1)),
-            "end" => snapped.max(other_boundary_frame + 1).min(total),
+            "end" => snapped
+                .max(other_boundary_frame.saturating_add(1))
+                .min(total),
             _ => return Err("boundary must be \"start\" or \"end\"".to_string()),
         };
         let ms = if buf.rate > 0 {
@@ -3361,9 +3658,32 @@ impl EngineClient {
         &self,
         bpm: Option<f64>,
     ) -> Result<crate::autoloop::AutoLoopResult, String> {
+        if bpm.is_some_and(|bpm| !bpm.is_finite() || !(20.0..=300.0).contains(&bpm)) {
+            return Err("BPM override must be between 20 and 300".into());
+        }
+        static RUNNING: AtomicBool = AtomicBool::new(false);
+        if RUNNING.swap(true, Ordering::AcqRel) {
+            return Err("automatic loop analysis is already running".into());
+        }
+        struct Release;
+        impl Drop for Release {
+            fn drop(&mut self) {
+                RUNNING.store(false, Ordering::Release);
+            }
+        }
+        let _release = Release;
         let guard = self.loaded_buffer.read().map_err(|e| e.to_string())?;
         let (_, _, buf) = guard.as_ref().ok_or("nothing loaded")?;
-        Ok(crate::autoloop::suggest(buf, bpm))
+        let buffer = buf.clone();
+        let path = guard.as_ref().unwrap().0.clone();
+        let generation = guard.as_ref().unwrap().1;
+        drop(guard);
+        let result = crate::autoloop::suggest(&buffer, bpm);
+        let current = self.loaded_buffer.read().map_err(|e| e.to_string())?;
+        if !waveform_snapshot_current(&current, &path, generation) {
+            return Err("track changed during automatic loop analysis".into());
+        }
+        Ok(result)
     }
 
     pub fn waveform_peaks(
