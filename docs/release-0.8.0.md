@@ -8,8 +8,11 @@
   looper/playlist/library reanalysis with protection for confirmed and file BPMs.
 - Compact 44 px library rows, single-line BPM, smaller loop names, and the
   My Library / Discover switcher in the collection-pane header.
-- Native macOS Preferences (`⌘,`) and an optional idle-cover display with a
-  persistent wait-time selector (1–60 minutes, five-minute default).
+- Native macOS Preferences (`⌘,`) and an idle-cover display enabled by default
+  after two minutes, with a persistent 1–60 minute selector and an off switch.
+- SWF/EXE import defaults to playback from the original source, with no audio
+  extraction or source copy. Previously saved choices and linked-folder options
+  remain respected.
 - Next/Random prefetch, MIDI map files/presets, bounded decoding/import memory,
   persistent waveform-cache limits, library recovery and startup-quote centering.
 
@@ -41,7 +44,7 @@ Regression coverage includes stale-tag interleaving, CUE writes followed by
 reanalysis, snapshot serialization, root-switch layout-effect events, Player BPM
 provenance, 2,000 same-time progress attempts, and disabled-hook resource cleanup.
 
-Local pre-publication checks: 103 frontend tests; 242 Rust tests passed and four
+Local pre-publication checks: 104 frontend tests; 242 Rust tests passed and four
 fixture tests ignored; TypeScript, Rustfmt and Clippy clean. pnpm audit found no
 known vulnerabilities; the OSV host graph audit found zero actionable advisories
 across 368 registry packages (six maintenance notices). A focused regression also
@@ -52,6 +55,8 @@ reopens the library between manual confirmation and stale-tag read.
 - Catalog schema v11 migrates automatically; previous app versions cannot open
   the upgraded catalog. Keep the same app version on machines sharing a library.
 - Build requirements: Node 24, pnpm 12.9.1, Rust >=1.89. End users do not need them.
+- Windows app/test executables both embed Common Controls v6; this resolves
+  loader startup failures uncovered by the new IPC test harness in Windows CI.
 - macOS Universal 2 (deployment target 11.0) and Windows x64 packages are built
   from the release tag in GitHub Actions. macOS package is unsigned/unnotarized.
 - DOC-A07 remains a conditional synthetic delayed-click case requiring native

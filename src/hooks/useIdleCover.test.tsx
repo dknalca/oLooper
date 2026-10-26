@@ -19,7 +19,7 @@ beforeEach(() => {
 });
 afterEach(() => { cleanup(); vi.useRealTimers(); vi.restoreAllMocks(); });
 
-it("waits exactly five minutes and does not reset on unrelated renders", async () => {
+it("waits exactly the default two minutes and does not reset on unrelated renders", async () => {
   const view = render(<Harness />);
   await advance(IDLE_COVER_DELAY_MS - 1);
   view.rerender(<Harness />);
@@ -32,11 +32,11 @@ it("waits exactly five minutes and does not reset on unrelated renders", async (
 
 it("local activity restarts the deadline without a render per movement", async () => {
   render(<Harness />);
-  await advance(299000);
+  await advance(IDLE_COVER_DELAY_MS - 1000);
   fireEvent.pointerMove(window);
   await advance(1000);
   expect(screen.getByLabelText("Phase").textContent).toBe("hidden");
-  await advance(299000);
+  await advance(IDLE_COVER_DELAY_MS - 1000);
   expect(screen.getByLabelText("Phase").textContent).toBe("visible");
 });
 
@@ -47,7 +47,7 @@ it("disabled, paused and modal states cannot enter; resuming starts a full new p
   view.rerender(<Harness eligible={false} />);
   await advance(600000);
   view.rerender(<Harness />);
-  await advance(299999);
+  await advance(IDLE_COVER_DELAY_MS - 1);
   expect(screen.getByLabelText("Phase").textContent).toBe("hidden");
   view.rerender(<Harness modal />);
   await act(async () => {});
@@ -55,13 +55,13 @@ it("disabled, paused and modal states cannot enter; resuming starts a full new p
   expect(screen.getByLabelText("Phase").textContent).toBe("hidden");
   view.rerender(<Harness />);
   await act(async () => {});
-  await advance(300000);
+  await advance(IDLE_COVER_DELAY_MS);
   expect(screen.getByLabelText("Phase").textContent).toBe("visible");
 });
 
 it("the first click wakes without activating an underlying button, even with instant exit", async () => {
   render(<Harness />);
-  await advance(300000);
+  await advance(IDLE_COVER_DELAY_MS);
   const button = screen.getByRole("button");
   fireEvent.pointerDown(button, { pointerId: 1 });
   fireEvent.pointerUp(button, { pointerId: 1 });
@@ -77,7 +77,7 @@ it("wake keys and autorepeat never reach transport handlers until released", asy
   render(<Harness />);
   const transport = vi.fn();
   window.addEventListener("keydown", transport);
-  await advance(300000);
+  await advance(IDLE_COVER_DELAY_MS);
   fireEvent.keyDown(window, { code: "Space", key: " " });
   fireEvent.keyDown(window, { code: "Space", key: " ", repeat: true });
   expect(transport).not.toHaveBeenCalled();
@@ -89,12 +89,12 @@ it("wake keys and autorepeat never reach transport handlers until released", asy
 
 it("blur and library switches dismiss and invalidate the old deadline", async () => {
   const view = render(<Harness />);
-  await advance(300000);
+  await advance(IDLE_COVER_DELAY_MS);
   fireEvent.blur(window);
   expect(screen.getByLabelText("Phase").textContent).toBe("hidden");
   await advance(600000);
   fireEvent.focus(window);
-  await advance(299999);
+  await advance(IDLE_COVER_DELAY_MS - 1);
   expect(screen.getByLabelText("Phase").textContent).toBe("hidden");
   view.rerender(<Harness scopeKey={1} />);
   await advance(1);
@@ -109,7 +109,7 @@ it("does not cover a held pointer or an active drag", async () => {
   await advance(300001);
   expect(screen.getByLabelText("Phase").textContent).toBe("hidden");
   fireEvent.pointerUp(window, { pointerId: 1 });
-  await advance(300000);
+  await advance(IDLE_COVER_DELAY_MS);
   expect(screen.getByLabelText("Phase").textContent).toBe("visible");
 });
 

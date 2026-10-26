@@ -450,8 +450,12 @@ mod tests {
         let folder = lib.link_folder(sources.path(), true, false).unwrap();
         let id =
             super::super::tests::add_test_looper_track(&lib, library.path(), "missing", "hash");
-        lib.record_folder_source(&format!("{}/old.swf", folder.path), "hash", true)
-            .unwrap();
+        lib.record_folder_source(
+            Path::new(&folder.path).join("old.swf").to_str().unwrap(),
+            "hash",
+            true,
+        )
+        .unwrap();
         std::fs::remove_file(lib.get_track(id).unwrap().unwrap().file_path).unwrap();
         lib.conn
             .execute(
@@ -471,8 +475,12 @@ mod tests {
         let folder = lib.link_folder(sources.path(), true, false).unwrap();
         let id =
             super::super::tests::add_test_looper_track(&lib, library.path(), "missing", "hash");
-        lib.record_folder_source(&format!("{}/old.swf", folder.path), "hash", true)
-            .unwrap();
+        lib.record_folder_source(
+            Path::new(&folder.path).join("old.swf").to_str().unwrap(),
+            "hash",
+            true,
+        )
+        .unwrap();
         let missing = library.path().join("deleted-looper").join("loop.wav");
         lib.conn
             .execute(

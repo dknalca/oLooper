@@ -55,7 +55,7 @@ it("persists an empty imported folder so it can discover loopers on a later resc
   vi.mocked(scanLooperFolder).mockResolvedValue([]);
   render(<ImportBar onImported={vi.fn()} />);
   await act(async () => { window.dispatchEvent(new CustomEvent("olooper:import-command", { detail: "import-folder" })); });
-  expect(libraryLinkFolder).toHaveBeenCalledWith("/sources", true, false);
+  expect(libraryLinkFolder).toHaveBeenCalledWith("/sources", false, false);
   expect(importLinkedFileAndWait).not.toHaveBeenCalled();
 });
 
@@ -64,4 +64,17 @@ it("opens the linked source folders requested from a looper or missing-audio pro
   await act(async () => { window.dispatchEvent(new CustomEvent("olooper:rescan-source-folder", { detail: "source-hash" })); });
   expect(librarySourceFolders).toHaveBeenCalledWith("source-hash");
   expect(screen.getByRole("dialog").textContent).toContain("/sources");
+});
+
+it("focuses source playback by default and leaves source copying unchecked", async () => {
+  vi.mocked(pickDirectory).mockResolvedValue("/sources");
+  vi.mocked(scanLooperFolder).mockResolvedValue(["/sources/one.swf"]);
+  vi.mocked(importLinkedFileAndWait).mockResolvedValue({ looper: "One", added: 1, already_there: 0, failed: [], track_ids: [1] });
+  render(<ImportBar onImported={vi.fn()} />);
+  await act(async () => { window.dispatchEvent(new CustomEvent("olooper:import-command", { detail: "import-folder" })); });
+  const source = screen.getByRole("button", { name: "Play from source (no extraction)" });
+  expect(document.activeElement).toBe(source);
+  expect((screen.getByRole("checkbox") as HTMLInputElement).checked).toBe(false);
+  await act(async () => { fireEvent.click(source); });
+  expect(libraryLinkFolder).toHaveBeenCalledWith("/sources", false, false);
 });

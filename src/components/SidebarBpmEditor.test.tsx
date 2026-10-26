@@ -71,7 +71,7 @@ it("double-clicking BPM focuses its editor without playback and never applies a 
   await open();
   expect(document.activeElement).toBe(input());
   expect(input().value).toBe("98");
-  expect(screen.getByRole("button", { name: "Detected · 100 BPM" })).toBeTruthy();
+  expect(await screen.findByRole("button", { name: "Detected · 100 BPM" })).toBeTruthy();
   expect(libraryAnalyzeBpm).toHaveBeenCalledExactlyOnceWith(1);
   expect(playerLoadTrack).not.toHaveBeenCalled();
   expect(playerPlay).not.toHaveBeenCalled();
@@ -102,7 +102,7 @@ it("ratios have a stable base and save only the explicit selected tempo", async 
   fireEvent.click(screen.getByRole("button", { name: "Half · 50 BPM" }));
   fireEvent.click(screen.getByRole("button", { name: "Half · 50 BPM" }));
   expect(input().value).toBe("50");
-  fireEvent.click(screen.getByRole("button", { name: "Detected · 100 BPM" }));
+  fireEvent.click(await screen.findByRole("button", { name: "Detected · 100 BPM" }));
   expect(input().value).toBe("100");
   fireEvent.click(screen.getByRole("button", { name: "Double · 200 BPM" }));
   expect(input().value).toBe("200");
@@ -117,7 +117,7 @@ it("same-value ×1 is manual confirmation, and embedded tracks never sync tags",
   vi.mocked(libraryUpdateMetadata).mockResolvedValue(track({ bpm: 100, audio_storage: "embedded", bpm_source: "manual", bpm_confidence: null }));
   render(<Fixture />);
   await open();
-  fireEvent.click(screen.getByRole("button", { name: "Detected · 100 BPM" }));
+  fireEvent.click(await screen.findByRole("button", { name: "Detected · 100 BPM" }));
   await act(async () => { fireEvent.click(screen.getByRole("button", { name: "Save metadata" })); });
   expect(libraryUpdateMetadata).toHaveBeenCalledWith(1, "Beat", 100, "", true);
   expect(librarySyncSeratoMetadata).not.toHaveBeenCalled();
@@ -169,7 +169,7 @@ it("closing and reopening the same track rejects the old session's response", as
   fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
   await open();
   await act(async () => { old(suggestion({ bpm: 140 })); });
-  expect(screen.getByRole("button", { name: "Detected · 100 BPM" })).toBeTruthy();
+  expect(await screen.findByRole("button", { name: "Detected · 100 BPM" })).toBeTruthy();
   expect(input().value).toBe("98");
 });
 
@@ -223,7 +223,7 @@ it("a pending or failed save preserves the selected draft and disables ratio con
   vi.mocked(libraryUpdateMetadata).mockImplementationOnce(() => new Promise((_, reject) => { fail = reject; }));
   render(<Fixture />);
   await open();
-  fireEvent.click(screen.getByRole("button", { name: "Double · 200 BPM" }));
+  fireEvent.click(await screen.findByRole("button", { name: "Double · 200 BPM" }));
   fireEvent.click(screen.getByRole("button", { name: "Save metadata" }));
   expect(screen.getByRole("group", { name: "Tempo options" }).hasAttribute("disabled")).toBe(true);
   await act(async () => { fail(new Error("cannot save metadata")); });

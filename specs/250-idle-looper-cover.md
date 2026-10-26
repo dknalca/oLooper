@@ -13,7 +13,7 @@ ventana de oLooper, sin interrumpir la reproducción.
 ## Comportamiento solicitado
 
 1. Si la opción está activada y transcurre el **retraso elegido en minutos** sin
-   interacción dentro de la ventana (cinco minutos por defecto), la carátula del
+   interacción dentro de la ventana (dos minutos por defecto), la carátula del
    looper que está sonando se amplía hasta ocupar toda la ventana de la app.
 2. Al mover el ratón dentro de la ventana, la carátula se encoge y vuelve a su
    posición habitual, recuperando la vista normal.
@@ -25,8 +25,8 @@ ventana de oLooper, sin interrumpir la reproducción.
 ## Estado de implementación
 
 - Preferencias generales en el menú macOS (`Preferences…`, `⌘,`), `TopBar` y
-  `AppPreferencesDialog`, desactivado por defecto y persistido con `appPreferences.ts`.
-- Contador configurable en minutos (cinco por defecto) en `useIdleCover`, con estados de transición,
+  `AppPreferencesDialog`, activado por defecto y persistido con `appPreferences.ts`.
+- Contador configurable en minutos (dos por defecto) en `useIdleCover`, con estados de transición,
   actividad local, foco, modales y protección frente a gestos de despertar.
 - `IdleCoverScreensaver` precarga y valida la imagen, conserva la última portada
   mientras llega una nueva y descarta respuestas de otro looper/biblioteca.
@@ -44,9 +44,9 @@ implementada utiliza estas decisiones:
 
 | Tema | Propuesta para la primera versión |
 | --- | --- |
-| Estado inicial | Desactivado, para que la nueva vista sea optativa. |
+| Estado inicial | Activado con espera de dos minutos; respetar elecciones guardadas. |
 | Preferencia | Global para la app, persistente entre reinicios y cambios de biblioteca. |
-| Tiempo | Persistir 1, 2, 3, 5, 10, 15, 20, 30, 45 o 60 minutos. Predeterminado: 5 minutos (`300000` ms). |
+| Tiempo | Persistir 1, 2, 3, 5, 10, 15, 20, 30, 45 o 60 minutos. Predeterminado: 2 minutos (`120000` ms). |
 | Cuándo puede aparecer | App visible y con foco, reproducción activa, biblioteca lista y carátula válida de la pista que realmente suena. |
 | Pausa o stop | Cerrar la vista y cancelar el contador. Al reanudar, comenzar el retraso elegido de nuevo. |
 | Sin carátula | Conservar la vista normal; no ampliar el logotipo ni el placeholder `No cover`. |
@@ -99,14 +99,14 @@ La opción usa una clave específica de `localStorage`:
 ```ts
 const IDLE_COVER_KEY = "olooper.appearance.idle-cover-enabled";
 const IDLE_COVER_DELAY_KEY = "olooper.appearance.idle-cover-delay-minutes";
-const DEFAULT_IDLE_COVER_DELAY_MINUTES = 5;
+const DEFAULT_IDLE_COVER_DELAY_MINUTES = 2;
 const IDLE_COVER_DELAY_OPTIONS_MINUTES = [1, 2, 3, 5, 10, 15, 20, 30, 45, 60];
 ```
 
 Reglas:
 
 1. Guardar exclusivamente `"true"` o `"false"`.
-2. Si falta la clave o el contenido es inválido, usar `false`.
+2. Si falta la clave, usar `true`; un valor guardado inválido se trata como `false`.
 3. Leer y escribir con `try/catch`: un almacenamiento no disponible no debe
    impedir arrancar la app ni cambiar la opción durante la sesión.
 4. Mantener el valor efectivo en un único estado de `App`; el diálogo lo recibe
@@ -121,7 +121,7 @@ Texto actual de la interfaz, en inglés:
 - Sección: `Appearance`.
 - Checkbox: `Show looper cover after inactivity`.
 - A wait-time selector offers 1, 2, 3, 5, 10, 15, 20, 30, 45, or 60 minutes;
-  default is five minutes. The selector is disabled when the cover is off.
+  default is two minutes. The selector is disabled when the cover is off.
 - Ayuda: `Move the pointer inside the window to return to the player.`
 
 El checkbox debe tener un `<label>` asociado. El diálogo debe usar
@@ -153,7 +153,7 @@ interface IdleCoverInputs {
   canEnter: boolean;
   canRemainVisible: boolean;
   libraryGeneration: number;
-  delayMs?: number; // configurable; 300000 ms por defecto; injectable en pruebas.
+  delayMs?: number; // configurable; 120000 ms por defecto; injectable en pruebas.
 }
 ```
 
@@ -349,7 +349,7 @@ restaurándolos al terminar. Las pruebas de comportamiento deben cubrir:
 
 | Caso | Resultado esperado |
 | --- | --- |
-| Preferencia ausente, inválida o almacenamiento inaccesible | Estado inicial desactivado y app utilizable. |
+| Preferencia ausente o almacenamiento inaccesible | Activado con espera de dos minutos y app utilizable; un valor inválido explícito desactiva. |
 | Preferencia guardada | Se restaura; si falla el guardado, el cambio de sesión sigue aplicado. |
 | Opción apagada | No aparece aunque se avance más de 60 minutos. |
 | Opción encendida y reproducción elegible | No aparece antes del retraso elegido; aparece al alcanzarlo. |
@@ -379,7 +379,7 @@ resumido en `Estado de implementación` y en la revisión de auditoría enlazada
 
 - [ ] Elegir un retraso corto (por ejemplo, un minuto), activarlo, reproducir un
   looper con portada y verificar el momento de entrada; comprobar también el
-  valor predeterminado de cinco minutos.
+  valor predeterminado de dos minutos.
 - [ ] Mover el ratón dentro de la ventana: se encoge hacia la carátula original.
 - [ ] Repetir con ventana redimensionada y con el puntero inicialmente fuera.
 - [ ] Probar clic, rueda, Escape, Espacio y R: el primer gesto solo sale; el

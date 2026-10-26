@@ -1,6 +1,6 @@
 export const IDLE_COVER_KEY = "olooper.appearance.idle-cover-enabled";
 export const IDLE_COVER_DELAY_KEY = "olooper.appearance.idle-cover-delay-minutes";
-export const DEFAULT_IDLE_COVER_DELAY_MINUTES = 5;
+export const DEFAULT_IDLE_COVER_DELAY_MINUTES = 2;
 export const IDLE_COVER_DELAY_OPTIONS_MINUTES = [1, 2, 3, 5, 10, 15, 20, 30, 45, 60] as const;
 export const IDLE_COVER_DELAY_MS = DEFAULT_IDLE_COVER_DELAY_MINUTES * 60 * 1000;
 
@@ -28,8 +28,10 @@ export function idleCoverDelayMs(minutes: number): number {
 }
 
 export function readIdleCoverEnabled(): boolean {
-  try { return localStorage.getItem(IDLE_COVER_KEY) === "true"; }
-  catch { return false; }
+  try {
+    const stored = localStorage.getItem(IDLE_COVER_KEY);
+    return stored === null || stored === "true";
+  } catch { return true; }
 }
 
 export function saveIdleCoverEnabled(enabled: boolean): string | null {

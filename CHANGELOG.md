@@ -15,9 +15,11 @@
 - Estimate 4/4 looper tempo from canonical PCM duration and expose a read-only
   per-track suggestion. Metadata editing offers stable Half/Detected/Double
   choices; double-clicking a library BPM opens the editor without playing the row.
-- Add an optional looper-cover screensaver after a configurable period of
-  window-local inactivity (five-minute default); choose a delay from 1 to 60
+- Add a looper-cover screensaver after a configurable period of
+  window-local inactivity (enabled by default after two minutes); choose a delay from 1 to 60
   minutes in Preferences. The app menu opens Preferences with ⌘, on macOS.
+- Default SWF/EXE imports to source playback without extracting audio or copying
+  the looper. Extraction and source copying remain explicit choices.
 - Fix manual BPM/tag synchronization races; CUE writes no longer turn automatic
   estimates into protected tags. Playback metadata preserves BPM provenance and
   confidence, and stale root/generation events cannot update another library.

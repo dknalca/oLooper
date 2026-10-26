@@ -492,7 +492,7 @@ export async function importLinkedFileAndWait(folder: LinkedFolder, path: string
   } finally { waiter.cancel(); }
 }
 
-export function importSwf(path: string, jobId = importJobId(), extractAudio = true, copySource = copyContainerOnImport()): Promise<string> {
+export function importSwf(path: string, jobId = importJobId(), extractAudio = false, copySource = copyContainerOnImport()): Promise<string> {
   return invoke<string>("import_swf", { path, jobId, extractAudio, copySource });
 }
 
@@ -550,7 +550,7 @@ function waitForImportDone(jobId: string, timeoutMs = 30 * 60 * 1000): {
 export async function importSwfAndWait(
   path: string,
   jobId = importJobId(),
-  extractAudio = true,
+  extractAudio = false,
   copySource = copyContainerOnImport(),
 ): Promise<ImportReport> {
   const waiter = waitForImportDone(jobId);
@@ -568,7 +568,7 @@ export async function importSwfAndWait(
   throw new Error("import finished without a report");
 }
 
-export function importExe(path: string, jobId = importJobId(), extractAudio = true, copySource = copyContainerOnImport()): Promise<string> {
+export function importExe(path: string, jobId = importJobId(), extractAudio = false, copySource = copyContainerOnImport()): Promise<string> {
   return invoke<string>("import_exe", { path, jobId, extractAudio, copySource });
 }
 
@@ -579,7 +579,7 @@ export function importExe(path: string, jobId = importJobId(), extractAudio = tr
 export async function importExeAndWait(
   path: string,
   jobId = importJobId(),
-  extractAudio = true,
+  extractAudio = false,
   copySource = copyContainerOnImport(),
 ): Promise<ImportReport> {
   const waiter = waitForImportDone(jobId);

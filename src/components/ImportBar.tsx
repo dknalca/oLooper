@@ -68,7 +68,7 @@ export default function ImportBar({ onImported }: Props) {
   const chooseContainerMode = (paths: string[], folder?: string): Promise<ContainerImportOptions | null> => {
     const count = paths.filter((path) => ["swf", "exe"].includes(importKindForPath(path))).length;
     const copySource = copySourcePreference(localStorage.getItem("olooper.import.copy-source"));
-    if (count === 0) return Promise.resolve({ mode: "extract", copySource });
+    if (count === 0) return Promise.resolve({ mode: "embedded", copySource });
     setPromptCopySource(copySource);
     return new Promise((resolve) => setModePrompt({ count, folder, resolve }));
   };
@@ -593,8 +593,8 @@ export default function ImportBar({ onImported }: Props) {
               <span>Copy SWF/EXE loopers to the library<span className="mt-1 block text-[10px] text-text-secondary">Applies to this import. Without a copy, source playback needs the original files to remain in place. Extracted audio is always stored in the library.</span></span>
             </label>
             <div className="mt-4 flex flex-col gap-2">
+              <button onClick={() => { modePrompt.resolve({ mode: "embedded", copySource: promptCopySource }); setModePrompt(null); }} className="rounded border border-accent bg-accent/10 px-3 py-2 text-left text-xs text-text hover:bg-accent/20">Play from source (no extraction)</button>
               <button onClick={() => { modePrompt.resolve({ mode: "extract", copySource: promptCopySource }); setModePrompt(null); }} className="rounded border border-border bg-elevated px-3 py-2 text-left text-xs text-text hover:border-accent">Extract audio</button>
-              <button onClick={() => { modePrompt.resolve({ mode: "embedded", copySource: promptCopySource }); setModePrompt(null); }} className="rounded border border-border bg-elevated px-3 py-2 text-left text-xs text-text hover:border-accent">Play from source (no extraction)</button>
               <button onClick={() => { modePrompt.resolve(null); setModePrompt(null); }} className="dialog-close self-end">Cancel import</button>
             </div>
           </div>
