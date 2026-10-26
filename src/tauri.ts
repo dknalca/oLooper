@@ -33,6 +33,8 @@ export interface PlayerStatus {
   pitch_error: string | null;
   /** A background decode is running; previous audio (if any) still live. */
   loading: boolean;
+  /** Prepared automatic Random target awaiting the current loop's endpoint. */
+  boundary_pending?: boolean;
   load_error: string | null;
   /** Frame-precise values for internal use. */
   position_frame: number;
@@ -53,8 +55,12 @@ export function playerLoad(path: string): Promise<PlayerStatus> {
   return invoke<PlayerStatus>("player_load", { path });
 }
 
-export function playerLoadTrack(trackId: number): Promise<PlayerStatus> {
-  return invoke<PlayerStatus>("player_load_library_track", { id: trackId });
+export function playerLoadTrack(trackId: number, atLoopEnd = false): Promise<PlayerStatus> {
+  return invoke<PlayerStatus>("player_load_library_track", { id: trackId, atLoopEnd });
+}
+
+export function playerCancelBoundaryLoad(): Promise<PlayerStatus> {
+  return invoke("player_cancel_boundary_load");
 }
 
 /** Decode a likely next track into the audio cache without switching playback. */

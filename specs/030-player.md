@@ -57,8 +57,9 @@ Waveform rendering and library integration are separate specs.
     `Preparing pitch lock…` while those jobs run.
 12. Practice time accumulates only while audio is playing and can be reset
      from the top bar. Optional random mode switches to another playable local
-     library track at 2-minute, 5-minute, or custom (1–1440 minute) intervals;
-     the timer repeats until disabled and avoids the current track when possible.
+      library track at the complete loop ending nearest its 2-minute, 5-minute,
+      or custom (1–1440 minute) target interval (spec 290). The timer repeats until
+      disabled and avoids the current track when possible.
      A **Next random** button immediately switches to another playable local
      library track and restarts the interval when timed random mode is enabled.
 13. The waveform shows the current track name in its upper-left corner.
@@ -120,7 +121,8 @@ Waveform rendering and library integration are separate specs.
 - Timed Random and the Random button invoke one shared action/controller with
   the latest library scope. Changing scope updates the next choice without
   restarting the countdown. A manual change restarts the countdown after it
-  completes; overlapping triggers share one in-flight load. Both paths show the
+   completes; manual Random supersedes a timed boundary wait, while overlapping
+   manual triggers share one in-flight load. Both paths show the
   same errors and start the next full interval after completion, including a
   failed attempt. Disabling the timer prevents further automatic changes.
 

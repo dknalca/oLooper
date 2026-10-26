@@ -4,6 +4,11 @@
 
 ## 0.8.0
 
+- Align automatic Random changes to the complete loop ending nearest the chosen
+  interval, accounting for current region, position and pitch (59 s at 2 min →
+  1:58). Native prepared handoff avoids cutting the lap; manual Random/R remains
+  immediate, and pausing freezes the countdown.
+
 - Remember imported source folders and their import options. Rescan from Folder,
   a looper menu, or a missing-audio prompt to discover new/changed containers and
   remove only missing audio entries, retaining surviving extracted loops/copies.

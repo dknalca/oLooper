@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { startPolling } from "../poll";
-import { createRandomPlayback } from "../randomPlayback";
+import { createRandomPlayback, type RandomSwitchOptions } from "../randomPlayback";
 import {
   libraryGetSeratoMetadata,
   librarySetSeratoCue,
@@ -37,7 +37,7 @@ interface Props {
   playbackPath?: string | null;
   trackOpenGeneration: number;
   canRandom: boolean;
-  onRandomTrack: () => Promise<void>;
+  onRandomTrack: (request?: RandomSwitchOptions) => Promise<boolean | void>;
   canNavigateTracks: boolean;
   onPreviousTrack: () => void;
   onNextTrack: () => void;
@@ -62,7 +62,7 @@ export default function Player({ status: st, trackId, audioStorage, playbackPath
   const randomActionRef = useRef(onRandomTrack);
   randomActionRef.current = onRandomTrack;
   const [randomPlayback] = useState(() => createRandomPlayback({
-    action: () => randomActionRef.current(),
+    action: (request) => randomActionRef.current(request),
     onRemaining: setRandomRemaining,
     onSuccess: () => setError(null),
     onError: (cause) => setError(`Random track: ${String(cause)}`),
@@ -74,6 +74,8 @@ export default function Player({ status: st, trackId, audioStorage, playbackPath
     randomPlayback.configure(randomEnabled && canRandom && validInterval ? minutes * 60_000 : null);
     return () => randomPlayback.configure(null);
   }, [randomEnabled, canRandom, validInterval, minutes, randomPlayback]);
+
+  useEffect(() => { randomPlayback.updatePlayback(st); }, [st, randomPlayback]);
 
   useEffect(() => {
     const random = () => { if (canRandom) void randomPlayback.trigger(); };
@@ -513,7 +515,7 @@ export default function Player({ status: st, trackId, audioStorage, playbackPath
             onClick={() => setRandomEnabled((enabled) => !enabled)}
             disabled={!canRandom || (!randomEnabled && !validInterval)}
             aria-pressed={randomEnabled}
-            title="Run Random automatically at this interval, using the current looper or All tracks"
+            title="Change at the loop ending closest to this interval; manual Random remains immediate"
             className={`rounded px-2 py-1 text-[10px] font-medium transition-colors disabled:opacity-30 ${randomEnabled ? "bg-success/20 text-success" : "bg-border text-text-secondary hover:text-text"}`}
           >
             {randomEnabled ? "Random ON" : "Random OFF"}

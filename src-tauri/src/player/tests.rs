@@ -17,6 +17,139 @@ fn cursor() -> Arc<AtomicUsize> {
 }
 
 #[test]
+fn armed_boundary_switch_finishes_all_channels_before_notifying_once() {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let gate = Arc::new(BoundaryGate {
+        request: std::sync::atomic::AtomicU64::new(42),
+        tx,
+    });
+    let buffer = Arc::new(LoopBuffer {
+        samples: vec![10, 11, 20, 21, 30, 31],
+        channels: 2,
+        rate: 1000,
+    });
+    let mut source = LoopRegion::new(buffer, 0, 0, 3, true, cursor());
+    source.boundary_gate = Some(gate);
+    assert_eq!(
+        source.by_ref().collect::<Vec<_>>(),
+        vec![10, 11, 20, 21, 30, 31]
+    );
+    assert!(matches!(
+        rx.try_recv().unwrap(),
+        EngineCmd::LoopBoundaryReached { generation: 42 }
+    ));
+    assert_eq!(source.next(), None);
+    assert!(rx.try_recv().is_err());
+}
+
+#[test]
+fn cancelling_boundary_switch_keeps_the_original_loop_running() {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let gate = Arc::new(BoundaryGate {
+        request: std::sync::atomic::AtomicU64::new(42),
+        tx,
+    });
+    let mut source = LoopRegion::new(mono(vec![10, 20, 30]), 0, 0, 3, true, cursor());
+    source.boundary_gate = Some(gate.clone());
+    assert_eq!(source.next(), Some(10));
+    gate.request.store(0, Ordering::Release);
+    assert_eq!(source.take(5).collect::<Vec<_>>(), vec![20, 30, 10, 20, 30]);
+    assert!(rx.try_recv().is_err());
+}
+
+#[test]
+fn cancelling_a_boundary_decode_discards_its_late_completion_without_audio_hardware() {
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let mut engine = Engine::new(Arc::new(std::sync::RwLock::new(None)), tx);
+    let request = AudioLoadRequest::file("next".into(), "missing.wav".into()).at_loop_end(true);
+    engine.pending_load = Some(PendingLoad {
+        generation: 2,
+        path: "next".into(),
+        request: request.clone(),
+        identity: None,
+    });
+    engine.decode_running = true;
+    engine.cancel_boundary_load();
+    engine.cmd_load_ready(
+        2,
+        "next".into(),
+        request,
+        None,
+        Ok((*mono(vec![1, 2])).clone()),
+    );
+    assert!(!engine.status().loaded);
+    assert!(!engine.status().loading);
+    assert!(!engine.status().boundary_pending);
+    assert!(engine.status().load_error.is_none());
+}
+
+#[test]
+fn prepared_audio_is_committed_only_after_the_mixer_reaches_the_old_loop_end() {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (controller, mut mixer) = rodio::dynamic_mixer::mixer::<f32>(2, 1000);
+    let mut track = loaded_for_pitch();
+    track.buf = mono(vec![100; 8]);
+    track.original_buf = track.buf.clone();
+    track.speed = 1.0;
+    track.pitch_lock = false;
+    track.pitch_pending = false;
+    track.boundary_gate = Arc::new(BoundaryGate {
+        request: std::sync::atomic::AtomicU64::new(0),
+        tx: tx.clone(),
+    });
+    let mut player = Player {
+        _output_stream: None,
+        stream_generation: 1,
+        output_device_name: "synthetic".into(),
+        output_error: None,
+        output_mixer: controller,
+        output_channels: 2,
+        output_sample_rate: 1000,
+        first_channel: 0,
+        output_meter: Arc::new(OutputMeter::default()),
+        sink: None,
+        metronome_sink: None,
+        metronome_bpm: None,
+        output_test_sink: None,
+        output_test_resume_playback: false,
+        output_test_resume_metronome: false,
+        track: Some(track),
+        tx: tx.clone(),
+        pitch_seq: 0,
+        pitch_worker_running: false,
+    };
+    player.play().unwrap();
+    let mut engine = Engine::new(Arc::new(std::sync::RwLock::new(None)), tx);
+    engine.player = Some(player);
+    engine.complete_decoded_load(
+        AudioLoadRequest::file("next".into(), "synthetic-next.wav".into()).at_loop_end(true),
+        8,
+        None,
+        mono(vec![200; 8]),
+    );
+    assert_eq!(engine.status().path.as_deref(), Some("/a.wav"));
+    assert!(engine.status().boundary_pending);
+    // Neither an obsolete callback nor UI polling is allowed to commit it.
+    engine.commit_boundary_load(6);
+    assert_eq!(engine.status().path.as_deref(), Some("/a.wav"));
+    let mut reached = None;
+    for _ in 0..1000 {
+        mixer.next();
+        if let Ok(EngineCmd::LoopBoundaryReached { generation }) = rx.try_recv() {
+            reached = Some(generation);
+            break;
+        }
+    }
+    assert_eq!(reached, Some(8));
+    engine.commit_boundary_load(reached.unwrap());
+    let status = engine.status();
+    assert_eq!(status.path.as_deref(), Some("next"));
+    assert!(!status.boundary_pending);
+    assert!(status.playing);
+    assert_eq!(status.position_frame, 0);
+}
+
+#[test]
 fn routes_stereo_source_to_selected_multichannel_pair() {
     let mut frame = [1.0f32; 8];
     map_stereo_frame(
@@ -785,6 +918,10 @@ fn loaded_for_pitch() -> Loaded {
         volume: 0.8,
         speed: 1.2,
         playback_speed: Arc::new(AtomicU32::new(1.2f32.to_bits())),
+        boundary_gate: Arc::new(BoundaryGate {
+            request: std::sync::atomic::AtomicU64::new(0),
+            tx: std::sync::mpsc::channel().0,
+        }),
         pitch_lock: true,
         pitch_pending: true,
         pitch_job: 3,

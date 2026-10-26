@@ -29,6 +29,7 @@ import {
   midiDisconnect,
   midiSetLed,
   playerLoadTrack,
+  playerCancelBoundaryLoad,
   playerPause,
   playerPlay,
   playerPrefetch,
@@ -48,6 +49,7 @@ import { normalizeStereoPair } from "./audioOutputPreferences";
 import { copySourcePreference } from "./importFlow";
 import { midiEncoderDirection } from "./midiLibraryNavigation";
 import { takeRandomCandidate, type RandomCandidate } from "./randomCandidate";
+import type { RandomSwitchOptions } from "./randomPlayback";
 import { MIDI_MAP_STORAGE_KEY, readMidiMaps, type MidiBindings } from "./midiMaps";
 
 type TrackNavigator = (direction: -1 | 1) => void;
@@ -245,41 +247,52 @@ export default function App() {
     setPlayerStatus((current) => current ? { ...current, loading: true } : current);
   }, []);
 
-  const playRandomTrack = useCallback(async () => {
+  const playRandomTrack = useCallback(async (request?: RandomSwitchOptions) => {
+    if (request?.signal?.aborted) return;
     const generation = ++randomLoadGeneration.current;
-    const scope = libraryView === "local" ? randomScopeHash : null;
-    const key = `${libraryGeneration}|${libraryView}|${scope ?? ""}`;
-    const prepared = randomCandidate.current;
-    randomCandidate.current = null;
-    const track = takeRandomCandidate(prepared, key, activeTrackId)
-      ?? await libraryRandomTrack(activeTrackId, scope);
-    if (!track) throw new Error("No playable tracks in the current selection");
-    if (generation !== randomLoadGeneration.current) return;
+    let admitted = false;
+    const cancelQueued = () => { if (admitted) void playerCancelBoundaryLoad().catch(() => {}); };
+    request?.signal?.addEventListener("abort", cancelQueued);
+    try {
+      const scope = libraryView === "local" ? randomScopeHash : null;
+      const key = `${libraryGeneration}|${libraryView}|${scope ?? ""}`;
+      const prepared = randomCandidate.current;
+      randomCandidate.current = null;
+      const track = takeRandomCandidate(prepared, key, activeTrackId)
+        ?? await libraryRandomTrack(activeTrackId, scope);
+      if (!track) throw new Error("No playable tracks in the current selection");
+      if (generation !== randomLoadGeneration.current || request?.signal?.aborted) return;
 
-    let status = await playerLoadTrack(track.id);
-    if (generation !== randomLoadGeneration.current) return;
-    setPlayerStatus(status);
-    const deadline = Date.now() + 120_000;
-    while (status.loading && Date.now() < deadline) {
-      await new Promise((resolve) => window.setTimeout(resolve, 150));
-      if (generation !== randomLoadGeneration.current) return;
-      status = await getPlayerStatus();
+      let status = request?.atLoopEnd ? await playerLoadTrack(track.id, true) : await playerLoadTrack(track.id);
+      admitted = true;
+      if (request?.signal?.aborted) status = await playerCancelBoundaryLoad();
       if (generation !== randomLoadGeneration.current) return;
       setPlayerStatus(status);
-    }
-    if (generation !== randomLoadGeneration.current) return;
-    if (status.loading) throw new Error("Random track load timed out");
-    if (status.load_error) throw new Error(status.load_error);
-    if (status.path !== track.playback_path) return;
-    const playing = await playerPlay();
-    if (generation !== randomLoadGeneration.current) return;
-    setActiveTrackId(track.id);
-    setActiveTrack(track);
-    setPlayerStatus(playing);
-    setTrackOpenGeneration((current) => current + 1);
-    window.dispatchEvent(new CustomEvent("olooper:reveal-library-track", {
-      detail: { trackId: track.id, sourceHash: track.source_hash, preserveCollection: true },
-    }));
+      const deadline = Date.now() + 120_000;
+      while ((status.loading || status.boundary_pending) && Date.now() < deadline) {
+        await new Promise((resolve) => window.setTimeout(resolve, 150));
+        if (generation !== randomLoadGeneration.current) return;
+        status = await getPlayerStatus();
+        if (generation !== randomLoadGeneration.current) return;
+        setPlayerStatus(status);
+      }
+      if (generation !== randomLoadGeneration.current) return;
+      if (status.loading || status.boundary_pending) {
+        if (request?.atLoopEnd) await playerCancelBoundaryLoad();
+        throw new Error("Random track load timed out");
+      }
+      if (status.load_error) throw new Error(status.load_error);
+      if (status.path !== track.playback_path) return false;
+      const playing = request?.atLoopEnd ? status : await playerPlay();
+      if (generation !== randomLoadGeneration.current) return;
+      setActiveTrackId(track.id);
+      setActiveTrack(track);
+      setPlayerStatus(playing);
+      setTrackOpenGeneration((current) => current + 1);
+      window.dispatchEvent(new CustomEvent("olooper:reveal-library-track", {
+        detail: { trackId: track.id, sourceHash: track.source_hash, preserveCollection: true },
+      }));
+    } finally { request?.signal?.removeEventListener("abort", cancelQueued); }
   }, [activeTrackId, libraryGeneration, libraryView, randomScopeHash]);
 
   // Prepare the next random target while the current loop plays, so button,

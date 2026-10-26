@@ -634,6 +634,7 @@ pub fn run() {
             inspect_exe,
             player_load,
             player_load_library_track,
+            player_cancel_boundary_load,
             player_prefetch,
             player_unload,
             audio_output_devices,
@@ -724,14 +725,20 @@ fn player_load(path: String, audio: Audio<'_>) -> Result<player::PlayerStatus, S
 #[tauri::command(async)]
 fn player_load_library_track(
     id: i64,
+    at_loop_end: Option<bool>,
     audio: Audio<'_>,
     database: Db<'_>,
 ) -> Result<player::PlayerStatus, String> {
     let guard = db(&database)?;
     let request = require_lib(&guard)?.playback_request(id)?;
-    let result = audio.load_request(request);
+    let result = audio.load_request(request.at_loop_end(at_loop_end.unwrap_or(false)));
     drop(guard);
     result
+}
+
+#[tauri::command]
+fn player_cancel_boundary_load(audio: Audio<'_>) -> Result<player::PlayerStatus, String> {
+    audio.cancel_boundary_load()
 }
 
 /// Warm the decoded cache for a likely next track without changing playback.

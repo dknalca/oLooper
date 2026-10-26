@@ -2,6 +2,11 @@
 
 ## Highlights
 
+- Updated 0.8.0 build: automatic Random changes at the complete lap ending nearest
+  the chosen interval, including earlier endings (59-second loop at 2 minutes →
+  1:58). It accounts for practice regions/position and pitch, pauses the countdown
+  while paused, and keeps manual Random/R immediate. The native engine commits
+  prepared audio only after the previous loop finishes.
 - Linked recursive SWF/EXE folders and manual rescans; preserve surviving
   extracted audio and managed copies while removing only missing dependencies.
 - Duration-aware 4/4 BPM suggestions, Half/Detected/Double editing, and cancellable
@@ -44,7 +49,7 @@ Regression coverage includes stale-tag interleaving, CUE writes followed by
 reanalysis, snapshot serialization, root-switch layout-effect events, Player BPM
 provenance, 2,000 same-time progress attempts, and disabled-hook resource cleanup.
 
-Local pre-publication checks: 104 frontend tests; 242 Rust tests passed and four
+Updated-build checks: 112 frontend tests; 246 Rust tests passed and four
 fixture tests ignored; TypeScript, Rustfmt and Clippy clean. pnpm audit found no
 known vulnerabilities; the OSV host graph audit found zero actionable advisories
 across 368 registry packages (six maintenance notices). A focused regression also

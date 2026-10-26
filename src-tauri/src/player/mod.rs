@@ -75,6 +75,13 @@ pub struct LoopRegion {
     /// Current frame, mirrored for UI polling.
     cursor: Arc<AtomicUsize>,
     speed_control: Arc<AtomicU32>,
+    boundary_gate: Option<Arc<BoundaryGate>>,
+    boundary_finished: bool,
+}
+
+struct BoundaryGate {
+    request: std::sync::atomic::AtomicU64,
+    tx: std::sync::mpsc::Sender<EngineCmd>,
 }
 
 impl LoopRegion {
@@ -96,6 +103,8 @@ impl LoopRegion {
             enabled,
             cursor,
             speed_control: Arc::new(AtomicU32::new(1.0f32.to_bits())),
+            boundary_gate: None,
+            boundary_finished: false,
         };
         s.cursor.store(from, Ordering::Relaxed);
         s
@@ -111,11 +120,25 @@ impl Iterator for LoopRegion {
     type Item = i16;
 
     fn next(&mut self) -> Option<i16> {
+        if self.boundary_finished {
+            return None;
+        }
         let ch = self.buf.channels.max(1) as usize;
         if self.end_frame <= self.start_frame {
             return None;
         }
         let mut frame = self.position.floor() as usize;
+        if frame >= self.end_frame {
+            if let Some(gate) = &self.boundary_gate {
+                let generation = gate.request.swap(0, Ordering::AcqRel);
+                if generation != 0 {
+                    self.boundary_finished = true;
+                    self.cursor.store(self.end_frame, Ordering::Relaxed);
+                    let _ = gate.tx.send(EngineCmd::LoopBoundaryReached { generation });
+                    return None;
+                }
+            }
+        }
         if self.enabled {
             if frame >= self.end_frame {
                 let length = (self.end_frame - self.start_frame) as f64;
@@ -1199,6 +1222,7 @@ struct Loaded {
     speed: f32,
     /// Shared with the live source so speed changes take effect immediately.
     playback_speed: Arc<AtomicU32>,
+    boundary_gate: Arc<BoundaryGate>,
     pitch_lock: bool,
     /// A WSOLA worker is stretching `original_buf` at `pitch_job_speed`.
     /// Playback continues untouched on the current buffer meanwhile.
@@ -1225,8 +1249,10 @@ impl Loaded {
         enabled: bool,
         cursor: Arc<AtomicUsize>,
     ) -> LoopRegion {
-        LoopRegion::new(buf, from_frame, start_frame, end_frame, enabled, cursor)
-            .with_speed_control(self.playback_speed.clone())
+        let mut region = LoopRegion::new(buf, from_frame, start_frame, end_frame, enabled, cursor)
+            .with_speed_control(self.playback_speed.clone());
+        region.boundary_gate = Some(self.boundary_gate.clone());
+        region
     }
 }
 
@@ -1299,6 +1325,7 @@ pub(crate) struct AudioLoadRequest {
     key: String,
     source: AudioLoadSource,
     practice: Option<(u64, u64, bool)>,
+    at_loop_end: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -1320,6 +1347,7 @@ impl AudioLoadRequest {
             key,
             source: AudioLoadSource::File { path },
             practice: None,
+            at_loop_end: false,
         }
     }
 
@@ -1339,6 +1367,7 @@ impl AudioLoadRequest {
                 source_hash,
             },
             practice: None,
+            at_loop_end: false,
         }
     }
 
@@ -1348,6 +1377,11 @@ impl AudioLoadRequest {
 
     pub(crate) fn with_practice(mut self, start: u64, end: u64, enabled: bool) -> Self {
         self.practice = Some((start, end, enabled));
+        self
+    }
+
+    pub(crate) fn at_loop_end(mut self, enabled: bool) -> Self {
+        self.at_loop_end = enabled;
         self
     }
 
@@ -2396,6 +2430,7 @@ impl Player {
                     pitch_preparing: t.pitch_pending,
                     pitch_error: t.pitch_error.clone(),
                     loading: false,
+                    boundary_pending: false,
                     load_error: None,
                     position_frame: position,
                     loop_start_frame: t.start_frame,
@@ -2431,6 +2466,8 @@ pub struct PlayerStatus {
     pub pitch_error: Option<String>,
     /// A background decode is running; previous audio (if any) still live.
     pub loading: bool,
+    /// Decoded next audio is waiting for the current source's final frame.
+    pub boundary_pending: bool,
     pub load_error: Option<String>,
     /// Frame-precise values for internal use.
     pub position_frame: usize,
@@ -2464,6 +2501,7 @@ impl PlayerStatus {
             pitch_preparing: false,
             pitch_error: None,
             loading: false,
+            boundary_pending: false,
             load_error: None,
             position_frame: 0,
             loop_start_frame: 0,
@@ -2496,6 +2534,7 @@ pub struct Engine {
     generation: u64,
     loaded_buffer: std::sync::Arc<std::sync::RwLock<LoadedSnapshot>>,
     pending_load: Option<PendingLoad>,
+    boundary_ready: Option<BoundaryLoad>,
     /// A decode worker is currently running. Requests received while it runs
     /// replace `pending_load`; only the newest one starts next.
     decode_running: bool,
@@ -2511,11 +2550,25 @@ pub struct Engine {
     prefetch_epoch: u64,
 }
 
+struct BoundaryLoad {
+    generation: u64,
+    source_generation: u64,
+    request: AudioLoadRequest,
+    identity: Option<FileIdentity>,
+    buffer: Arc<LoopBuffer>,
+}
+
 type Reply = std::sync::mpsc::Sender<Result<PlayerStatus, String>>;
 
 /// Internal commands. `pub(crate)` only because the type appears in
 /// `pub(crate)` constructors; never sent across the Tauri boundary.
 pub(crate) enum EngineCmd {
+    LoopBoundaryReached {
+        generation: u64,
+    },
+    CancelBoundaryLoad {
+        reply: Reply,
+    },
     Load {
         request: AudioLoadRequest,
         reply: Reply,
@@ -2634,6 +2687,7 @@ impl Engine {
             generation: 0,
             loaded_buffer,
             pending_load: None,
+            boundary_ready: None,
             decode_running: false,
             last_load_error: None,
             decoded_cache: VecDeque::new(),
@@ -2662,6 +2716,7 @@ impl Engine {
             |p| p.status(),
         );
         st.loading = self.pending_load.is_some();
+        st.boundary_pending = self.boundary_ready.is_some();
         st.load_error = self.last_load_error.clone();
         st
     }
@@ -2683,7 +2738,27 @@ impl Engine {
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
             };
+            if matches!(
+                &cmd,
+                EngineCmd::Pause { .. }
+                    | EngineCmd::Stop { .. }
+                    | EngineCmd::Seek { .. }
+                    | EngineCmd::SetLoop { .. }
+                    | EngineCmd::SetLoopSnapped { .. }
+                    | EngineCmd::SetLoopEnabled { .. }
+                    | EngineCmd::SetSpeed { .. }
+                    | EngineCmd::SetPitchLock { .. }
+            ) {
+                self.cancel_boundary_load();
+            }
             match cmd {
+                EngineCmd::LoopBoundaryReached { generation } => {
+                    self.commit_boundary_load(generation)
+                }
+                EngineCmd::CancelBoundaryLoad { reply } => {
+                    self.cancel_boundary_load();
+                    let _ = reply.send(Ok(self.status()));
+                }
                 // Worker completions carry no reply: they were requested
                 // by an earlier command whose reply already went out.
                 EngineCmd::LoadReady {
@@ -2963,6 +3038,7 @@ impl Engine {
     }
 
     fn cmd_unload(&mut self) -> Result<(), String> {
+        self.cancel_boundary_load();
         self.generation = self.generation.wrapping_add(1);
         self.pending_load = None;
         self.last_load_error = None;
@@ -2985,6 +3061,7 @@ impl Engine {
     /// Start a background decode and return a loading status instantly.
     /// Previous audio keeps playing until a valid buffer arrives.
     fn cmd_load_request(&mut self, request: AudioLoadRequest) -> Result<PlayerStatus, String> {
+        self.cancel_boundary_load();
         let path = request.key().to_string();
         self.generation += 1;
         let generation = self.generation;
@@ -3015,8 +3092,7 @@ impl Engine {
             self.decoded_cache_bytes = self
                 .decoded_cache_bytes
                 .saturating_sub(buffer.memory_bytes());
-            let practice = request.region(&buffer);
-            self.apply_loaded(path, generation, identity.take(), buffer, Some(practice));
+            self.complete_decoded_load(request, generation, identity.take(), buffer);
             return Ok(self.status());
         }
         self.pending_load = Some(PendingLoad {
@@ -3178,8 +3254,102 @@ impl Engine {
             }
             Ok(buf) => buf,
         };
-        let practice = request.region(&buf);
-        self.apply_loaded(path, generation, identity, Arc::new(buf), Some(practice));
+        self.complete_decoded_load(request, generation, identity, Arc::new(buf));
+    }
+
+    fn cancel_boundary_load(&mut self) {
+        self.boundary_ready = None;
+        if self
+            .pending_load
+            .as_ref()
+            .is_some_and(|pending| pending.request.at_loop_end)
+        {
+            self.pending_load = None;
+        }
+        if let Some(track) = self
+            .player
+            .as_ref()
+            .and_then(|player| player.track.as_ref())
+        {
+            track.boundary_gate.request.store(0, Ordering::Release);
+        }
+    }
+
+    fn complete_decoded_load(
+        &mut self,
+        request: AudioLoadRequest,
+        generation: u64,
+        identity: Option<FileIdentity>,
+        buffer: Arc<LoopBuffer>,
+    ) {
+        if request.at_loop_end {
+            let Some(player) = self.player.as_ref() else {
+                return;
+            };
+            let Some(track) = player.track.as_ref() else {
+                return;
+            };
+            if !player
+                .sink
+                .as_ref()
+                .is_some_and(|sink| !sink.is_paused() && !sink.empty())
+            {
+                return;
+            }
+            self.boundary_ready = Some(BoundaryLoad {
+                generation,
+                source_generation: track.generation,
+                request,
+                identity,
+                buffer,
+            });
+            track
+                .boundary_gate
+                .request
+                .store(generation, Ordering::Release);
+        } else {
+            let practice = request.region(&buffer);
+            self.apply_loaded(
+                request.key().into(),
+                generation,
+                identity,
+                buffer,
+                Some(practice),
+            );
+        }
+    }
+
+    fn commit_boundary_load(&mut self, generation: u64) {
+        let current_source = self
+            .player
+            .as_ref()
+            .and_then(|player| player.track.as_ref())
+            .map(|track| track.generation);
+        if !self.boundary_ready.as_ref().is_some_and(|ready| {
+            ready.generation == generation && Some(ready.source_generation) == current_source
+        }) {
+            return;
+        }
+        let ready = self.boundary_ready.take().expect("checked queued load");
+        if file_identity(ready.request.identity_path()) != ready.identity {
+            self.last_load_error = Some("queued audio changed before the loop ended".into());
+        } else {
+            let practice = ready.request.region(&ready.buffer);
+            self.apply_loaded(
+                ready.request.key().into(),
+                generation,
+                ready.identity,
+                ready.buffer,
+                Some(practice),
+            );
+        }
+        // The old region exhausted at its endpoint. Start the prepared source
+        // on the engine thread, without waiting for a WebView status poll.
+        if let Some(player) = self.player.as_mut() {
+            if let Err(error) = player.play() {
+                self.last_load_error = Some(error);
+            }
+        }
     }
 
     fn apply_loaded(
@@ -3191,6 +3361,10 @@ impl Engine {
         practice: Option<(u64, u64, bool)>,
     ) {
         let vol = self.pending_volume;
+        let boundary_gate = Arc::new(BoundaryGate {
+            request: std::sync::atomic::AtomicU64::new(0),
+            tx: self.tx.clone(),
+        });
         let applied: Result<(String, u64, Arc<LoopBuffer>), String> = (|| {
             let p = self.ensure()?;
             p.sink = None; // hard stop of previous audio
@@ -3217,6 +3391,7 @@ impl Engine {
                 volume: vol,
                 speed: 1.0,
                 playback_speed: Arc::new(AtomicU32::new(1.0f32.to_bits())),
+                boundary_gate,
                 pitch_lock: false,
                 pitch_pending: false,
                 pitch_job: 0,
@@ -3486,6 +3661,10 @@ impl EngineClient {
 
     pub fn unload(&self) -> Result<PlayerStatus, String> {
         self.call(|reply| EngineCmd::Unload { reply })
+    }
+
+    pub fn cancel_boundary_load(&self) -> Result<PlayerStatus, String> {
+        self.call(|reply| EngineCmd::CancelBoundaryLoad { reply })
     }
 
     pub fn set_volume(&self, volume_pct: f32) -> Result<PlayerStatus, String> {
