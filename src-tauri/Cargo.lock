@@ -2707,6 +2707,7 @@ dependencies = [
  "base64 0.22.1",
  "cpal",
  "dispatch",
+ "embed-resource",
  "flate2",
  "fs2",
  "id3",
