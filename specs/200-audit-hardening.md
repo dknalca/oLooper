@@ -3,32 +3,45 @@
 Resource and mutation constraints are recorded in ADR 0022. Executed checks and
 the remaining on-device release checks are tracked in
 [`docs/audit-validation-2026-10-25.md`](../docs/audit-validation-2026-10-25.md).
-Two newly reproduced BPM/tag and root-scoped progress races are recorded as open
-follow-up findings in [`docs/documentation-review-2026-10-26.md`](../docs/documentation-review-2026-10-26.md).
-The follow-up also records source-less BPM event provenance, full-snapshot
-progress-event cost, and idle-cover observers while disabled.
+The historical follow-up findings DOC-A01–DOC-A06 in
+[`docs/documentation-review-2026-10-26.md`](../docs/documentation-review-2026-10-26.md)
+were corrected before v0.8.0; see [`docs/release-0.8.0.md`](../docs/release-0.8.0.md).
 
 ## Library identity and persistence
 
 - A library switch invalidates selection/decode generations, clears UI state
   bound to old catalog IDs, and unloads the old audio source.
+  Sidebar track-load completions also check the owning library generation,
+  including when two libraries contain the same numeric ID and playback path.
+- Library init/restore requests use a shared admission generation: only the
+  newest request admitted by the backend may activate its catalog and log.
+  If that request fails, the previous active library remains selected; older
+  in-flight requests cannot become active. The UI ignores superseded results.
 - Long-running library work captures the selected root before moving to a
   blocking worker; it must never apply old track IDs to a newly selected DB.
 - Every extracted source group has a collision-resistant managed directory.
   Staged audio writes and user exports never overwrite an existing destination.
-- Cancellation before catalog insertion removes the staged audio file.
+- Cancellation or a progress-callback panic immediately before catalog
+  insertion attempts to remove the staged audio file; filesystem cleanup errors
+  may leave it behind. Once insertion has begun, a panic may have committed the
+  track and cleanup must not assume otherwise.
 - Metadata-only edits preserve BPM provenance. A user edit or Tap Tempo action
   explicitly confirms the numeric BPM, including when the value is unchanged;
   Serato sync writes that confirmed BPM without replacing preserved CUEs or loops.
-  This is the intended invariant. The ordinary metadata-only regression passes,
-  but the follow-up audit reproduced a tag-read/sync interleaving that can violate
-  it; see DOC-A01.
+  This includes the stale-tag/sync interleaving recorded as DOC-A01.
 - Metadata, tag and removal writes are serialized per library with an exclusive
   file lease plus an in-process mutex. Concurrent updates to different CUE slots
   must both persist, and a second process must not mutate the same library.
 - Deletion quarantine is recorded in a durable manifest before the database row
   is removed. Reopening a library restores a pending clean-shutdown removal,
   purges completed ones, and rejects manifest paths outside the library.
+  Cleanup is non-recursive: unexpected quarantine entries are retained and
+  reported instead of being deleted. Move them aside before retrying recovery.
+  Staged symlinks are restored as links without following them, including when
+  their targets are missing; an existing destination, even a dangling symlink,
+  is never deliberately overwritten.
+  Staging, rollback and recovery use no-replace filesystem moves; an unsupported
+  operation fails safely instead of falling back to overwriting a destination.
 
 ## Audio engine
 
@@ -55,8 +68,12 @@ progress-event cost, and idle-cover observers while disabled.
   use no-clobber commits.
 - Parsers, network downloads, container decompression and decode use bounded
   reads with cancellation checks, and heavy work runs outside synchronous IPC
-  handlers under the shared working budget. A failed import job cannot terminate
-  the worker or hide the partial report.
+  handlers under the shared working budget. An ordinary import failure retains
+  its partial report, including a track inserted before a later BPM update
+  fails. An unexpected worker panic emits an error and retains completed custom
+  or Tablist results and the last available container report. The in-progress
+  item may already have committed without reaching a checkpoint, so the partial
+  report is not guaranteed to list every committed track.
 - Window/analysis IPC inputs are validated before allocation, division or
   indexing, so invalid sizes return an error instead of panicking.
 - The frontend baseline remains macOS 11 / Safari 14.1; styles use Tailwind 3

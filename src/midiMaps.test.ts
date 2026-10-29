@@ -84,4 +84,72 @@ describe("MIDI map presets", () => {
     }));
     expect(restored.bindings).toEqual(bindings);
   });
+
+  it("preserves only the first valid legacy assignment when controls collide", () => {
+    const state = readMidiMaps(storage({ "olooper.midi.bindings": JSON.stringify({
+      "play-pause": bindings["play-pause"],
+      stop: { ...bindings["play-pause"] },
+      next: { inputId: "other", inputName: "Other", kind: "note", channel: 1, number: 60 },
+    }) }));
+    expect(state.bindings["play-pause"]).toEqual(bindings["play-pause"]);
+    expect(state.bindings.stop).toBeUndefined();
+    expect(state.bindings.next?.inputId).toBe("other");
+  });
+
+  it("rejects malformed saved presets and recovers valid legacy bindings", () => {
+    const state = readMidiMaps(storage({
+      [MIDI_MAP_STORAGE_KEY]: JSON.stringify({ version: 1, activeName: "Unknown", presets: [], bindings: {} }),
+      "olooper.midi.bindings": JSON.stringify(bindings),
+    }));
+    expect(state.activeName).toBe("Custom_map");
+    expect(state.bindings).toEqual(bindings);
+  });
+
+  it("does not confuse note and CC controls or channels at the same address", () => {
+    const portable = document({ bindings: {
+      stop: { kind: "note", channel: 1, number: 127 },
+      next: { kind: "cc", channel: 1, number: 127 },
+      previous: { kind: "note", channel: 16, number: 127 },
+    } });
+    expect(Object.keys(importMidiMap(portable).bindings)).toHaveLength(3);
+  });
+
+  it("ignores machine-local identifiers in portable maps", () => {
+    const imported = importMidiMap(document({ bindings: {
+      stop: { kind: "note", channel: 1, number: 0, inputId: "old-id", inputName: "old device" },
+    } }));
+    expect(imported.bindings.stop).toEqual({ inputId: "", inputName: "Unassigned input", kind: "note", channel: 1, number: 0 });
+  });
+
+  it("enforces the import limit in UTF-8 bytes rather than character count", () => {
+    const text = document({ padding: "é".repeat(33_000) });
+    expect(text.length).toBeLessThan(64 * 1024);
+    expect(() => importMidiMap(text)).toThrow("64 KiB");
+  });
+
+  it("returns defaults if both current and legacy storage reads fail", () => {
+    const result = readMidiMaps({ getItem: () => { throw new Error("unavailable"); } });
+    expect(result.activeName).toBe("Custom_map");
+    expect(result.bindings).toEqual({});
+    expect(result.presets).toHaveLength(3);
+  });
+
+  it("rejects duplicate saved preset names and restores legacy mappings", () => {
+    const repeated = { name: "Duplicate", bindings: {} };
+    const state = readMidiMaps(storage({
+      [MIDI_MAP_STORAGE_KEY]: JSON.stringify({ version: 1, activeName: "Duplicate", presets: [repeated, repeated], bindings: {} }),
+      "olooper.midi.bindings": JSON.stringify(bindings),
+    }));
+    expect(state.activeName).toBe("Custom_map");
+    expect(state.bindings).toEqual(bindings);
+  });
+
+  it("ignores legacy bindings without local input identity", () => {
+    const state = readMidiMaps(storage({ "olooper.midi.bindings": JSON.stringify({
+      stop: { kind: "note", channel: 1, number: 60 },
+      next: bindings["play-pause"],
+    }) }));
+    expect(state.bindings.stop).toBeUndefined();
+    expect(state.bindings.next).toEqual(bindings["play-pause"]);
+  });
 });

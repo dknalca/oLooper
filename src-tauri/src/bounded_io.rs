@@ -1,13 +1,43 @@
 use std::io::Read;
 
+/// Open first without waiting for FIFO writers, then validate that descriptor.
+pub(crate) fn open_regular(path: impl AsRef<std::path::Path>) -> std::io::Result<std::fs::File> {
+    open_regular_with_access(path.as_ref(), false)
+}
+
+/// Open an existing regular file for in-place metadata updates.
+pub(crate) fn open_regular_for_update(
+    path: impl AsRef<std::path::Path>,
+) -> std::io::Result<std::fs::File> {
+    open_regular_with_access(path.as_ref(), true)
+}
+
+fn open_regular_with_access(path: &std::path::Path, write: bool) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(write);
+    // Opening a FIFO for reading can otherwise block before we can inspect it.
+    // O_NONBLOCK has no effect on ordinary files; inspect the opened descriptor
+    // rather than a path that could be replaced between inspection and opening.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "input is not a regular file",
+        ));
+    }
+    Ok(file)
+}
+
 /// Inspect and read the same regular descriptor, including a growth cap.
 pub(crate) fn read(path: impl AsRef<std::path::Path>, maximum: u64) -> Result<Vec<u8>, String> {
-    let file = std::fs::File::open(path).map_err(|e| format!("cannot open file: {e}"))?;
+    let file = open_regular(path).map_err(|e| format!("cannot open file: {e}"))?;
     let metadata = file.metadata().map_err(|e| e.to_string())?;
     let limit = maximum.min(crate::memory::working_budget(maximum as usize) as u64);
-    if !metadata.is_file() {
-        return Err("input is not a regular file".into());
-    }
     if metadata.len() > limit {
         return Err(format!(
             "file exceeds the current input budget ({limit} bytes)"
@@ -88,5 +118,27 @@ mod tests {
         let mut bytes = Vec::new();
         assert!(read_into(std::io::repeat(0), &mut bytes, 3).is_err());
         assert_eq!(bytes.len(), 4);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_fifo_without_waiting_for_a_writer() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("input");
+        let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: name is a valid, NUL-terminated path in the temporary directory.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(read(path, 1024));
+        });
+        let result = receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("opening a FIFO must not wait for a writer");
+        assert!(result.unwrap_err().contains("not a regular file"));
     }
 }

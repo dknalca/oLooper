@@ -24,6 +24,11 @@ Status: implemented in the unreleased working tree.
   dependency parent aborts reconciliation before catalog removal. Unix volume
   identity is checked so an unmounted volume's empty mount point is not treated
   as an empty source folder. Windows relies on normal filesystem access errors.
+- Before pruning or relocating tracks, a second enumeration must match the
+  first list of SWF/EXE paths; otherwise the scan aborts and can be retried.
+  Size and modification time (also device/inode on Unix) are checked around
+  hashing and again before pruning. This does not detect every in-place content
+  change or filesystem race, including changes that preserve those attributes.
 - Reconciliation never deletes physical files. The missing-audio dialog's separate
   manual **Remove this track** action retains normal explicit removal semantics.
 
@@ -39,6 +44,10 @@ Status: implemented in the unreleased working tree.
   but remain retryable. A folder imported with older builds can be linked by
   importing it once again; copied historical containers alone cannot recover their
   former external folder.
+- When a source belongs to multiple linked folders, their associations commit
+  together. If association fails after tracks were committed, the final import
+  event includes both the error and the partial report; a previous import error
+  is retained too. Already imported tracks and original sources remain intact.
 - Commands: `library_link_folder`, `library_linked_folders`,
   `library_source_folders`, `library_rescan_folder`, `import_linked_file`.
 - `LinkedFolder`: `id`, `path`, `extract_audio`, `copy_source`, `library_root`.
@@ -64,6 +73,8 @@ missing individual audio and playlist cleanup, deleted subdirectories, missing
 roots, Unix device mismatch, embedded relocation and avoiding re-creation of
 deleted audio. Frontend coverage exercises folder selection, root-pinned imports,
 empty folder persistence, error reporting and the missing extracted-audio action.
+An injected SQLite failure checks association rollback across nested folders and
+preservation of committed import reports; the frontend counts those partial results.
 
 Native Finder/disconnected-drive UX and Windows volume behavior still require
 manual platform validation; automated tests do not constitute device validation.

@@ -2,8 +2,8 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { copySourcePreference } from "./importFlow";
 
-// Typed Tauri command contracts. All backend access goes through here;
-// components must not import @tauri-apps/api directly.
+// Typed Tauri command and dialog contracts live here. ImportBar is the one
+// exception: it owns the webview drag/drop subscription directly.
 
 export interface AppStatus {
   version: string;

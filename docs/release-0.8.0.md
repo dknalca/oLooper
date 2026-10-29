@@ -63,7 +63,8 @@ reopens the library between manual confirmation and stale-tag read.
 - Windows app/test executables both embed Common Controls v6; this resolves
   loader startup failures uncovered by the new IPC test harness in Windows CI.
 - macOS Universal 2 (deployment target 11.0) and Windows x64 packages are built
-  from the release tag in GitHub Actions. macOS package is unsigned/unnotarized.
+  from the release tag in GitHub Actions. macOS package is intentionally
+  unsigned/unnotarized; first-launch Gatekeeper instructions are in the README.
 - DOC-A07 remains a conditional synthetic delayed-click case requiring native
   WebKit/touch validation. Physical audio/MIDI routing, long-running performance,
   Big Sur and additional hardware acceptance remain separate from automated CI.

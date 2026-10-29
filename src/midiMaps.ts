@@ -30,23 +30,30 @@ export function midiMapName(value: unknown): string {
   return value.trim();
 }
 
+function midiInteger(value: unknown, min: number, max: number): value is number {
+  return typeof value === "number" && Number.isInteger(value) && value >= min && value <= max;
+}
+
+function parseAssignment(action: string, raw: unknown, portable: boolean): MidiBinding {
+  if (!ACTIONS.includes(action as MidiAction) || !record(raw)
+    || (raw.kind !== "note" && raw.kind !== "cc")
+    || !midiInteger(raw.channel, 1, 16) || !midiInteger(raw.number, 0, 127)
+    || (!portable && (typeof raw.inputId !== "string" || typeof raw.inputName !== "string"))) {
+    throw new Error(`Invalid MIDI assignment: ${action}.`);
+  }
+  return {
+    inputId: portable ? "" : raw.inputId as string,
+    inputName: portable ? "Unassigned input" : raw.inputName as string,
+    kind: raw.kind, channel: raw.channel, number: raw.number,
+  };
+}
+
 function parseBindings(value: unknown, portable = false): MidiBindings {
   if (!record(value)) throw new Error("Invalid MIDI bindings.");
   const bindings: MidiBindings = {};
   const controls = new Set<string>();
   for (const [action, raw] of Object.entries(value)) {
-    if (!ACTIONS.includes(action as MidiAction) || !record(raw)
-      || (raw.kind !== "note" && raw.kind !== "cc")
-      || !Number.isInteger(raw.channel) || Number(raw.channel) < 1 || Number(raw.channel) > 16
-      || !Number.isInteger(raw.number) || Number(raw.number) < 0 || Number(raw.number) > 127
-      || (!portable && (typeof raw.inputId !== "string" || typeof raw.inputName !== "string"))) {
-      throw new Error(`Invalid MIDI assignment: ${action}.`);
-    }
-    const binding: MidiBinding = {
-      inputId: portable ? "" : raw.inputId as string,
-      inputName: portable ? "Unassigned input" : raw.inputName as string,
-      kind: raw.kind, channel: raw.channel as number, number: raw.number as number,
-    };
+    const binding = parseAssignment(action, raw, portable);
     const key = `${binding.inputId}:${binding.kind}:${binding.channel}:${binding.number}`;
     if (controls.has(key)) throw new Error("A MIDI control cannot be assigned to multiple actions.");
     controls.add(key);
@@ -78,29 +85,23 @@ export function importMidiMap(text: string): { name: string; bindings: MidiBindi
   return { name: midiMapName(value.name), bindings: parseBindings(value.bindings, true) };
 }
 
-export function readMidiMaps(storage: Pick<Storage, "getItem">): MidiMapState {
-  const initial: MidiMapState = {
-    version: 1, activeName: "Custom_map", bindings: {},
-    presets: BUILTIN_MAPS.map((map) => importMidiMap(JSON.stringify(map))),
-  };
-  try {
-    const text = storage.getItem(MIDI_MAP_STORAGE_KEY);
-    if (text) {
-      const value: unknown = JSON.parse(text);
-      if (!record(value) || value.version !== 1 || !Array.isArray(value.presets)) throw new Error("Invalid presets.");
-      const presets = value.presets.map((preset: unknown) => {
-        if (!record(preset)) throw new Error("Invalid preset.");
-        return { name: midiMapName(preset.name), bindings: parseBindings(preset.bindings) };
-      });
-      if (new Set(presets.map((preset) => preset.name)).size !== presets.length) throw new Error("Duplicate presets.");
-      for (const preset of initial.presets) {
-        if (!presets.some((existing) => existing.name === preset.name)) presets.push(preset);
-      }
-      const activeName = midiMapName(value.activeName);
-      if (!presets.some((preset) => preset.name === activeName)) throw new Error("Unknown active preset.");
-      return { version: 1, presets, activeName, bindings: parseBindings(value.bindings) };
-    }
-  } catch { /* Recover the previous mapping if the preset preference is invalid. */ }
+function parseSavedMaps(text: string, defaults: MidiMapState): MidiMapState {
+  const value: unknown = JSON.parse(text);
+  if (!record(value) || value.version !== 1 || !Array.isArray(value.presets)) throw new Error("Invalid presets.");
+  const presets = value.presets.map((preset: unknown) => {
+    if (!record(preset)) throw new Error("Invalid preset.");
+    return { name: midiMapName(preset.name), bindings: parseBindings(preset.bindings) };
+  });
+  if (new Set(presets.map((preset) => preset.name)).size !== presets.length) throw new Error("Duplicate presets.");
+  for (const preset of defaults.presets) {
+    if (!presets.some((existing) => existing.name === preset.name)) presets.push(preset);
+  }
+  const activeName = midiMapName(value.activeName);
+  if (!presets.some((preset) => preset.name === activeName)) throw new Error("Unknown active preset.");
+  return { version: 1, presets, activeName, bindings: parseBindings(value.bindings) };
+}
+
+function recoverLegacyMaps(storage: Pick<Storage, "getItem">, initial: MidiMapState): MidiMapState {
   try {
     const legacy: unknown = JSON.parse(storage.getItem("olooper.midi.bindings") ?? "{}");
     if (record(legacy)) {
@@ -114,4 +115,16 @@ export function readMidiMaps(storage: Pick<Storage, "getItem">): MidiMapState {
     initial.presets[0].bindings = initial.bindings;
   } catch { /* Fresh installation or invalid legacy preference. */ }
   return initial;
+}
+
+export function readMidiMaps(storage: Pick<Storage, "getItem">): MidiMapState {
+  const initial: MidiMapState = {
+    version: 1, activeName: "Custom_map", bindings: {},
+    presets: BUILTIN_MAPS.map((map) => importMidiMap(JSON.stringify(map))),
+  };
+  try {
+    const text = storage.getItem(MIDI_MAP_STORAGE_KEY);
+    if (text) return parseSavedMaps(text, initial);
+  } catch { /* Recover the previous mapping if the preset preference is invalid. */ }
+  return recoverLegacyMaps(storage, initial);
 }

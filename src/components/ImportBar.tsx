@@ -2,7 +2,6 @@ import { useEffect, useRef, useState } from "react";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { ownSubscription } from "../subscription";
 import { libraryLinkFolder, libraryLinkedFolders, librarySourceFolders, libraryRescanFolder, importLinkedFileAndWait, type LinkedFolder } from "../tauri";
-import { partialImportCounts } from "../tauri";
 import {
   importCustomAndWait,
   cancelImport,
@@ -18,6 +17,8 @@ import {
   type ImportReport,
 } from "../tauri";
 import { copySourcePreference, elapsedLabel, fileName, importKindForPath, type ContainerImportOptions } from "../importFlow";
+import { importMixedFiles } from "../mixedImport";
+import { containerImportMessages, importContainerFiles, importRescannedFiles } from "../containerImport";
 
 interface Props {
   onImported: () => void;
@@ -190,42 +191,8 @@ export default function ImportBar({ onImported }: Props) {
             const containerMode = await chooseContainerMode(paths);
             if (!containerMode) { setImportBusy(false); return; }
             beginImport(paths);
-            let totalAdded = 0;
-            let totalExisting = 0;
-            let totalFailed = 0;
-            let firstError: string | null = null;
-            for (const path of paths) {
-              if (cancelQueue.current) break;
-              setFiles((current) => current.map((file) => file.path === path ? { ...file, stage: "Preparing", done: false } : file));
-              try {
-                const kind = importKindForPath(path);
-                if (kind === "swf") {
-                  const r = await runOwnedJob(path, (jobId) => importSwfAndWait(path, jobId, containerMode.mode === "extract", containerMode.copySource));
-                  totalAdded += r.added;
-                  totalExisting += r.already_there;
-                  if (r.failed.length) { totalFailed++; firstError ??= r.failed[0].reason; }
-                } else if (kind === "exe") {
-                  const r = await runOwnedJob(path, (jobId) => importExeAndWait(path, jobId, containerMode.mode === "extract", containerMode.copySource));
-                  totalAdded += r.added;
-                  totalExisting += r.already_there;
-                  if (r.failed.length) { totalFailed++; firstError ??= r.failed[0].reason; }
-                } else {
-                  const rs = await runOwnedJob(path, (jobId) => importCustomAndWait([path], jobId));
-                  totalAdded += rs.filter((r) => r.added).length;
-                  totalExisting += rs.filter((r) => r.error === "already in library").length;
-                  const bad = rs.filter((r) => !r.added && r.error !== "already in library");
-                  if (bad.length > 0) { totalFailed++; firstError ??= bad[0].error ?? "import failed"; }
-                }
-              } catch (reason) {
-                const partial = partialImportCounts(reason);
-                totalAdded += partial.added;
-                totalExisting += partial.existing;
-                if (!cancelQueue.current) {
-                  totalFailed++;
-                  firstError ??= String(reason);
-                }
-              }
-            }
+            const { added: totalAdded, existing: totalExisting, failed: totalFailed, firstError } =
+              await importMixedFiles(paths, containerMode, runOwnedJob, () => cancelQueue.current, "import failed");
             if (totalFailed > 0) {
               setError(`${totalFailed} file(s) failed: ${firstError}`);
               finishProgress(firstError);
@@ -293,45 +260,18 @@ export default function ImportBar({ onImported }: Props) {
     beginImport(files);
     setError(null);
     setReport(null);
-    // Import each file sequentially, accumulate results
-    let totalAdded = 0;
-    let totalExisting = 0;
-    let failedSounds = 0;
-    const failures: string[] = [];
-    let lastReport: ImportReport | null = null;
-    for (const f of files) {
-      if (cancelQueue.current) break;
-      try {
-        const r = await runOwnedJob(f, (jobId) => linked
-          ? importLinkedFileAndWait(linked, f, jobId)
-          : importFn(f, jobId, containerMode));
-        lastReport = r;
-        totalAdded += r.added;
-        totalExisting += r.already_there;
-        failedSounds += r.failed.length;
-      } catch (e) {
-        const partial = partialImportCounts(e);
-        totalAdded += partial.added;
-        totalExisting += partial.existing;
-        failedSounds += partial.failed;
-        if (!cancelQueue.current) failures.push(`${f}: ${String(e)}`);
-        if (linked && String(e).includes("Library changed")) break;
-      }
-    }
-    if (lastReport) setReport(lastReport);
-    if (failures.length > 0 || failedSounds > 0) {
-      const summary = [
-        failures.length > 0 ? `${failures.length} file(s) failed` : "",
-        failedSounds > 0 ? `${failedSounds} embedded sound(s) skipped` : "",
-      ].filter(Boolean).join("; ");
-      setError(summary);
-    }
-    if (totalAdded > 0) {
-      setDragCount(totalAdded);
+    const result = await importContainerFiles(files, (path) => runOwnedJob(path, (jobId) => linked
+        ? importLinkedFileAndWait(linked, path, jobId)
+        : importFn(path, jobId, containerMode)), () => cancelQueue.current, Boolean(linked));
+    const { error, progressError } = containerImportMessages(result, cancelQueue.current);
+    if (result.lastReport) setReport(result.lastReport);
+    if (error) setError(error);
+    if (result.added > 0) {
+      setDragCount(result.added);
       setTimeout(() => setDragCount(null), 3000);
     }
-    if (totalExisting > 0) showNotice(`${totalExisting} existing track${totalExisting === 1 ? "" : "s"} already in library`);
-    finishProgress(failures.length > 0 ? failures[0] : failedSounds > 0 ? `${failedSounds} embedded sound(s) skipped` : cancelQueue.current ? "import cancelled" : null);
+    if (result.existing > 0) showNotice(`${result.existing} existing track${result.existing === 1 ? "" : "s"} already in library`);
+    finishProgress(progressError);
     setImportBusy(false);
     onImported();
   };
@@ -355,21 +295,9 @@ export default function ImportBar({ onImported }: Props) {
       const scan = await libraryRescanFolder(folder);
       onImported();
       beginImport(scan.paths);
-      let added = 0;
-      let failed = 0;
-      const errors: string[] = [];
-      for (const path of scan.paths) {
-        if (cancelQueue.current) break;
-        try {
-          const report = await runOwnedJob(path, (jobId) => importLinkedFileAndWait(folder, path, jobId));
-          added += report.added;
-          failed += report.failed.length;
-        } catch (cause) {
-          added += partialImportCounts(cause).added;
-          if (!cancelQueue.current) { failed++; errors.push(String(cause)); }
-          if (String(cause).includes("Library changed")) break;
-        }
-      }
+      const { added, failed, errors } = await importRescannedFiles(scan.paths,
+        (path) => runOwnedJob(path, (jobId) => importLinkedFileAndWait(folder, path, jobId)),
+        () => cancelQueue.current);
       const failure = errors[0] ?? (failed ? `${failed} sound(s) failed` : null);
       setError(failure);
       finishProgress(cancelQueue.current ? "import cancelled" : failure);
@@ -468,44 +396,8 @@ export default function ImportBar({ onImported }: Props) {
     beginImport(paths);
     setError(null);
     setReport(null);
-    let added = 0;
-    let existing = 0;
-    let failed = 0;
-    let firstError: string | null = null;
-    for (const path of paths) {
-      if (cancelQueue.current) break;
-      try {
-        const kind = importKindForPath(path);
-        if (kind === "swf") {
-          const report = await runOwnedJob(path, (jobId) => importSwfAndWait(path, jobId, containerMode.mode === "extract", containerMode.copySource));
-          added += report.added;
-          existing += report.already_there;
-          if (report.failed.length) { failed++; firstError ??= report.failed[0].reason; }
-        } else if (kind === "exe") {
-          const report = await runOwnedJob(path, (jobId) => importExeAndWait(path, jobId, containerMode.mode === "extract", containerMode.copySource));
-          added += report.added;
-          existing += report.already_there;
-          if (report.failed.length) { failed++; firstError ??= report.failed[0].reason; }
-        } else {
-          const reports = await runOwnedJob(path, (jobId) => importCustomAndWait([path], jobId));
-          added += reports.filter((report) => report.added).length;
-          existing += reports.filter((report) => report.error === "already in library").length;
-          const rejected = reports.find((report) => !report.added && report.error !== "already in library");
-          if (rejected) {
-            failed++;
-            firstError ??= rejected.error ?? "audio import failed";
-          }
-        }
-      } catch (reason) {
-        const partial = partialImportCounts(reason);
-        added += partial.added;
-        existing += partial.existing;
-        if (!cancelQueue.current) {
-          failed++;
-          firstError ??= String(reason);
-        }
-      }
-    }
+    const { added, existing, failed, firstError } =
+      await importMixedFiles(paths, containerMode, runOwnedJob, () => cancelQueue.current, "audio import failed");
     if (failed > 0) {
       setError(`${failed} file(s) failed: ${firstError}`);
       finishProgress(firstError);

@@ -2,12 +2,12 @@
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import Sidebar from "./Sidebar";
-import { libraryList, libraryPlaylists, playerPrefetch, type Track } from "../tauri";
+import { libraryList, libraryPlaylists, libraryRemoveLooper, playerPrefetch, type Track } from "../tauri";
 
 vi.mock("../tauri", async (original) => ({
   ...await original<typeof import("../tauri")>(),
   libraryList: vi.fn(), libraryPlaylists: vi.fn().mockResolvedValue([]), libraryLooperOrder: vi.fn().mockResolvedValue([]),
-  playerPrefetch: vi.fn().mockResolvedValue(true),
+  playerPrefetch: vi.fn().mockResolvedValue(true), libraryRemoveLooper: vi.fn(),
 }));
 beforeEach(() => {
   localStorage.clear();
@@ -157,4 +157,20 @@ it("offers a folder rescan for missing extracted audio without trying to play it
     expect((request.mock.calls[0][0] as CustomEvent).detail).toBe("source-hash");
     expect(props.onTrackLoading).not.toHaveBeenCalled();
   } finally { window.removeEventListener("olooper:rescan-source-folder", request); }
+});
+
+it("deletes a looper only after confirming the matching group", async () => {
+  vi.mocked(libraryList).mockResolvedValue([{ ...track(1, "Break"), source_type: "swf", looper_name: "Break Pack", source_hash: "swf-a" }]);
+  vi.mocked(libraryRemoveLooper).mockResolvedValue(1);
+  render(<Sidebar {...props} />);
+  await act(async () => {});
+  const group = screen.getAllByText("Break Pack")[0];
+  fireEvent.contextMenu(group);
+  fireEvent.click(screen.getByRole("button", { name: "Remove group from library" }));
+  fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+  expect(libraryRemoveLooper).not.toHaveBeenCalled();
+  fireEvent.contextMenu(group);
+  fireEvent.click(screen.getByRole("button", { name: "Remove group from library" }));
+  await act(async () => { fireEvent.click(screen.getByRole("button", { name: "Delete looper" })); });
+  expect(libraryRemoveLooper).toHaveBeenCalledExactlyOnceWith("swf-a");
 });

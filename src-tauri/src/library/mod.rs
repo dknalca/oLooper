@@ -1,9 +1,11 @@
-//! Persistent library: SQLite catalog + audio as normal files.
+//! Persistent library: SQLite catalog, managed audio and source-backed sounds.
 //!
-//! The database is metadata only. Every write path keeps looper directories and
-//! `Custom Loops/` human-browsable; file copies go `tmp → validate → rename`
-//! and row writes are transactional. Removing a track deletes its library copy,
-//! but never its original source file.
+//! Extracted/custom audio is stored in human-browsable library directories;
+//! embedded tracks are decoded from the original or an optional managed copy of
+//! their SWF/EXE source. The catalog owns track identities and practice regions,
+//! while managed audio tags are authoritative for editable Serato cues. File
+//! replacement and removal use staged writes or recoverable quarantine; original
+//! external sources must never be deleted.
 
 use std::collections::{BTreeMap, HashSet};
 use std::io::Cursor;
@@ -42,7 +44,7 @@ pub struct Track {
     pub playback_path: String,
     /// False when the file was moved/deleted outside the app.
     pub exists: bool,
-    /// `extracted` audio file or `embedded` sound decoded from the managed source.
+    /// `extracted` audio file or `embedded` sound decoded from its SWF/EXE source.
     pub audio_storage: String,
     pub source_type: String,
     pub source_path: String,
@@ -145,7 +147,17 @@ fn looper_audio_tags(looper: &str) -> (Option<String>, String) {
 }
 
 pub fn sha256_hex(data: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(data))
+    digest_hex(&Sha256::digest(data))
+}
+
+fn digest_hex(digest: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        output.push(char::from(HEX[usize::from(byte >> 4)]));
+        output.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    output
 }
 
 fn copy_file_noclobber(source: &Path, destination: &Path) -> std::io::Result<()> {
@@ -153,7 +165,7 @@ fn copy_file_noclobber(source: &Path, destination: &Path) -> std::io::Result<()>
         .parent()
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "missing parent"))?;
     let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
-    let mut input = std::fs::File::open(source)?;
+    let mut input = crate::bounded_io::open_regular(source)?;
     crate::bounded_io::copy(&mut input, temporary.as_file_mut(), 512 * 1024 * 1024)?;
     temporary.as_file().sync_all()?;
     temporary
@@ -1742,7 +1754,7 @@ impl Library {
         self.write_quarantine_manifest(&manifest)?;
         for (index, original) in safe_files.into_iter().enumerate() {
             let quarantined = directory.join(format!("asset-{index}"));
-            if let Err(error) = std::fs::rename(&original, &quarantined) {
+            if let Err(error) = crate::fs_ops::rename_noreplace(&original, &quarantined) {
                 let files = QuarantinedFiles {
                     directory: directory.clone(),
                     moved,
@@ -1771,7 +1783,7 @@ impl Library {
 
     fn restore_quarantined(&self, files: &QuarantinedFiles) -> Result<(), String> {
         for (original, quarantined) in files.moved.iter().rev() {
-            std::fs::rename(quarantined, original)
+            crate::fs_ops::rename_noreplace(quarantined, original)
                 .map_err(|error| format!("cannot restore {}: {error}", original.display()))?;
         }
         std::fs::remove_file(files.directory.join("manifest.json")).map_err(|e| e.to_string())?;
@@ -1779,7 +1791,7 @@ impl Library {
     }
 
     fn purge_quarantined(&self, files: QuarantinedFiles) -> Result<(), String> {
-        std::fs::remove_dir_all(&files.directory).map_err(|error| {
+        recovery::remove_quarantine(&files.directory, &files.moved).map_err(|error| {
             format!(
                 "catalog entry was removed but staged audio could not be deleted at {}: {error}",
                 files.directory.display()
@@ -2566,122 +2578,99 @@ impl Library {
         // Decode and BPM-analyze small bounded batches in parallel. Keep all
         // SQLite writes and atomic file copies on this worker thread and commit
         // each batch in original SWF sound order.
-        for batch_start in (0..total).step_by(workers) {
-            let batch_end = (batch_start + workers).min(total);
-            let batch_len = batch_end - batch_start;
-            let mut known_ids = vec![None; batch_len];
-            let mut prepared: Vec<Option<Result<PreparedSound, String>>> =
-                std::iter::repeat_with(|| None).take(batch_len).collect();
-            let mut decode_indices = Vec::new();
+        // Keep the counters outside the unwind boundary so a decoder or callback
+        // panic cannot erase the last completed items from the terminal report.
+        let import_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+            || -> Result<(), (ImportReport, String)> {
+                for batch_start in (0..total).step_by(workers) {
+                    let batch_end = (batch_start + workers).min(total);
+                    let batch_len = batch_end - batch_start;
+                    let mut known_ids = vec![None; batch_len];
+                    let mut prepared: Vec<Option<Result<PreparedSound, String>>> =
+                        std::iter::repeat_with(|| None).take(batch_len).collect();
+                    let mut decode_indices = Vec::new();
 
-            for (slot, index) in (batch_start..batch_end).enumerate() {
-                let sound = &sounds[index];
-                let known: Option<i64> = self
-                    .conn
-                    .query_row(
-                        "SELECT id FROM tracks WHERE source_hash=?1 AND source_sound_id=?2",
-                        rusqlite::params![source_hash, sound.id as i64],
-                        |row| row.get(0),
-                    )
-                    .optional()
-                    .map_err(|error| {
-                        (
-                            make_partial(
-                                &looper,
-                                added,
-                                already_there,
-                                failed.clone(),
-                                track_ids.clone(),
-                            ),
-                            error.to_string(),
-                        )
-                    })?;
-                if let Some(id) = known {
-                    known_ids[slot] = Some(id);
-                } else if sound.frames.is_empty() {
-                    prepared[slot] = Some(Err("unsupported or empty sound".to_string()));
-                } else {
-                    progress("extracting", index + 1, total).map_err(|error| {
-                        (
-                            make_partial(
-                                &looper,
-                                added,
-                                already_there,
-                                failed.clone(),
-                                track_ids.clone(),
-                            ),
-                            error,
-                        )
-                    })?;
-                    decode_indices.push((slot, index));
-                }
-            }
-
-            let decoded_batch: Vec<_> = decode_indices
-                .into_iter()
-                .map(|(slot, index)| {
-                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        crate::check_cancelled()?;
-                        prepare_sound(&sounds[index], extract_audio)
-                    }))
-                    .unwrap_or_else(|_| Err("audio decode worker panicked".into()));
-                    (slot, result)
-                })
-                .collect();
-            for (slot, result) in decoded_batch {
-                prepared[slot] = Some(result);
-            }
-
-            for (slot, index) in (batch_start..batch_end).enumerate() {
-                let sound = &sounds[index];
-                if let Some(id) = known_ids[slot] {
-                    already_there += 1;
-                    track_ids.push(id);
-                    continue;
-                }
-                let item = match prepared[slot]
-                    .take()
-                    .unwrap_or_else(|| Err("audio was not prepared".to_string()))
-                {
-                    Ok(item) => item,
-                    Err(reason) => {
-                        failed.push(FailedSound {
-                            id: sound.id as i64,
-                            reason,
-                        });
-                        continue;
+                    for (slot, index) in (batch_start..batch_end).enumerate() {
+                        let sound = &sounds[index];
+                        let known: Option<i64> = self
+                            .conn
+                            .query_row(
+                                "SELECT id FROM tracks WHERE source_hash=?1 AND source_sound_id=?2",
+                                rusqlite::params![source_hash, sound.id as i64],
+                                |row| row.get(0),
+                            )
+                            .optional()
+                            .map_err(|error| {
+                                (
+                                    make_partial(
+                                        &looper,
+                                        added,
+                                        already_there,
+                                        failed.clone(),
+                                        track_ids.clone(),
+                                    ),
+                                    error.to_string(),
+                                )
+                            })?;
+                        if let Some(id) = known {
+                            known_ids[slot] = Some(id);
+                        } else if sound.frames.is_empty() {
+                            prepared[slot] = Some(Err("unsupported or empty sound".to_string()));
+                        } else {
+                            progress("extracting", index + 1, total).map_err(|error| {
+                                (
+                                    make_partial(
+                                        &looper,
+                                        added,
+                                        already_there,
+                                        failed.clone(),
+                                        track_ids.clone(),
+                                    ),
+                                    error,
+                                )
+                            })?;
+                            decode_indices.push((slot, index));
+                        }
                     }
-                };
-                let current = index + 1;
-                progress("adjusting BPM", current, total).map_err(|error| {
-                    (
-                        make_partial(
-                            &looper,
-                            added,
-                            already_there,
-                            failed.clone(),
-                            track_ids.clone(),
-                        ),
-                        error,
-                    )
-                })?;
-                progress("adjusting loops", current, total).map_err(|error| {
-                    (
-                        make_partial(
-                            &looper,
-                            added,
-                            already_there,
-                            failed.clone(),
-                            track_ids.clone(),
-                        ),
-                        error,
-                    )
-                })?;
-                let final_path = if extract_audio {
-                    let dest =
-                        dir.join(format!("{:02}_{}.{}", index + 1, sound.id, item.file_codec));
-                    self.atomic_write(&dest, &item.file_bytes)
-                        .map_err(|error| {
+
+                    let decoded_batch: Vec<_> = decode_indices
+                        .into_iter()
+                        .map(|(slot, index)| {
+                            let result =
+                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    crate::check_cancelled()?;
+                                    prepare_sound(&sounds[index], extract_audio)
+                                }))
+                                .unwrap_or_else(|_| Err("audio decode worker panicked".into()));
+                            (slot, result)
+                        })
+                        .collect();
+                    for (slot, result) in decoded_batch {
+                        prepared[slot] = Some(result);
+                    }
+
+                    for (slot, index) in (batch_start..batch_end).enumerate() {
+                        let sound = &sounds[index];
+                        if let Some(id) = known_ids[slot] {
+                            already_there += 1;
+                            track_ids.push(id);
+                            continue;
+                        }
+                        let item = match prepared[slot]
+                            .take()
+                            .unwrap_or_else(|| Err("audio was not prepared".to_string()))
+                        {
+                            Ok(item) => item,
+                            Err(reason) => {
+                                failed.push(FailedSound {
+                                    id: sound.id as i64,
+                                    reason,
+                                });
+                                continue;
+                            }
+                        };
+                        let current = index + 1;
+                        progress("adjusting BPM", current, total).map_err(|error| {
                             (
                                 make_partial(
                                     &looper,
@@ -2692,66 +2681,27 @@ impl Library {
                                 ),
                                 error,
                             )
-                        })?
-                } else {
-                    PathBuf::from(source_path)
-                };
-                if extract_audio {
-                    if let Err(reason) = serato::write_extracted_audio_tags(
-                        &final_path,
-                        artist_tag.as_deref(),
-                        &album_tag,
-                        cover_image,
-                    ) {
-                        let _ = std::fs::remove_file(&final_path);
-                        failed.push(FailedSound {
-                            id: sound.id as i64,
-                            reason,
-                        });
-                        continue;
-                    }
-                }
-                let title = format!("{:02} · {}", index + 1, looper);
-                if let Err(error) = progress("inserting in library", current, total) {
-                    if extract_audio {
-                        let _ = std::fs::remove_file(&final_path);
-                    }
-                    return Err((
-                        make_partial(
-                            &looper,
-                            added,
-                            already_there,
-                            failed.clone(),
-                            track_ids.clone(),
-                        ),
-                        error,
-                    ));
-                }
-                let audio_storage = if extract_audio {
-                    "extracted"
-                } else {
-                    "embedded"
-                };
-                match self.add_track_with_storage(
-                    &title,
-                    &looper,
-                    &final_path,
-                    source_type,
-                    source_path,
-                    source_hash,
-                    sound.id as i64,
-                    exe_offset,
-                    exe_length,
-                    &item.file_codec,
-                    &item.buffer,
-                    0,
-                    0,
-                    audio_storage,
-                    source_managed,
-                ) {
-                    Ok((id, true)) => {
-                        if let Some(estimate) = item.estimate {
-                            self.update_bpm(id, estimate.bpm, Some(estimate.confidence), false)
+                        })?;
+                        progress("adjusting loops", current, total).map_err(|error| {
+                            (
+                                make_partial(
+                                    &looper,
+                                    added,
+                                    already_there,
+                                    failed.clone(),
+                                    track_ids.clone(),
+                                ),
+                                error,
+                            )
+                        })?;
+                        let final_path = if extract_audio {
+                            let dest = dir.join(format!(
+                                "{:02}_{}.{}",
+                                index + 1,
+                                sound.id,
+                                item.file_codec
+                            ));
+                            self.atomic_write(&dest, &item.file_bytes)
                                 .map_err(|error| {
                                     (
                                         make_partial(
@@ -2763,28 +2713,141 @@ impl Library {
                                         ),
                                         error,
                                     )
-                                })?;
-                        }
-                        added += 1;
-                        track_ids.push(id);
-                    }
-                    Ok((id, false)) => {
+                                })?
+                        } else {
+                            PathBuf::from(source_path)
+                        };
                         if extract_audio {
-                            let _ = std::fs::remove_file(&final_path);
+                            if let Err(reason) = serato::write_extracted_audio_tags(
+                                &final_path,
+                                artist_tag.as_deref(),
+                                &album_tag,
+                                cover_image,
+                            ) {
+                                let _ = std::fs::remove_file(&final_path);
+                                failed.push(FailedSound {
+                                    id: sound.id as i64,
+                                    reason,
+                                });
+                                continue;
+                            }
                         }
-                        already_there += 1;
-                        track_ids.push(id);
-                    }
-                    Err(error) => {
-                        if extract_audio {
-                            let _ = std::fs::remove_file(&final_path);
+                        let title = format!("{:02} · {}", index + 1, looper);
+                        // No catalog insertion has started yet. Clean up the
+                        // staged copy on both cancellation and callback panic;
+                        // after insertion begins, a panic may have committed it.
+                        let before_insert =
+                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                progress("inserting in library", current, total)
+                            }));
+                        match before_insert {
+                            Ok(Ok(())) => {}
+                            result => {
+                                if extract_audio {
+                                    let _ = std::fs::remove_file(&final_path);
+                                }
+                                match result {
+                                    Ok(Err(error)) => {
+                                        return Err((
+                                            make_partial(
+                                                &looper,
+                                                added,
+                                                already_there,
+                                                failed.clone(),
+                                                track_ids.clone(),
+                                            ),
+                                            error,
+                                        ))
+                                    }
+                                    Err(panic) => std::panic::resume_unwind(panic),
+                                    Ok(Ok(())) => unreachable!(),
+                                }
+                            }
                         }
-                        return Err((
-                            make_partial(&looper, added, already_there, failed, track_ids),
-                            error,
-                        ));
+                        let audio_storage = if extract_audio {
+                            "extracted"
+                        } else {
+                            "embedded"
+                        };
+                        match self.add_track_with_storage(
+                            &title,
+                            &looper,
+                            &final_path,
+                            source_type,
+                            source_path,
+                            source_hash,
+                            sound.id as i64,
+                            exe_offset,
+                            exe_length,
+                            &item.file_codec,
+                            &item.buffer,
+                            0,
+                            0,
+                            audio_storage,
+                            source_managed,
+                        ) {
+                            Ok((id, true)) => {
+                                // The track was committed by add_track_with_storage;
+                                // account for it before any fallible BPM update.
+                                added += 1;
+                                track_ids.push(id);
+                                if let Some(estimate) = item.estimate {
+                                    self.update_bpm(
+                                        id,
+                                        estimate.bpm,
+                                        Some(estimate.confidence),
+                                        false,
+                                    )
+                                    .map_err(|error| {
+                                        (
+                                            make_partial(
+                                                &looper,
+                                                added,
+                                                already_there,
+                                                failed.clone(),
+                                                track_ids.clone(),
+                                            ),
+                                            error,
+                                        )
+                                    })?;
+                                }
+                            }
+                            Ok((id, false)) => {
+                                if extract_audio {
+                                    let _ = std::fs::remove_file(&final_path);
+                                }
+                                already_there += 1;
+                                track_ids.push(id);
+                            }
+                            Err(error) => {
+                                if extract_audio {
+                                    let _ = std::fs::remove_file(&final_path);
+                                }
+                                return Err((
+                                    make_partial(
+                                        &looper,
+                                        added,
+                                        already_there,
+                                        failed.clone(),
+                                        track_ids.clone(),
+                                    ),
+                                    error,
+                                ));
+                            }
+                        }
                     }
                 }
+                Ok(())
+            },
+        ));
+        match import_result {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => return Err(error),
+            Err(_) => {
+                return Err((
+                    make_partial(&looper, added, already_there, failed, track_ids),
+                    "import worker failed unexpectedly; the current item may already be in the library".into(),
+                ));
             }
         }
         if added == 0 && already_there == 0 {

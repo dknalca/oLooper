@@ -36,6 +36,82 @@ function isTextInput(el: Element | null): boolean {
   return tag === "input" || tag === "textarea" || tag === "select" || (el as HTMLElement).isContentEditable;
 }
 
+type Chain = (fn: () => Promise<PlayerStatus>) => void;
+
+function shortcutIsBlocked(event: KeyboardEvent): boolean {
+  if (isTextInput(document.activeElement)) return true;
+  // Dialogs, sliders and tab lists own their respective keyboard controls.
+  if (document.querySelector('[role="dialog"][aria-modal="true"]')
+    || document.activeElement?.closest('[role="slider"]')) return true;
+  if (event.target instanceof Element && event.target.closest('[role="tablist"]')) return true;
+  return event.metaKey || event.ctrlKey || event.altKey;
+}
+
+function handleCueShortcut(event: KeyboardEvent): boolean {
+  const match = /^(?:Digit|Numpad)([1-4])$/.exec(event.code);
+  if (!match) return false;
+  event.preventDefault();
+  window.dispatchEvent(new CustomEvent("olooper:cue-shortcut", {
+    detail: { slot: Number(match[1]), clear: event.shiftKey },
+  }));
+  return true;
+}
+
+function handleNavigationShortcut(event: KeyboardEvent, enabled: boolean, chain: Chain): boolean {
+  switch (event.code) {
+    case "ArrowLeft":
+    case "ArrowRight": {
+      event.preventDefault();
+      const left = event.code === "ArrowLeft";
+      if (enabled && !event.shiftKey) {
+        window.dispatchEvent(new CustomEvent("olooper:library-navigation", { detail: left ? "back" : "intro" }));
+      } else if (isLoaded) {
+        const target = left ? Math.max(0, currentPositionMs - 5000) : Math.min(durationMs, currentPositionMs + 5000);
+        chain(() => playerSeek(target));
+      }
+      return true;
+    }
+    case "ArrowUp":
+    case "ArrowDown":
+      if (enabled) {
+        event.preventDefault();
+        window.dispatchEvent(new CustomEvent("olooper:library-navigation", {
+          detail: event.code === "ArrowUp" ? "up" : "down",
+        }));
+      }
+      return true;
+    default:
+      return false;
+  }
+}
+
+function handleTransportShortcut(event: KeyboardEvent, chain: Chain): void {
+  switch (event.code) {
+    case "Space":
+      event.preventDefault();
+      if (isPlaying) {
+        isPlaying = false;
+        chain(() => playerPause());
+      } else if (isLoaded) {
+        isPlaying = true;
+        chain(() => playerPlay());
+      }
+      break;
+    case "KeyS":
+      event.preventDefault();
+      if (isLoaded) chain(() => playerStop());
+      break;
+    case "KeyR":
+      event.preventDefault();
+      window.dispatchEvent(new Event("olooper:random-loop"));
+      break;
+    case "KeyL":
+      event.preventDefault();
+      if (isLoaded) chain(() => playerSetLoopEnabled(!loopEnabled));
+      break;
+  }
+}
+
 export default function useKeyboardShortcuts(libraryNavigationEnabled = true) {
   const pendingRef = useRef<Promise<void>>(Promise.resolve());
 
@@ -58,84 +134,9 @@ export default function useKeyboardShortcuts(libraryNavigationEnabled = true) {
 
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
-      // Skip when typing in inputs.
-      if (isTextInput(document.activeElement)) return;
-      // Dialog controls own Space/Enter; tapping tempo must not toggle playback.
-      if (document.querySelector('[role="dialog"][aria-modal="true"]')
-        || document.activeElement?.closest('[role="slider"]')) return;
-      // The library-view tabs already own left/right arrow navigation.
-      if (e.target instanceof Element && e.target.closest('[role="tablist"]')) return;
-      // Skip other modified shortcuts (allow Cmd+C, Cmd+V, etc.).
-      if (e.metaKey || e.ctrlKey || e.altKey) return;
-
-      const cueMatch = /^(?:Digit|Numpad)([1-4])$/.exec(e.code);
-      if (cueMatch) {
-        e.preventDefault();
-        window.dispatchEvent(new CustomEvent("olooper:cue-shortcut", {
-          detail: { slot: Number(cueMatch[1]), clear: e.shiftKey },
-        }));
-        return;
-      }
-
-      switch (e.code) {
-        case "Space": {
-          e.preventDefault();
-          if (isPlaying) {
-            isPlaying = false;
-            chain(() => playerPause());
-          } else if (isLoaded) {
-            isPlaying = true;
-            chain(() => playerPlay());
-          }
-          break;
-        }
-        case "KeyS": {
-          e.preventDefault();
-          if (isLoaded) chain(() => playerStop());
-          break;
-        }
-        case "ArrowLeft": {
-          e.preventDefault();
-          if (libraryNavigationEnabled && !e.shiftKey) {
-            window.dispatchEvent(new CustomEvent("olooper:library-navigation", { detail: "back" }));
-          } else if (isLoaded) {
-            const target = Math.max(0, currentPositionMs - 5000);
-            chain(() => playerSeek(target));
-          }
-          break;
-        }
-        case "ArrowRight": {
-          e.preventDefault();
-          if (libraryNavigationEnabled && !e.shiftKey) {
-            window.dispatchEvent(new CustomEvent("olooper:library-navigation", { detail: "intro" }));
-          } else if (isLoaded) {
-            const target = Math.min(durationMs, currentPositionMs + 5000);
-            chain(() => playerSeek(target));
-          }
-          break;
-        }
-        case "ArrowUp":
-        case "ArrowDown": {
-          if (!libraryNavigationEnabled) break;
-          e.preventDefault();
-          window.dispatchEvent(new CustomEvent("olooper:library-navigation", {
-            detail: e.code === "ArrowUp" ? "up" : "down",
-          }));
-          break;
-        }
-        case "KeyR": {
-          e.preventDefault();
-          window.dispatchEvent(new Event("olooper:random-loop"));
-          break;
-        }
-        case "KeyL": {
-          e.preventDefault();
-          if (isLoaded) {
-            chain(() => playerSetLoopEnabled(!loopEnabled));
-          }
-          break;
-        }
-      }
+      if (shortcutIsBlocked(e) || handleCueShortcut(e)) return;
+      if (handleNavigationShortcut(e, libraryNavigationEnabled, chain)) return;
+      handleTransportShortcut(e, chain);
     };
 
     window.addEventListener("keydown", handler);

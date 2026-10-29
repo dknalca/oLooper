@@ -16,7 +16,7 @@ fn copy_managed_audio_to_destination(source: &Path, destination: &Path) -> Resul
     {
         return Err("managed audio is not a valid desktop drag source".to_string());
     }
-    let mut input = std::fs::File::open(source)
+    let mut input = crate::bounded_io::open_regular(source)
         .map_err(|error| format!("cannot read managed audio: {error}"))?;
     let mut output = std::fs::OpenOptions::new()
         .write(true)

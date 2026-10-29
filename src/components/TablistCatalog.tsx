@@ -9,8 +9,8 @@ import {
   tablistSearch,
   type ImportProgress,
   type TablistCatalogLooper,
-  type TablistImportCount,
 } from "../tauri";
+import { TABLIST_PAGE_SIZE, findRandomTablistLooper, isTablistLooperDownloaded, tablistCountsByRoute, tablistRouteKey } from "../tablistCatalog";
 import LibraryViewTabs, { type LibraryView } from "./LibraryViewTabs";
 
 interface Props {
@@ -18,20 +18,6 @@ interface Props {
   refreshKey: number;
   onImported: () => void;
   onLibraryViewChange: (view: LibraryView) => void;
-}
-
-const PAGE_SIZE = 24;
-
-function routeKey(pathOrUrl: string): string {
-  try {
-    const url = new URL(pathOrUrl, "https://tablist.net/");
-    if (url.hostname === "tablist.net" || url.hostname === "www.tablist.net") {
-      return url.pathname.replace(/^\/+|\/+$/g, "");
-    }
-  } catch {
-    // Fall back to the normalized catalog path below.
-  }
-  return pathOrUrl.replace(/^\/+|\/+$/g, "").split(/[?#]/, 1)[0];
 }
 
 interface CatalogContextMenu {
@@ -69,7 +55,7 @@ export default function TablistCatalog({ libraryReady, refreshKey, onImported, o
     let cancelled = false;
     setLoading(true);
     setError(null);
-    tablistSearch(query, pageNumber * PAGE_SIZE)
+    tablistSearch(query, pageNumber * TABLIST_PAGE_SIZE)
       .then((page) => {
         if (cancelled) return;
         setResults(page.hits);
@@ -92,14 +78,9 @@ export default function TablistCatalog({ libraryReady, refreshKey, onImported, o
     }
     let cancelled = false;
     libraryTablistImportCounts()
-      .then((counts: TablistImportCount[]) => {
+      .then((counts) => {
         if (cancelled) return;
-        const byRoute: Record<string, number> = {};
-        for (const item of counts) {
-          const key = routeKey(item.source_path);
-          byRoute[key] = (byRoute[key] ?? 0) + item.tracks;
-        }
-        setImportCounts(byRoute);
+        setImportCounts(tablistCountsByRoute(counts));
       })
       .catch((reason: unknown) => {
         if (!cancelled) setError(String(reason));
@@ -126,8 +107,7 @@ export default function TablistCatalog({ libraryReady, refreshKey, onImported, o
 
   const importLooper = async (looper: TablistCatalogLooper, fromRandom = false) => {
     if (!libraryReady || activeLooper !== null || (randomLoading && !fromRandom)) return;
-    const imported = importCounts[routeKey(looper.path)] ?? 0;
-    if (looper.loops.length > 0 && imported >= looper.loops.length) {
+    if (isTablistLooperDownloaded(looper, importCounts)) {
       setImportError(`${looper.title} is already fully downloaded.`);
       return;
     }
@@ -164,29 +144,8 @@ export default function TablistCatalog({ libraryReady, refreshKey, onImported, o
     setRandomLoading(true);
     setImportError(null);
     try {
-      // Use the unfiltered catalogue total, not the current search or page.
-      const catalog = await tablistSearch("", 0, 1);
-      const available = catalog.estimatedTotalHits;
-      if (available === 0) throw new Error("The Tablist catalogue is empty.");
-
-      // Start on a random page and wrap through every catalogue page until
-      // finding a valid looper that is not already fully downloaded.
-      const pageCount = Math.ceil(available / PAGE_SIZE);
-      const startPage = Math.floor(Math.random() * pageCount);
-      for (let distance = 0; distance < pageCount; distance++) {
-        const pageNumber = (startPage + distance) % pageCount;
-        const page = await tablistSearch("", pageNumber * PAGE_SIZE);
-        const candidates = page.hits.filter((looper) => {
-          const imported = importCounts[routeKey(looper.path)] ?? 0;
-          return looper.loops.length === 0 || imported < looper.loops.length;
-        });
-        if (candidates.length > 0) {
-          const candidate = candidates[Math.floor(Math.random() * candidates.length)];
-          await importLooper(candidate, true);
-          return;
-        }
-      }
-      throw new Error("Every valid looper in the Tablist catalogue is already downloaded.");
+      const candidate = await findRandomTablistLooper(tablistSearch, importCounts);
+      await importLooper(candidate, true);
     } catch (reason) {
       setImportError(`Random looper: ${String(reason)}`);
     } finally {
@@ -220,9 +179,9 @@ export default function TablistCatalog({ libraryReady, refreshKey, onImported, o
     setContextMenu(null);
   };
 
-  const firstItem = total === 0 ? 0 : pageNumber * PAGE_SIZE + 1;
-  const lastItem = Math.min(pageNumber * PAGE_SIZE + results.length, total);
-  const pageCount = Math.max(1, Math.ceil(total / PAGE_SIZE));
+  const firstItem = total === 0 ? 0 : pageNumber * TABLIST_PAGE_SIZE + 1;
+  const lastItem = Math.min(pageNumber * TABLIST_PAGE_SIZE + results.length, total);
+  const pageCount = Math.max(1, Math.ceil(total / TABLIST_PAGE_SIZE));
 
   return (
     <aside className="flex min-h-0 flex-1 flex-col bg-surface">
@@ -301,8 +260,8 @@ export default function TablistCatalog({ libraryReady, refreshKey, onImported, o
         {!loading && !error && results.length === 0 && <p className="px-4 py-8 text-center text-xs text-text-secondary">No loopers found.</p>}
         {results.map((looper) => {
           const busy = activeLooper === looper.path;
-          const imported = importCounts[routeKey(looper.path)] ?? 0;
-          const downloaded = looper.loops.length > 0 && imported >= looper.loops.length;
+          const imported = importCounts[tablistRouteKey(looper.path)] ?? 0;
+          const downloaded = isTablistLooperDownloaded(looper, importCounts);
           const partial = imported > 0 && !downloaded;
           return (
             <div

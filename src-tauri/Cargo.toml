@@ -29,7 +29,7 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "rustls-no-provider", "system-proxy"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rusty_mp3 = "1.0.0"
-sha2 = "0.10"
+sha2 = "0.11.1"
 symphonia = { version = "0.5", default-features = false, features = ["aac", "isomp4"] }
 tempfile = "3"
 wsola = "0.1"
@@ -37,6 +37,9 @@ wsola = "0.1"
 [target.'cfg(target_os = "macos")'.dependencies]
 dispatch = "0.2"
 objc = "0.2"
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["fs"] }
 
 [[example]]
 name = "tablist_download_test"

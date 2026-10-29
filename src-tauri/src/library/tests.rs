@@ -1776,6 +1776,128 @@ fn embedded_import_lists_tracks_and_decodes_from_the_managed_source_without_audi
 }
 
 #[test]
+fn panic_during_second_sound_preserves_committed_partial_report() {
+    let root = tempfile::tempdir().unwrap();
+    let lib = Library::open(root.path()).unwrap();
+    let buffer = wav_buf();
+    let sounds: Vec<_> = (1..=2)
+        .map(|id| crate::import::swf::Sound {
+            id,
+            format: 0,
+            codec: "wav".into(),
+            sample_count: buffer.frames() as u32,
+            seek_samples: 0,
+            trimmed_leading: 0,
+            frames: Library::loop_buffer_to_wav(&buffer),
+        })
+        .collect();
+    let (report, error) = lib
+        .import_sounds_with_progress(
+            "Panic",
+            "swf",
+            "/source/test.swf",
+            "panic-test",
+            None,
+            None,
+            &sounds,
+            |stage, current, _| {
+                if stage == "extracting" && current == 2 {
+                    panic!("injected failure");
+                }
+                Ok(())
+            },
+        )
+        .unwrap_err();
+    assert!(error.contains("current item may already"));
+    assert_eq!(report.added, 1);
+    assert_eq!(report.track_ids.len(), 1);
+    assert_eq!(lib.list_tracks().unwrap()[0].id, report.track_ids[0]);
+}
+
+#[test]
+fn bpm_update_failure_reports_track_already_inserted() {
+    let root = tempfile::tempdir().unwrap();
+    let lib = Library::open(root.path()).unwrap();
+    lib.conn.execute_batch("CREATE TRIGGER reject_bpm BEFORE UPDATE OF bpm ON tracks BEGIN SELECT RAISE(FAIL, 'injected bpm failure'); END;").unwrap();
+    let mut samples = vec![0i16; 8000 * 8];
+    for sample in samples.iter_mut().step_by(4000) {
+        *sample = i16::MAX;
+    }
+    let buffer = crate::player::LoopBuffer {
+        samples,
+        channels: 1,
+        rate: 8000,
+    };
+    let sound = crate::import::swf::Sound {
+        id: 1,
+        format: 0,
+        codec: "wav".into(),
+        sample_count: buffer.frames() as u32,
+        seek_samples: 0,
+        trimmed_leading: 0,
+        frames: Library::loop_buffer_to_wav(&buffer),
+    };
+    assert!(prepare_sound(&sound, true).unwrap().estimate.is_some());
+    let (report, error) = lib
+        .import_sounds_with_progress(
+            "BPM",
+            "swf",
+            "/source/test.swf",
+            "bpm-failure",
+            None,
+            None,
+            &[sound],
+            |_, _, _| Ok(()),
+        )
+        .unwrap_err();
+    assert!(error.contains("injected bpm failure"));
+    assert_eq!(report.added, 1);
+    assert_eq!(report.track_ids.len(), 1);
+    assert_eq!(lib.list_tracks().unwrap()[0].id, report.track_ids[0]);
+}
+
+#[test]
+fn panic_before_catalog_insert_removes_staged_audio() {
+    let root = tempfile::tempdir().unwrap();
+    let lib = Library::open(root.path()).unwrap();
+    let buffer = wav_buf();
+    let sound = crate::import::swf::Sound {
+        id: 3,
+        format: 0,
+        codec: "wav".into(),
+        sample_count: buffer.frames() as u32,
+        seek_samples: 0,
+        trimmed_leading: 0,
+        frames: Library::loop_buffer_to_wav(&buffer),
+    };
+    let (report, error) = lib
+        .import_sounds_with_progress(
+            "Panic",
+            "swf",
+            "/source/panic.swf",
+            "panic-before-insert",
+            None,
+            None,
+            &[sound],
+            |stage, _, _| {
+                if stage == "inserting in library" {
+                    panic!("injected callback panic");
+                }
+                Ok(())
+            },
+        )
+        .unwrap_err();
+    assert!(error.contains("failed unexpectedly"));
+    assert_eq!(report.added, 0);
+    assert!(lib.list_tracks().unwrap().is_empty());
+    let group = root.path().join(extracted_group_directory_name(
+        "Panic",
+        "panic-before-insert",
+    ));
+    assert!(std::fs::read_dir(group).unwrap().next().is_none());
+}
+
+#[test]
 fn cancelling_before_catalog_insert_removes_the_staged_audio_file() {
     let root = tmp_root("cancel-before-track-insert");
     let lib = Library::open(&root).unwrap();
@@ -2352,6 +2474,168 @@ fn reopening_purges_quarantine_after_catalog_commit() {
     let reopened = Library::open(root.path()).unwrap();
     assert!(reopened.get_track(id).unwrap().is_none());
     assert!(!staged.directory.exists());
+}
+
+#[test]
+fn sha256_hashes_keep_their_existing_lowercase_hex_format() {
+    assert_eq!(
+        sha256_hex(b"abc"),
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+    );
+    assert_eq!(
+        sha256_hex(b""),
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    );
+    assert_eq!(digest_hex(&[0, 1, 15, 16, 255]), "00010f10ff");
+}
+
+#[test]
+fn quarantine_cleanup_never_recursively_deletes_unexpected_files() {
+    let root = tempfile::tempdir().unwrap();
+    let lib = Library::open(root.path()).unwrap();
+    let input = root.path().join("input.wav");
+    write_wav(&input, &[1000; 16000], 8000);
+    let original_input = std::fs::read(&input).unwrap();
+    let id = lib
+        .import_one_custom(input.to_str().unwrap())
+        .track_id
+        .unwrap();
+    let track = lib.get_track(id).unwrap().unwrap();
+    let staged = lib
+        .quarantine_files(&[PathBuf::from(&track.file_path)])
+        .unwrap()
+        .unwrap();
+    let directory = staged.directory.clone();
+    let extra = directory.join("user-data");
+    std::fs::create_dir(&extra).unwrap();
+    std::fs::write(extra.join("notes.txt"), b"keep me").unwrap();
+    lib.conn
+        .execute("DELETE FROM tracks WHERE id=?1", [id])
+        .unwrap();
+
+    assert!(lib
+        .purge_quarantined(staged)
+        .unwrap_err()
+        .contains("unexpected quarantine entry"));
+    assert_eq!(std::fs::read(extra.join("notes.txt")).unwrap(), b"keep me");
+    assert!(directory.join("asset-0").is_file());
+    assert!(directory.join("manifest.json").is_file());
+    drop(lib);
+    assert!(Library::open(root.path()).is_err());
+    assert_eq!(std::fs::read(extra.join("notes.txt")).unwrap(), b"keep me");
+    assert_eq!(std::fs::read(&input).unwrap(), original_input);
+
+    // Once the user moves their unrelated data aside, recovery can finish.
+    let saved = root.path().join("saved-user-data");
+    std::fs::rename(&extra, &saved).unwrap();
+    let reopened = Library::open(root.path()).unwrap();
+    assert!(reopened.get_track(id).unwrap().is_none());
+    assert!(!directory.exists());
+    assert_eq!(std::fs::read(saved.join("notes.txt")).unwrap(), b"keep me");
+}
+
+#[test]
+fn recovery_preserves_staged_audio_when_quarantine_has_unknown_entries() {
+    let root = tempfile::tempdir().unwrap();
+    let lib = Library::open(root.path()).unwrap();
+    let input = root.path().join("input.wav");
+    write_wav(&input, &[1000; 16000], 8000);
+    let id = lib
+        .import_one_custom(input.to_str().unwrap())
+        .track_id
+        .unwrap();
+    let track = lib.get_track(id).unwrap().unwrap();
+    let staged = lib
+        .quarantine_files(&[PathBuf::from(&track.file_path)])
+        .unwrap()
+        .unwrap();
+    let extra = staged.directory.join("notes.txt");
+    std::fs::write(&extra, b"keep me").unwrap();
+    drop(lib);
+
+    assert!(Library::open(root.path()).is_err());
+    assert_eq!(std::fs::read(&extra).unwrap(), b"keep me");
+    assert!(staged.directory.join("asset-0").is_file());
+    let saved = root.path().join("saved-notes.txt");
+    std::fs::rename(&extra, &saved).unwrap();
+    let reopened = Library::open(root.path()).unwrap();
+    assert!(reopened.get_track(id).unwrap().unwrap().exists);
+    assert_eq!(std::fs::read(saved).unwrap(), b"keep me");
+}
+
+#[test]
+fn rollback_preserves_a_destination_created_after_quarantine() {
+    let root = tempfile::tempdir().unwrap();
+    let lib = Library::open(root.path()).unwrap();
+    let original = root.path().join("Custom Loops/track.wav");
+    std::fs::write(&original, b"managed audio").unwrap();
+    let staged = lib
+        .quarantine_files(std::slice::from_ref(&original))
+        .unwrap()
+        .unwrap();
+    std::fs::write(&original, b"new user file").unwrap();
+    assert!(lib.restore_quarantined(&staged).is_err());
+    assert_eq!(std::fs::read(&original).unwrap(), b"new user file");
+    assert_eq!(
+        std::fs::read(staged.directory.join("asset-0")).unwrap(),
+        b"managed audio"
+    );
+    assert!(staged.directory.join("manifest.json").exists());
+    let saved = root.path().join("saved-user-file.wav");
+    std::fs::rename(&original, &saved).unwrap();
+    lib.restore_quarantined(&staged).unwrap();
+    assert_eq!(std::fs::read(&original).unwrap(), b"managed audio");
+    assert_eq!(std::fs::read(saved).unwrap(), b"new user file");
+}
+
+#[cfg(unix)]
+#[test]
+fn recovery_restores_staged_symlinks_without_following_or_overwriting_them() {
+    use std::os::unix::fs::symlink;
+
+    for dangling in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("external.wav");
+        if !dangling {
+            std::fs::write(&target, b"external contents").unwrap();
+        }
+        let lib = Library::open(root.path()).unwrap();
+        let input = root.path().join("input.wav");
+        write_wav(&input, &[1000; 16000], 8000);
+        let id = lib
+            .import_one_custom(input.to_str().unwrap())
+            .track_id
+            .unwrap();
+        let managed = PathBuf::from(lib.get_track(id).unwrap().unwrap().file_path);
+        std::fs::remove_file(&managed).unwrap();
+        symlink(&target, &managed).unwrap();
+        let staged = lib
+            .quarantine_files(std::slice::from_ref(&managed))
+            .unwrap()
+            .unwrap();
+        let conflict_target = outside.path().join("missing-conflict");
+        symlink(&conflict_target, &managed).unwrap();
+        drop(lib);
+
+        // A dangling destination still exists and must never be overwritten.
+        assert!(Library::open(root.path()).is_err());
+        assert_eq!(std::fs::read_link(&managed).unwrap(), conflict_target);
+        assert_eq!(
+            std::fs::read_link(staged.directory.join("asset-0")).unwrap(),
+            target
+        );
+        std::fs::remove_file(&managed).unwrap();
+        let reopened = Library::open(root.path()).unwrap();
+        assert_eq!(std::fs::read_link(&managed).unwrap(), target);
+        assert_eq!(reopened.get_track(id).unwrap().unwrap().exists, !dangling);
+        assert!(!staged.directory.exists());
+        if !dangling {
+            assert_eq!(std::fs::read(&target).unwrap(), b"external contents");
+        } else {
+            assert!(!target.exists());
+        }
+    }
 }
 
 #[test]

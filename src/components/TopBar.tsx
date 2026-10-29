@@ -37,6 +37,8 @@ export default function TopBar({ onLibraryReady, playing, onAudioOptions, onMidi
   const accumulatedMs = useRef(0);
   const segmentStartedAt = useRef<number | null>(null);
   const metronomeEnabledRef = useRef(false);
+  const libraryRequest = useRef(0);
+  const librarySelected = useRef(false);
 
   useEffect(() => { metronomeEnabledRef.current = metronomeEnabled; }, [metronomeEnabled]);
 
@@ -134,25 +136,32 @@ export default function TopBar({ onLibraryReady, playing, onAudioOptions, onMidi
 
   useEffect(() => {
     let cancelled = false;
+    const request = ++libraryRequest.current;
+    const current = () => !cancelled && request === libraryRequest.current;
     let restoreFailed = false;
     const rememberedRoot = localStorage.getItem("olooper.library.root");
     Promise.all([getAppStatus(), libraryDefaultRoot(), libraryRestore(rememberedRoot).catch((cause) => {
       restoreFailed = true;
-      if (!cancelled) setError(`Could not open the saved library: ${String(cause)}`);
+      if (current()) setError(`Could not open the saved library: ${String(cause)}`);
       return null;
     })])
       .then(([appStatus, defaultRoot, savedRoot]) => {
         if (cancelled) return;
+        // Status is independent of the chosen library; a delayed startup may
+        // still provide it after a newer manual selection has started.
+        setStatus((previous) => previous ?? { ...appStatus, library_set: librarySelected.current });
+        if (!current()) return;
         try {
           if (savedRoot) localStorage.setItem("olooper.library.root", savedRoot);
           else if (rememberedRoot && !restoreFailed) localStorage.removeItem("olooper.library.root");
         } catch (cause) { setError(`Library opened, but its preference could not be saved: ${String(cause)}`); }
         setRoot(savedRoot ?? (restoreFailed ? rememberedRoot ?? defaultRoot : defaultRoot));
+        librarySelected.current = savedRoot !== null;
         setStatus({ ...appStatus, library_set: savedRoot !== null });
         if (savedRoot) onLibraryReady(savedRoot);
         else setSetupOpen(true);
       })
-      .catch((e) => !cancelled && setError(`Could not prepare library: ${String(e)}`));
+      .catch((e) => current() && setError(`Could not prepare library: ${String(e)}`));
     return () => { cancelled = true; };
   }, [onLibraryReady]);
 
@@ -168,10 +177,14 @@ export default function TopBar({ onLibraryReady, playing, onAudioOptions, onMidi
   };
 
   const init = () => {
+    const request = ++libraryRequest.current;
+    const current = () => request === libraryRequest.current;
     setInitializing(true);
     setError(null);
     libraryInit(root)
       .then((libraryRoot) => {
+        if (!current()) return;
+        librarySelected.current = true;
         setStatus((current) => current ? { ...current, library_set: true } : current);
         try { localStorage.setItem("olooper.library.root", libraryRoot); }
         catch (cause) { setError(`Library opened, but its preference could not be saved: ${String(cause)}`); }
@@ -179,8 +192,8 @@ export default function TopBar({ onLibraryReady, playing, onAudioOptions, onMidi
         setSetupOpen(false);
         onLibraryReady(libraryRoot);
       })
-      .catch((e) => setError(String(e)))
-      .finally(() => setInitializing(false));
+      .catch((e) => { if (current()) setError(String(e)); })
+      .finally(() => { if (current()) setInitializing(false); });
   };
 
   return (

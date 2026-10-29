@@ -85,8 +85,12 @@ other than 1–2.
   `audio-output.previous.log` when the active log reaches 2 MiB. Entries record
   session OS/CPU facts (plus Rosetta state on macOS), enumerated output capabilities, selection and
   stream results/errors, output-test peak levels, and decoded audio/loop shape.
-  They omit track names, source paths, and audio data; no per-buffer callback
-  logging or disk I/O is performed.
+   They omit track names, source paths, and audio data; no per-buffer callback
+   logging or disk I/O is performed.
+- The diagnostic directory must resolve inside the library. Existing log files
+  must be regular files; Unix opens reject last-component symbolic links and
+  nonblocking opens avoid waiting on FIFOs. The directory is rechecked before
+  writes, but these checks do not eliminate every concurrent filesystem race.
 - The frontend invokes output commands through `src/tauri.ts`; the backend
   applies routing on the existing audio engine thread.
 

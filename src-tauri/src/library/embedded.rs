@@ -111,11 +111,12 @@ impl SourceCache {
 
 fn source(path: &str, source_type: &str, expected_hash: &str) -> Result<Arc<SoundSource>, String> {
     let cache = CACHE.get_or_init(|| Mutex::new(SourceCache::default()));
-    let file = std::fs::File::open(path).map_err(|error| format!("cannot open source: {error}"))?;
+    let file = crate::bounded_io::open_regular(path)
+        .map_err(|error| format!("cannot open source: {error}"))?;
     let metadata = file
         .metadata()
         .map_err(|error| format!("cannot inspect source: {error}"))?;
-    if !metadata.is_file() || metadata.len() > MAX_SOURCE_BYTES {
+    if metadata.len() > MAX_SOURCE_BYTES {
         return Err("source exceeds the 512 MiB limit".to_string());
     }
     let key = SourceKey::new(path, source_type, expected_hash, &metadata);

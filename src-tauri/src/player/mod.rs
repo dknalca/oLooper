@@ -1,8 +1,9 @@
 //! Practice player: decode-on-load + gapless region looping.
 //!
-//! Timing lives here, never in the UI: the frontend only polls
-//! [`PlayerStatus`]. Hardware (`OutputStream`) is created lazily so unit
-//! tests run headless; all loop math is hardware-free.
+//! Playback and loop-boundary timing live here; the frontend sends commands and
+//! polls [`PlayerStatus`]. The engine owns hardware on its dedicated thread, and
+//! decoding and pitch preparation run as background work. Hardware is created
+//! lazily so loop math and other unit tests can run headless.
 
 use std::collections::{BTreeSet, VecDeque};
 use std::io::Cursor;

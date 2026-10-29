@@ -142,6 +142,48 @@ it("a pause that cancels an armed native request preserves the original target i
   playback.configure(null);
 });
 
+it.each([
+  ["pause", { playing: false }],
+  ["speed", { speed_pct: 120 }],
+  ["pitch lock", { pitch_lock: true }],
+  ["loop start", { loop_start_ms: 1000 }],
+  ["loop end", { loop_end_ms: 58_000 }],
+  ["loop enabled", { loop_enabled: false }],
+] as const)("invalidates a prepared switch when %s changes on the current track", async (_label, changes) => {
+  vi.useFakeTimers();
+  let request: RandomSwitchOptions | undefined;
+  const playback = setup((value) => {
+    request = value;
+    return new Promise<void>(() => {});
+  });
+  playback.updatePlayback(playing(59_000));
+  playback.configure(120_000);
+  await vi.advanceTimersByTimeAsync(117_000);
+  expect(request?.signal?.aborted).toBe(false);
+  playback.updatePlayback(playing(59_000, changes));
+  expect(request?.signal?.aborted).toBe(true);
+  playback.configure(null);
+});
+
+it.each([
+  ["position polling", { position_ms: 12_000 }],
+  ["another generation", { generation: 2, speed_pct: 120 }],
+  ["another path", { path: "second", speed_pct: 120 }],
+] as const)("does not cancel a prepared switch for %s", async (_label, changes) => {
+  vi.useFakeTimers();
+  let request: RandomSwitchOptions | undefined;
+  const playback = setup((value) => {
+    request = value;
+    return new Promise<void>(() => {});
+  });
+  playback.updatePlayback(playing(59_000));
+  playback.configure(120_000);
+  await vi.advanceTimersByTimeAsync(117_000);
+  playback.updatePlayback(playing(59_000, changes));
+  expect(request?.signal?.aborted).toBe(false);
+  playback.configure(null);
+});
+
 it("manual and timed changes call the same latest random action", async () => {
   vi.useFakeTimers();
   const all = vi.fn().mockResolvedValue(undefined);

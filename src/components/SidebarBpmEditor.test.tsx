@@ -38,9 +38,9 @@ const props = {
   onRegisterTrackNavigation: vi.fn(), onRegisterRandomScope: vi.fn(),
   onRegisterMidiLibraryNavigation: vi.fn(), onTrackLoading: vi.fn(), onTrackSelected: vi.fn(),
 };
-function Fixture({ generation = 0 }) {
+function Fixture({ generation = 0, activeTrackId = null }: { generation?: number; activeTrackId?: number | null }) {
   useModalFocus();
-  return <Sidebar {...props} libraryGeneration={generation} />;
+  return <Sidebar {...props} libraryGeneration={generation} activeTrackId={activeTrackId} />;
 }
 let user: ReturnType<typeof userEvent.setup>;
 const input = () => screen.getByRole("spinbutton", { name: /^BPM/ }) as HTMLInputElement;
@@ -123,6 +123,18 @@ it("same-value ×1 is manual confirmation, and embedded tracks never sync tags",
   expect(librarySyncSeratoMetadata).not.toHaveBeenCalled();
 });
 
+it("removes the uncertainty warning after a manual BPM is saved", async () => {
+  render(<Fixture />);
+  await open();
+  expect(screen.getByText(/Low-confidence estimate/)).toBeTruthy();
+  expect(screen.getByRole("button", { name: "Review uncertain BPM for Beat", hidden: true })).toBeTruthy();
+  fireEvent.change(input(), { target: { value: "123" } });
+  expect(screen.queryByText(/Low-confidence estimate/)).toBeNull();
+  await act(async () => { fireEvent.click(screen.getByRole("button", { name: "Save metadata" })); });
+  expect(libraryUpdateMetadata).toHaveBeenCalledWith(1, "Beat", 123, "", true);
+  expect(screen.queryByRole("button", { name: "Review uncertain BPM for Beat" })).toBeNull();
+});
+
 it("changing only a title does not apply the suggestion or trigger Serato BPM writes", async () => {
   render(<Fixture />);
   await open();
@@ -184,6 +196,31 @@ it("changing the library closes the editor and ignores the old-root preview", as
   expect(libraryUpdateMetadata).not.toHaveBeenCalled();
 });
 
+it.each(["success", "failure"] as const)("ignores a delayed metadata save %s after changing libraries", async (result) => {
+  let resolve!: (value: Track) => void;
+  let reject!: (reason: Error) => void;
+  vi.mocked(libraryUpdateMetadata).mockImplementationOnce(() => new Promise((yes, no) => { resolve = yes; reject = no; }));
+  const bpmEvent = vi.fn();
+  window.addEventListener("olooper:track-bpm", bpmEvent);
+  const view = render(<Fixture activeTrackId={1} />);
+  await open();
+  fireEvent.change(input(), { target: { value: "123" } });
+  fireEvent.click(screen.getByRole("button", { name: "Save metadata" }));
+  expect(libraryUpdateMetadata).toHaveBeenCalledWith(1, "Beat", 123, "", true);
+  vi.mocked(libraryList).mockResolvedValue([track({ title: "Other library" })]);
+  view.rerender(<Fixture generation={1} activeTrackId={1} />);
+  await act(async () => {
+    if (result === "success") resolve(track({ title: "Stale update", bpm: 123, bpm_source: "manual" }));
+    else reject(new Error("old library failure"));
+  });
+  expect(screen.getByText("Other library")).toBeTruthy();
+  expect(screen.queryByText("Stale update")).toBeNull();
+  expect(screen.queryByText(/old library failure/)).toBeNull();
+  expect(librarySyncSeratoMetadata).not.toHaveBeenCalled();
+  expect(bpmEvent).not.toHaveBeenCalled();
+  window.removeEventListener("olooper:track-bpm", bpmEvent);
+});
+
 it.each(["manual", "serato", "analyzed"])("preserves known %s BPMs without automatic preview", async (source) => {
   vi.mocked(libraryList).mockResolvedValue([track({ bpm: 100, bpm_source: source, bpm_confidence: null })]);
   render(<Fixture />);
@@ -216,6 +253,46 @@ it("double-clicking the title still plays instead of opening BPM metadata", asyn
   expect(playerPlay).toHaveBeenCalledOnce();
   expect(screen.queryByRole("dialog")).toBeNull();
   expect(libraryAnalyzeBpm).not.toHaveBeenCalled();
+});
+
+it("ignores an older track load that finishes after a newer selection", async () => {
+  const first = track({ id: 1, title: "First", file_path: "first.wav", playback_path: "first.wav" });
+  const second = track({ id: 2, title: "Second", file_path: "second.wav", playback_path: "second.wav" });
+  vi.mocked(libraryList).mockResolvedValue([first, second]);
+  let resolveFirst!: (status: PlayerStatus) => void;
+  const secondStatus = { loaded: true, loading: false, load_error: null, path: "second.wav" } as PlayerStatus;
+  vi.mocked(playerLoadTrack).mockImplementationOnce(() => new Promise((resolve) => { resolveFirst = resolve; }))
+    .mockResolvedValueOnce(secondStatus);
+  vi.mocked(playerPlay).mockResolvedValue(secondStatus);
+  render(<Fixture />);
+  await act(async () => {});
+  await user.dblClick(screen.getByText("First"));
+  await user.dblClick(screen.getByText("Second"));
+  await act(async () => { resolveFirst({ ...secondStatus, path: "first.wav" }); });
+  expect(vi.mocked(playerLoadTrack).mock.calls.map(([id]) => id)).toEqual([1, 2]);
+  expect(playerPlay).toHaveBeenCalledOnce();
+  expect(props.onTrackSelected).toHaveBeenCalledExactlyOnceWith(second, secondStatus);
+});
+
+it.each(["success", "failure"] as const)("ignores a track load %s from a previous library with matching ID and path", async (result) => {
+  const oldTrack = track({ title: "Old library" });
+  const newTrack = track({ title: "New library" });
+  vi.mocked(libraryList).mockResolvedValueOnce([oldTrack]).mockResolvedValue([newTrack]);
+  let finish!: (status: PlayerStatus) => void;
+  let reject!: (reason: Error) => void;
+  vi.mocked(playerLoadTrack).mockImplementationOnce(() => new Promise((resolve, fail) => { finish = resolve; reject = fail; }));
+  const view = render(<Fixture />);
+  await act(async () => {});
+  await user.dblClick(screen.getByText("Old library"));
+  view.rerender(<Fixture generation={1} />);
+  await act(async () => {
+    if (result === "success") finish({ loaded: true, loading: false, load_error: null, path: "beat.wav" } as PlayerStatus);
+    else reject(new Error("old library load failed"));
+  });
+  expect(screen.getByText("New library")).toBeTruthy();
+  expect(playerPlay).not.toHaveBeenCalled();
+  expect(props.onTrackSelected).not.toHaveBeenCalled();
+  expect(screen.queryByText(/old library load failed/)).toBeNull();
 });
 
 it("a pending or failed save preserves the selected draft and disables ratio controls", async () => {

@@ -2,11 +2,11 @@
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, expect, it, vi } from "vitest";
 import Player from "./Player";
-import { libraryGetSeratoMetadata, librarySetSeratoCue, type PlayerStatus, type SeratoMetadata } from "../tauri";
+import { libraryGetSeratoMetadata, librarySetSeratoCue, playerSetSpeed, playerSetVolume, type PlayerStatus, type SeratoMetadata } from "../tauri";
 
 vi.mock("../tauri", async (original) => ({
   ...await original<typeof import("../tauri")>(),
-  libraryGetSeratoMetadata: vi.fn(), librarySetSeratoCue: vi.fn(),
+  libraryGetSeratoMetadata: vi.fn(), librarySetSeratoCue: vi.fn(), playerSetSpeed: vi.fn(), playerSetVolume: vi.fn(),
 }));
 afterEach(() => { cleanup(); vi.useRealTimers(); vi.resetAllMocks(); });
 
@@ -66,4 +66,17 @@ it("publishes the canonical BPM source and confidence instead of inventing Serat
     await act(async () => {});
     expect((receive.mock.calls[0][0] as CustomEvent).detail).toEqual({ trackId: 1, bpm: 111, source: "analyzed", confidence: 0.2 });
   } finally { window.removeEventListener("olooper:track-bpm", receive); }
+});
+
+it("routes volume and pitch controls through the current player status handler", async () => {
+  const current = status(1);
+  const onStatusChange = vi.fn();
+  vi.mocked(playerSetVolume).mockResolvedValue({ ...current, volume_pct: 70 });
+  vi.mocked(playerSetSpeed).mockResolvedValue({ ...current, speed_pct: 105 });
+  render(<Player {...base} status={current} onStatusChange={onStatusChange} onRandomTrack={vi.fn()} />);
+  await act(async () => { fireEvent.change(screen.getByLabelText("Volume"), { target: { value: "70" } }); });
+  await act(async () => { fireEvent.click(screen.getByTitle("Faster")); });
+  expect(playerSetVolume).toHaveBeenCalledWith(70);
+  expect(playerSetSpeed).toHaveBeenCalledWith(105);
+  expect(onStatusChange).toHaveBeenCalledTimes(2);
 });

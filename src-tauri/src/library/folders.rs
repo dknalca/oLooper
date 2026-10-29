@@ -35,14 +35,42 @@ fn device_id(path: &Path) -> Result<Option<String>, String> {
     }
 }
 
-fn file_hash(path: &Path) -> Result<String, String> {
+#[derive(PartialEq, Eq)]
+struct SourceIdentity {
+    length: u64,
+    modified: Option<std::time::SystemTime>,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+fn source_identity(metadata: &std::fs::Metadata) -> SourceIdentity {
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt;
+    SourceIdentity {
+        length: metadata.len(),
+        modified: metadata.modified().ok(),
+        #[cfg(unix)]
+        device: metadata.dev(),
+        #[cfg(unix)]
+        inode: metadata.ino(),
+    }
+}
+
+fn path_identity(path: &Path) -> Result<SourceIdentity, String> {
     let kind = std::fs::symlink_metadata(path).map_err(|e| e.to_string())?;
     if !kind.is_file() {
         return Err("Source changed during scan; retry the scan".into());
     }
-    let mut file = std::fs::File::open(path).map_err(|e| e.to_string())?;
-    if !file.metadata().map_err(|e| e.to_string())?.is_file() {
-        return Err("Source is not a regular file".into());
+    Ok(source_identity(&kind))
+}
+
+fn file_hash(path: &Path) -> Result<(String, SourceIdentity), String> {
+    let before = path_identity(path)?;
+    let mut file = crate::bounded_io::open_regular(path).map_err(|e| e.to_string())?;
+    if source_identity(&file.metadata().map_err(|e| e.to_string())?) != before {
+        return Err("Source changed during scan; retry the scan".into());
     }
     let mut hash = Sha256::new();
     let mut buffer = [0; 65536];
@@ -59,7 +87,12 @@ fn file_hash(path: &Path) -> Result<String, String> {
         }
         hash.update(&buffer[..count]);
     }
-    Ok(format!("{:x}", hash.finalize()))
+    if source_identity(&file.metadata().map_err(|e| e.to_string())?) != before
+        || path_identity(path)? != before
+    {
+        return Err("Source changed during scan; retry the scan".into());
+    }
+    Ok((digest_hex(&hash.finalize()), before))
 }
 
 // Missing parents may mean a disconnected volume. Never prune in that case.
@@ -152,12 +185,19 @@ impl Library {
         complete: bool,
     ) -> Result<(), String> {
         let _guard = self.operations.lock.lock();
-        for folder in self.linked_folders()? {
+        let folders = self.linked_folders()?;
+        // A source may belong to nested linked folders. Either record all of
+        // those associations or none; a later rescan relies on their consistency.
+        let transaction = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| e.to_string())?;
+        for folder in folders {
             if Path::new(original).starts_with(&folder.path) {
-                self.conn.execute("INSERT INTO linked_folder_sources(folder_id,source_hash,complete) VALUES(?1,?2,?3) ON CONFLICT(folder_id,source_hash) DO UPDATE SET complete=MAX(complete,excluded.complete)", rusqlite::params![folder.id, hash, complete]).map_err(|e| e.to_string())?;
+                transaction.execute("INSERT INTO linked_folder_sources(folder_id,source_hash,complete) VALUES(?1,?2,?3) ON CONFLICT(folder_id,source_hash) DO UPDATE SET complete=MAX(complete,excluded.complete)", rusqlite::params![folder.id, hash, complete]).map_err(|e| e.to_string())?;
             }
         }
-        Ok(())
+        transaction.commit().map_err(|e| e.to_string())
     }
 
     pub fn folders_for_source(&self, hash: &str) -> Result<Vec<LinkedFolder>, String> {
@@ -183,6 +223,14 @@ impl Library {
     }
 
     pub fn rescan_folder(&self, id: i64) -> Result<FolderScan, String> {
+        self.rescan_folder_with_scan(id, crate::import_folder::scan)
+    }
+
+    fn rescan_folder_with_scan(
+        &self,
+        id: i64,
+        mut scan: impl FnMut(&Path) -> Result<Vec<String>, String>,
+    ) -> Result<FolderScan, String> {
         let folder = self
             .linked_folders()?
             .into_iter()
@@ -203,11 +251,14 @@ impl Library {
             Ok(())
         };
         verify_device()?;
-        let files = crate::import_folder::scan(Path::new(&folder.path))?;
+        let files = scan(Path::new(&folder.path))?;
         // Hash with bounded scratch, without holding the library mutation lock.
         let mut hashes = HashMap::new();
+        let mut identities = HashMap::new();
         for path in &files {
-            hashes.insert(path.clone(), file_hash(Path::new(path))?);
+            let (hash, identity) = file_hash(Path::new(path))?;
+            hashes.insert(path.clone(), hash);
+            identities.insert(path.clone(), identity);
         }
         let _guard = self.operations.lock.lock();
         let mut statement = self
@@ -249,8 +300,18 @@ impl Library {
                 missing.push(track.id);
             }
         }
-        // Recheck enumeration before pruning: a disappearing source root is not empty.
-        crate::import_folder::scan(Path::new(&folder.path))?;
+        // A successful second traversal alone is not enough: a different set of
+        // sources would make the hashes and deletion decisions stale.
+        if scan(Path::new(&folder.path))? != files {
+            return Err(
+                "Source folder changed during scan; nothing removed. Retry the scan.".into(),
+            );
+        }
+        for path in &files {
+            if path_identity(Path::new(path)).ok().as_ref() != identities.get(path) {
+                return Err("Source changed during scan; nothing removed. Retry the scan.".into());
+            }
+        }
         verify_device()?;
         let transaction = self
             .conn
@@ -297,6 +358,104 @@ mod tests {
         let path = root.join(name);
         std::fs::write(&path, bytes).unwrap();
         path.to_str().unwrap().into()
+    }
+
+    #[test]
+    fn source_association_rolls_back_all_nested_folders_on_failure() {
+        let library = tempfile::tempdir().unwrap();
+        let sources = tempfile::tempdir().unwrap();
+        let parent = sources.path().canonicalize().unwrap();
+        let nested = parent.join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        let original = source(&nested, "one.swf", b"source");
+        let lib = Library::open(library.path()).unwrap();
+        let outer = lib.link_folder(&parent, false, false).unwrap();
+        let inner = lib.link_folder(&nested, false, false).unwrap();
+        lib.conn.execute_batch(&format!(
+            "CREATE TRIGGER reject_nested_association BEFORE INSERT ON linked_folder_sources WHEN NEW.folder_id = {} BEGIN SELECT RAISE(ABORT, 'injected failure'); END;",
+            inner.id,
+        )).unwrap();
+
+        assert!(lib.record_folder_source(&original, "hash", true).is_err());
+        assert!(lib.folders_for_source("hash").unwrap().is_empty());
+        lib.conn
+            .execute_batch("DROP TRIGGER reject_nested_association")
+            .unwrap();
+        lib.record_folder_source(&original, "hash", true).unwrap();
+        let folders = lib.folders_for_source("hash").unwrap();
+        assert_eq!(
+            folders.iter().map(|folder| folder.id).collect::<Vec<_>>(),
+            vec![outer.id, inner.id]
+        );
+    }
+
+    #[test]
+    fn rescan_aborts_before_pruning_if_source_listing_changes() {
+        let library = tempfile::tempdir().unwrap();
+        let sources = tempfile::tempdir().unwrap();
+        let sources = sources.path().canonicalize().unwrap();
+        let lib = Library::open(library.path()).unwrap();
+        let original = source(&sources, "old.swf", b"original");
+        let hash = sha256_hex(b"original");
+        let folder = lib.link_folder(&sources, false, false).unwrap();
+        let id = super::super::tests::add_test_looper_track(&lib, library.path(), "track", &hash);
+        lib.conn.execute(
+            "UPDATE tracks SET audio_storage='embedded',file_path=?1,source_path=?1,source_managed=0 WHERE id=?2",
+            rusqlite::params![original, id],
+        ).unwrap();
+        lib.record_folder_source(&original, &hash, true).unwrap();
+        std::fs::remove_file(&original).unwrap();
+
+        let mut calls = 0;
+        let result = lib.rescan_folder_with_scan(folder.id, |root| {
+            calls += 1;
+            if calls == 2 {
+                std::fs::write(root.join("moved.swf"), b"original").unwrap();
+            }
+            crate::import_folder::scan(root)
+        });
+        assert!(result.unwrap_err().contains("nothing removed"));
+        assert_eq!(calls, 2);
+        assert!(lib.get_track(id).unwrap().is_some());
+        assert!(sources.join("moved.swf").is_file());
+        // A stable retry can relocate the track without changing its identity.
+        assert_eq!(lib.rescan_folder(folder.id).unwrap().removed, 0);
+        assert!(lib
+            .get_track(id)
+            .unwrap()
+            .unwrap()
+            .file_path
+            .ends_with("moved.swf"));
+    }
+
+    #[test]
+    fn rescan_aborts_if_source_content_changes_without_a_new_filename() {
+        let library = tempfile::tempdir().unwrap();
+        let sources = tempfile::tempdir().unwrap();
+        let sources = sources.path().canonicalize().unwrap();
+        let lib = Library::open(library.path()).unwrap();
+        let original = source(&sources, "source.swf", b"original");
+        let hash = sha256_hex(b"original");
+        let folder = lib.link_folder(&sources, false, false).unwrap();
+        let id = super::super::tests::add_test_looper_track(&lib, library.path(), "track", &hash);
+        lib.conn.execute(
+            "UPDATE tracks SET audio_storage='embedded',file_path=?1,source_path=?1,source_managed=0 WHERE id=?2",
+            rusqlite::params![original, id],
+        ).unwrap();
+        lib.record_folder_source(&original, &hash, true).unwrap();
+        std::fs::write(&original, b"different length").unwrap();
+
+        let mut calls = 0;
+        let result = lib.rescan_folder_with_scan(folder.id, |root| {
+            calls += 1;
+            if calls == 2 {
+                std::fs::write(&original, b"original").unwrap();
+            }
+            crate::import_folder::scan(root)
+        });
+        assert!(result.unwrap_err().contains("nothing removed"));
+        assert!(lib.get_track(id).unwrap().is_some());
+        assert_eq!(lib.rescan_folder(folder.id).unwrap().removed, 0);
     }
 
     #[test]

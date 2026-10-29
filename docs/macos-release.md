@@ -41,8 +41,12 @@ The frontend uses Tailwind CSS 3 to avoid Tailwind 4's Safari 16.4 CSS baseline,
 and import job IDs use `crypto.getRandomValues` with a fallback. Big Sur's
 WebKit 14.1 remains the minimum runtime target to verify on-device.
 
-The result is `dist/oLooper-<version>-unsigned.dmg`. It is not suitable for
-normal Gatekeeper distribution until signed and notarized.
+The result is `dist/oLooper-<version>-unsigned.dmg`. **All oLooper macOS releases
+are intentionally unsigned and unnotarized.** The project does not enroll in the
+Apple Developer Program or plan to add Developer ID signing/notarization. Users
+approve oLooper for their own Mac using the one-app Gatekeeper instructions in
+the [README](../README.md#macos--intel-and-apple-silicon). This does not disable
+Gatekeeper globally. See [ADR 0026](adr/0026-unsigned-macos-distribution.md).
 
 Verify a Universal bundle contains both architectures with:
 
@@ -52,15 +56,3 @@ lipo -archs oLooper.app/Contents/MacOS/oLooper
 
 The output should include both `x86_64` and `arm64`. A single-architecture
 bundle contains only the architecture selected by its build flag.
-
-With a Developer ID Application identity installed outside this repository:
-
-```sh
-codesign --force --deep --options runtime --sign "Developer ID Application: YOUR NAME (TEAMID)" oLooper.app
-./scripts/package-dmg.sh
-xcrun notarytool submit dist/oLooper-<version>-unsigned.dmg --keychain-profile YOUR_PROFILE --wait
-xcrun stapler staple dist/oLooper-<version>-unsigned.dmg
-```
-
-Never store the certificate, Apple ID password, API key, or keychain profile in
-the repository. Rename the final artifact only after notarization succeeds.

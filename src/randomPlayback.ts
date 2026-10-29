@@ -17,6 +17,18 @@ export function nearestLoopEnd(status: PlayerStatus, desiredMs: number): { delay
   return { delayMs: first + extra * periodMs, periodMs };
 }
 
+/** Changes to the current loop invalidate a prepared native boundary switch. */
+function invalidatesPreparedSwitch(previous: PlayerStatus | null, next: PlayerStatus | null): boolean {
+  const sameTrack = previous?.generation === next?.generation && previous?.path === next?.path;
+  if (!sameTrack || !next) return false;
+  return !next.playing
+    || next.speed_pct !== previous?.speed_pct
+    || next.pitch_lock !== previous?.pitch_lock
+    || next.loop_start_ms !== previous?.loop_start_ms
+    || next.loop_end_ms !== previous?.loop_end_ms
+    || next.loop_enabled !== previous?.loop_enabled;
+}
+
 /** The timer prepares a switch; the native source owns the actual loop endpoint. */
 export function createRandomPlayback(options: {
   action: (request?: RandomSwitchOptions) => Promise<boolean | void>;
@@ -100,8 +112,7 @@ export function createRandomPlayback(options: {
         pausedAt = null;
       }
       if (pending) {
-        const sameTrack = previous?.generation === next?.generation && previous?.path === next?.path;
-        if (pending.atLoopEnd && sameTrack && next && (!next.playing || next.speed_pct !== previous?.speed_pct || next.pitch_lock !== previous?.pitch_lock || next.loop_start_ms !== previous?.loop_start_ms || next.loop_end_ms !== previous?.loop_end_ms || next.loop_enabled !== previous?.loop_enabled)) {
+        if (pending.atLoopEnd && invalidatesPreparedSwitch(previous, next)) {
           pending.abort.abort();
         }
         return;

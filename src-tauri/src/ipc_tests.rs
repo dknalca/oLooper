@@ -8,6 +8,7 @@ fn ipc_catalog_switch_and_concurrent_cue_updates_are_isolated() {
     let app = tauri::test::mock_builder()
         .manage(player::spawn())
         .manage(Mutex::new(None::<library::Library>))
+        .manage(LibrarySelection::default())
         .manage(bpm_jobs::BpmJobs::default())
         .invoke_handler(tauri::generate_handler![
             library_init,

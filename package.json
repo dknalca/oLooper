@@ -13,6 +13,7 @@
     "build": "tsc && vite build",
     "preview": "vite preview",
     "test": "vitest run",
+    "quality:baseline": "node scripts/quality-baseline.mjs",
     "typecheck": "tsc --noEmit",
     "tauri": "tauri"
   },

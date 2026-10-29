@@ -20,6 +20,8 @@ import {
   type SeratoMetadata,
 } from "../tauri";
 import { exposePlayerState } from "../hooks/useKeyboardShortcuts";
+import CueControls from "./CueControls";
+import PlayerAudioControls from "./PlayerAudioControls";
 
 function fmt(ms: number): string {
   const s = Math.floor(ms / 1000);
@@ -27,8 +29,6 @@ function fmt(ms: number): string {
     Math.floor((ms % 1000) / 100),
   )}`;
 }
-
-const CUE_SLOTS = Array.from({ length: 4 }, (_, index) => index + 1);
 
 interface Props {
   status: PlayerStatus | null;
@@ -83,7 +83,7 @@ export default function Player({ status: st, trackId, audioStorage, playbackPath
     return () => window.removeEventListener("olooper:random-loop", random);
   }, [canRandom, randomPlayback]);
 
-  // CUEs live in the audio file, not the private catalog DB.
+  // Managed audio tags own editable CUEs; embedded tracks only expose fixed CUE 1.
   const [cues, setCues] = useState<SeratoCue[]>([]);
   const [metadataTrackId, setMetadataTrackId] = useState<number | null>(null);
   const [activeCueSlot, setActiveCueSlot] = useState<number | null>(null);
@@ -435,70 +435,15 @@ export default function Player({ status: st, trackId, audioStorage, playbackPath
 
         <div className="w-px h-5 bg-border" />
 
-        {/* Volume */}
-        <div className="flex items-center gap-1.5">
-          <svg viewBox="0 0 16 16" className="w-3.5 h-3.5 fill-text-secondary shrink-0">
-            <path d="M2 5.5h2.5L8 2.5v11l-3.5-3H2a.5.5 0 01-.5-.5V6a.5.5 0 01.5-.5z" />
-            {(st?.volume_pct ?? 80) > 0 && (
-              <path d="M10 5.5a3.5 3.5 0 010 5" fill="none" stroke="currentColor" strokeWidth="1.2" className="text-text-secondary" />
-            )}
-            {(st?.volume_pct ?? 80) > 50 && (
-              <path d="M11.5 3.5a6 6 0 010 9" fill="none" stroke="currentColor" strokeWidth="1.2" className="text-text-secondary" />
-            )}
-          </svg>
-          <input
-            type="range"
-            min={0}
-            max={100}
-            value={st?.volume_pct ?? 80}
-            onChange={(e) => run(playerSetVolume(Number(e.target.value)))}
-            aria-label="Volume"
-            className="w-16"
-          />
-        </div>
-
-         <div className="w-px h-5 bg-border" />
-
-         <div className="flex items-center gap-1">
-            <span className="mr-1 text-[9px] font-semibold uppercase tracking-wide text-text-secondary">Pitch</span>
-            <button onClick={() => run(playerSetSpeed(Math.max(50, (st?.speed_pct ?? 100) - 5)))} disabled={!loaded} title="Slower" className="rounded bg-border px-1.5 py-0.5 text-xs text-text-secondary hover:text-text disabled:opacity-30">−</button>
-            <span className="w-9 text-center font-mono text-[10px] text-text-secondary">{Math.round(st?.speed_pct ?? 100)}%</span>
-            <button onClick={() => run(playerSetSpeed(Math.min(200, (st?.speed_pct ?? 100) + 5)))} disabled={!loaded} title="Faster" className="rounded bg-border px-1.5 py-0.5 text-xs text-text-secondary hover:text-text disabled:opacity-30">+</button>
-          </div>
+        <PlayerAudioControls status={st} loaded={loaded} onVolume={(value) => run(playerSetVolume(value))}
+          onSpeed={(value) => run(playerSetSpeed(value))} />
 
           <div className="w-px h-5 bg-border" />
 
           {loaded && trackId && (
-            <div className="flex items-center gap-1">
-                <span className="mr-1 text-[9px] font-semibold uppercase tracking-wide text-text-secondary">CUE</span>
-                {CUE_SLOTS.map((slot) => {
-                  const cue = cues.find((saved) => saved.slot === slot);
-                  const ready = metadataTrackId === trackId && loaded;
-                  return (
-                    <span key={slot} className="flex items-center">
-                      <button
-                        onClick={() => cue ? loadCue(slot) : saveCue(slot)}
-                        disabled={!ready || (audioStorage === "embedded" && slot !== 1)}
-                        title={slot === 1 ? "CUE 1 is fixed at the start of the track" : audioStorage === "embedded" ? "Source-backed audio only has CUE 1" : cue ? `Jump to CUE ${slot}` : `Save CUE ${slot} at the current position`}
-                        className={`w-6 h-6 rounded text-[10px] font-bold transition-colors disabled:opacity-40 ${
-                          activeCueSlot === slot
-                            ? "bg-accent text-app"
-                            : cue
-                              ? "bg-success/20 text-success hover:bg-success/30"
-                              : "bg-border text-text-secondary hover:bg-border hover:text-text"
-                        }`}
-                      >{slot}</button>
-                      {cue && slot > 1 && <button onClick={() => clearCue(slot)} title={`Clear CUE ${slot}`} aria-label={`Clear CUE ${slot}`} className="-ml-1 rounded px-1 text-[10px] text-text-secondary hover:bg-danger/10 hover:text-danger">×</button>}
-                    </span>
-                  );
-                })}
-                {audioStorage === "extracted" && <button
-                  onClick={() => void syncSeratoMetadata(trackId)}
-                  disabled={metadataTrackId !== trackId || seratoSyncing}
-                  title="Write CUEs and BPM into this audio file"
-                  className="ml-1 rounded bg-accent/15 px-2 py-1 text-[9px] font-medium text-accent hover:bg-accent/25 disabled:opacity-40"
-                >{seratoSyncing ? "Sync…" : "Audio tags"}</button>}
-            </div>
+            <CueControls cues={cues} ready={metadataTrackId === trackId && loaded} audioStorage={audioStorage}
+              activeCueSlot={activeCueSlot} syncing={seratoSyncing} onLoad={loadCue} onSave={saveCue}
+              onClear={clearCue} onSync={() => void syncSeratoMetadata(trackId)} />
           )}
 
         <button

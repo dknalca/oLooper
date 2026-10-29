@@ -44,6 +44,8 @@ loop-boundary suggestion.
   the existing background import worker. Enforce response size/count limits,
   timeouts, safe redirects, supported audio decoding, cancellation, and per-loop
   progress/errors. Never fetch arbitrary hosts from untrusted page data.
+  Rust audio/cover downloads and redirects require the expected HTTPS host,
+  default port and no URL credentials; redirects are limited to ten hops.
 - Tablist stores tracks as AAC in M4A containers. Include Symphonia AAC/ISO-MP4
   decoding; rodio's built-in MP4 adapter panics during initialization on these
   files, so `player::decode_bytes` handles ISO-BMFF directly. M4A decoding trims

@@ -75,7 +75,7 @@ enum MarkerContainer {
     Mp4,
 }
 
-const MAX_ID3_CHUNK_BYTES: u32 = 64 * 1024 * 1024;
+const MAX_WAV_ID3_BYTES: u64 = 64 * 1024 * 1024;
 
 struct AudioTag {
     tag: Tag,
@@ -83,14 +83,18 @@ struct AudioTag {
 }
 
 fn read_audio_tag(path: &Path) -> Result<AudioTag, String> {
-    let mut file =
-        File::open(path).map_err(|error| format!("cannot read audio metadata: {error}"))?;
+    let mut file = crate::bounded_io::open_regular(path)
+        .map_err(|error| format!("cannot read audio metadata: {error}"))?;
     let mut header = [0u8; 12];
     let header_read = file.read_exact(&mut header);
     if header_read.is_ok() && header[..4] == *b"RIFF" && header[8..12] == *b"WAVE" {
         return read_wave_id3_tag(file, header);
     }
-    match Tag::read_from_path(path) {
+    // Parse the same validated descriptor: reopening the path would allow it to
+    // be replaced with a FIFO between the header check and the ID3 read.
+    file.rewind()
+        .map_err(|error| format!("cannot seek audio metadata: {error}"))?;
+    match Tag::read_from2(file) {
         Ok(tag) => Ok(AudioTag {
             tag,
             needs_wave_id3_normalization: false,
@@ -104,6 +108,14 @@ fn read_audio_tag(path: &Path) -> Result<AudioTag, String> {
 }
 
 fn read_wave_id3_tag(mut file: File, header: [u8; 12]) -> Result<AudioTag, String> {
+    read_wave_id3_tag_with_limit(&mut file, header, MAX_WAV_ID3_BYTES)
+}
+
+fn read_wave_id3_tag_with_limit(
+    file: &mut File,
+    header: [u8; 12],
+    max_tag_bytes: u64,
+) -> Result<AudioTag, String> {
     let file_size = file
         .metadata()
         .map_err(|error| format!("cannot inspect WAV metadata: {error}"))?
@@ -116,6 +128,9 @@ fn read_wave_id3_tag(mut file: File, header: [u8; 12]) -> Result<AudioTag, Strin
 
     let mut offset = 12u64;
     let mut id3_chunks = Vec::<(bool, Tag)>::new();
+    // Several individually valid ID3 chunks can coexist in one WAV. Bound
+    // their combined size before retaining the decoded tags for merging.
+    let mut total_tag_bytes = 0u64;
     while offset + 8 <= riff_end {
         file.seek(SeekFrom::Start(offset))
             .map_err(|error| format!("cannot seek WAV chunks: {error}"))?;
@@ -133,8 +148,9 @@ fn read_wave_id3_tag(mut file: File, header: [u8; 12]) -> Result<AudioTag, Strin
         }
 
         if chunk_header[..4].eq_ignore_ascii_case(b"ID3 ") {
-            if size > MAX_ID3_CHUNK_BYTES {
-                return Err("WAV ID3 chunk is too large".to_string());
+            total_tag_bytes += u64::from(size);
+            if total_tag_bytes > max_tag_bytes {
+                return Err("WAV ID3 chunks exceed the metadata size limit".to_string());
             }
             let mut contents = vec![0; size as usize];
             file.read_exact(&mut contents)
@@ -211,7 +227,9 @@ fn write_audio_tag(path: &Path, tag: &Tag) -> Result<(), String> {
     if is_wave_file(path)? {
         rewrite_wave_id3_tag(path, tag)
     } else {
-        tag.write_to_path(path, Version::Id3v23)
+        let file = crate::bounded_io::open_regular_for_update(path)
+            .map_err(|error| format!("cannot open audio metadata for writing: {error}"))?;
+        tag.write_to_file(file, Version::Id3v23)
             .map_err(|error| format!("cannot write audio ID3 metadata: {error}"))
     }
 }
@@ -235,8 +253,8 @@ pub(super) fn copy_wav_id3_metadata_to_mp3(
 }
 
 fn is_wave_file(path: &Path) -> Result<bool, String> {
-    let mut file =
-        File::open(path).map_err(|error| format!("cannot inspect audio file: {error}"))?;
+    let mut file = crate::bounded_io::open_regular(path)
+        .map_err(|error| format!("cannot inspect audio file: {error}"))?;
     let mut header = [0u8; 12];
     if file.read_exact(&mut header).is_err() {
         return Ok(false);
@@ -277,7 +295,8 @@ fn rewrite_wave_id3_tag(path: &Path, tag: &Tag) -> Result<(), String> {
         .map_err(|error| format!("cannot create temporary Serato WAV file: {error}"))?;
 
     let rewrite_result = (|| -> Result<(), String> {
-        let mut source = File::open(path).map_err(|error| format!("cannot read WAV: {error}"))?;
+        let mut source = crate::bounded_io::open_regular(path)
+            .map_err(|error| format!("cannot read WAV: {error}"))?;
         let file_size = source
             .metadata()
             .map_err(|error| format!("cannot inspect WAV size: {error}"))?
@@ -458,7 +477,7 @@ fn read_id3_audio_file(path: &Path) -> Result<ReadAudioMetadata, String> {
 
 fn read_vorbis_audio_file(path: &Path, flac: bool) -> Result<ReadAudioMetadata, String> {
     let (marker_value, bpm_value) = if flac {
-        let mut file = File::open(path).map_err(|error| error.to_string())?;
+        let mut file = crate::bounded_io::open_regular(path).map_err(|error| error.to_string())?;
         let tagged = FlacFile::read_from(&mut file, ParseOptions::default())
             .map_err(|error| format!("cannot read FLAC metadata: {error}"))?;
         let comments = tagged.vorbis_comments();
@@ -471,7 +490,7 @@ fn read_vorbis_audio_file(path: &Path, flac: bool) -> Result<ReadAudioMetadata, 
                 .map(str::to_string),
         )
     } else {
-        let mut file = File::open(path).map_err(|error| error.to_string())?;
+        let mut file = crate::bounded_io::open_regular(path).map_err(|error| error.to_string())?;
         let tagged = VorbisFile::read_from(&mut file, ParseOptions::default())
             .map_err(|error| format!("cannot read Ogg metadata: {error}"))?;
         let comments = tagged.vorbis_comments();
@@ -507,7 +526,8 @@ fn read_vorbis_audio_file(path: &Path, flac: bool) -> Result<ReadAudioMetadata, 
 }
 
 fn read_mp4_audio_file(path: &Path) -> Result<ReadAudioMetadata, String> {
-    let tag = Mp4Tag::read_from_path(path)
+    let mut file = crate::bounded_io::open_regular(path).map_err(|error| error.to_string())?;
+    let tag = Mp4Tag::read_from(&mut file)
         .map_err(|error| format!("cannot read MP4/M4A metadata: {error}"))?;
     let legacy_ident = Mp4DataIdent::freeform(SERATO_MP4_MEAN, SERATO_MP4_MARKERS_NAME);
     let markers = tag
@@ -682,8 +702,8 @@ fn copy_to_temporary_file(path: &Path) -> Result<PathBuf, String> {
         .map_err(|error| format!("cannot create temporary Serato metadata file: {error}"))?;
 
     let copy_result = (|| -> Result<(), String> {
-        let mut source =
-            File::open(path).map_err(|error| format!("cannot read audio file: {error}"))?;
+        let mut source = crate::bounded_io::open_regular(path)
+            .map_err(|error| format!("cannot read audio file: {error}"))?;
         crate::bounded_io::copy(&mut source, &mut output, 512 * 1024 * 1024)
             .map_err(|error| format!("cannot copy audio for Serato metadata: {error}"))?;
         output
@@ -816,7 +836,8 @@ fn update_vorbis_temporary_file(
         }
     }
     if flac {
-        let mut file = File::open(temporary).map_err(|error| error.to_string())?;
+        let mut file = crate::bounded_io::open_regular_for_update(temporary)
+            .map_err(|error| error.to_string())?;
         let mut audio = FlacFile::read_from(&mut file, ParseOptions::default())
             .map_err(|error| format!("cannot read FLAC metadata: {error}"))?;
         let previous = audio
@@ -835,11 +856,13 @@ fn update_vorbis_temporary_file(
         if let Some(bpm) = metadata.bpm {
             comments.insert("BPM".to_string(), bpm.to_string());
         }
+        file.rewind().map_err(|error| error.to_string())?;
         audio
-            .save_to_path(temporary, WriteOptions::default())
+            .save_to(&mut file, WriteOptions::default())
             .map_err(|error| format!("cannot write FLAC Serato markers: {error}"))?;
     } else {
-        let mut file = File::open(temporary).map_err(|error| error.to_string())?;
+        let mut file = crate::bounded_io::open_regular_for_update(temporary)
+            .map_err(|error| error.to_string())?;
         let mut audio = VorbisFile::read_from(&mut file, ParseOptions::default())
             .map_err(|error| format!("cannot read Ogg metadata: {error}"))?;
         let previous = audio
@@ -853,8 +876,9 @@ fn update_vorbis_temporary_file(
         if let Some(bpm) = metadata.bpm {
             comments.insert("BPM".to_string(), bpm.to_string());
         }
+        file.rewind().map_err(|error| error.to_string())?;
         audio
-            .save_to_path(temporary, WriteOptions::default())
+            .save_to(&mut file, WriteOptions::default())
             .map_err(|error| format!("cannot write Ogg Serato markers: {error}"))?;
     }
 
@@ -882,7 +906,9 @@ fn update_mp4_temporary_file(
             return Err("BPM is outside the supported range".to_string());
         }
     }
-    let mut tag = Mp4Tag::read_from_path(temporary)
+    let mut file =
+        crate::bounded_io::open_regular_for_update(temporary).map_err(|error| error.to_string())?;
+    let mut tag = Mp4Tag::read_from(&mut file)
         .map_err(|error| format!("cannot read MP4/M4A metadata: {error}"))?;
     let markers_ident = Mp4DataIdent::freeform(SERATO_MP4_MEAN, SERATO_MP4_MARKERS_NAME);
     let previous = tag
@@ -922,8 +948,10 @@ fn update_mp4_temporary_file(
     if let Some(bpm) = metadata.bpm {
         tag.userdata.set_bpm(bpm.round().clamp(20.0, 300.0) as u16);
     }
-    tag.write_to_path(temporary)
+    file.rewind().map_err(|error| error.to_string())?;
+    tag.write_to(&mut file)
         .map_err(|error| format!("cannot write MP4/M4A Serato markers: {error}"))?;
+    drop(file);
 
     verify_marker_metadata(temporary, metadata, duration_ms, MarkerContainer::Mp4)?;
     replace_file(temporary, destination)
@@ -1748,7 +1776,7 @@ pub(super) fn recover_replacement(destination: &Path) -> Result<(), String> {
             // Old backups omitted the extension: only recover matching audio,
             // never another missing file with the same stem.
             let mut header = [0u8; 12];
-            if File::open(entry.path())
+            if crate::bounded_io::open_regular(entry.path())
                 .and_then(|mut file| file.read_exact(&mut header))
                 .is_err()
             {
@@ -1780,7 +1808,7 @@ pub(super) fn recover_replacement(destination: &Path) -> Result<(), String> {
     let Some(backup) = backups.pop() else {
         return Ok(());
     };
-    fs::rename(backup.path(), destination).map_err(|error| {
+    crate::fs_ops::rename_noreplace(&backup.path(), destination).map_err(|error| {
         format!(
             "cannot restore Serato audio backup {}: {error}",
             backup.path().display()
@@ -1789,9 +1817,7 @@ pub(super) fn recover_replacement(destination: &Path) -> Result<(), String> {
 }
 
 fn replace_file(temporary: &Path, destination: &Path) -> Result<(), String> {
-    OpenOptions::new()
-        .write(true)
-        .open(temporary)
+    crate::bounded_io::open_regular_for_update(temporary)
         .and_then(|file| file.sync_all())
         .map_err(|error| format!("cannot flush updated audio metadata: {error}"))?;
     #[cfg(not(target_os = "windows"))]
@@ -1817,10 +1843,10 @@ fn replace_file(temporary: &Path, destination: &Path) -> Result<(), String> {
             std::process::id(),
             TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
         ));
-        fs::rename(destination, &backup)
+        crate::fs_ops::rename_noreplace(destination, &backup)
             .map_err(|error| format!("cannot stage library audio for Serato metadata: {error}"))?;
-        if let Err(error) = fs::rename(temporary, destination) {
-            return match fs::rename(&backup, destination) {
+        if let Err(error) = crate::fs_ops::rename_noreplace(temporary, destination) {
+            return match crate::fs_ops::rename_noreplace(&backup, destination) {
                 Ok(()) => Err(format!(
                     "cannot replace library audio with Serato metadata: {error}"
                 )),
@@ -1935,6 +1961,69 @@ mod tests {
             bytes.extend_from_slice(&(frame as i16).to_le_bytes());
         }
         bytes
+    }
+
+    #[test]
+    fn wav_id3_limit_applies_to_all_chunks_together() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("duplicate.wav");
+        fs::write(&path, wav_with_ramp(4)).unwrap();
+        let mut tag = Tag::new();
+        tag.set_title("Test");
+        let mut encoded = Vec::new();
+        tag.write_to(&mut encoded, Version::Id3v23).unwrap();
+        append_wav_chunk(&path, *b"ID3 ", &encoded);
+        append_wav_chunk(&path, *b"id3 ", &encoded);
+
+        let read_with_limit = |limit| {
+            let mut file = File::open(&path).unwrap();
+            let mut header = [0; 12];
+            file.read_exact(&mut header).unwrap();
+            read_wave_id3_tag_with_limit(&mut file, header, limit)
+        };
+        assert!(read_with_limit((encoded.len() * 2) as u64).is_ok());
+        let error = read_with_limit((encoded.len() * 2 - 1) as u64)
+            .err()
+            .expect("combined ID3 chunks must respect the limit");
+        assert!(error.contains("metadata size limit"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn metadata_operations_reject_fifo_without_waiting_for_a_writer() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("audio.wav");
+        let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: name is a valid, NUL-terminated path in the temporary directory.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            let results = [
+                read_audio_tag(&path).map(|_| ()),
+                is_wave_file(&path).map(|_| ()),
+                read_vorbis_audio_file(&path, true).map(|_| ()),
+                read_vorbis_audio_file(&path, false).map(|_| ()),
+                read_mp4_audio_file(&path).map(|_| ()),
+                copy_to_temporary_file(&path).map(|_| ()),
+                rewrite_wave_id3_tag(&path, &Tag::new()),
+                write_audio_tag(&path, &Tag::new()),
+                update_vorbis_temporary_file(&path, &path, &SeratoMetadata::default(), 1000, true),
+                update_vorbis_temporary_file(&path, &path, &SeratoMetadata::default(), 1000, false),
+                update_mp4_temporary_file(&path, &path, &SeratoMetadata::default(), 1000),
+                replace_file(&path, &path),
+            ];
+            let _ = sender.send(results);
+        });
+        let results = receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("metadata operations must not wait for a FIFO writer");
+        assert!(results.iter().all(Result::is_err));
+        // Failed staged writes must not leave their temporary files behind.
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
     }
 
     #[test]

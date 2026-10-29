@@ -479,7 +479,9 @@ fn client_for(host: &'static str) -> Result<Client, String> {
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(15))
         .redirect(redirect::Policy::custom(move |attempt| {
-            if attempt.url().scheme() == "https" && attempt.url().host_str() == Some(host) {
+            if attempt.previous().len() >= 10 {
+                attempt.error("Tablist redirect limit exceeded")
+            } else if trusted_https_host(attempt.url(), host) {
                 attempt.follow()
             } else {
                 attempt.stop()
@@ -487,6 +489,14 @@ fn client_for(host: &'static str) -> Result<Client, String> {
         }))
         .build()
         .map_err(|error| format!("Could not prepare secure Tablist connection: {error}"))
+}
+
+fn trusted_https_host(url: &Url, host: &str) -> bool {
+    url.scheme() == "https"
+        && url.host_str() == Some(host)
+        && url.port().is_none()
+        && url.username().is_empty()
+        && url.password().is_none()
 }
 
 fn checked_response(response: Response, operation: &str) -> Result<Response, String> {
@@ -518,11 +528,7 @@ fn remote_file_url(path: &str) -> Result<Url, String> {
             .and_then(|base| base.join(value.trim_start_matches('/')))
             .map_err(|_| "Tablist returned an invalid audio path".to_string())?
     };
-    if url.scheme() != "https"
-        || url.host_str() != Some("files.tablist.net")
-        || !url.username().is_empty()
-        || url.password().is_some()
-    {
+    if !trusted_https_host(&url, "files.tablist.net") {
         return Err("Tablist audio URL is outside files.tablist.net".to_string());
     }
     Ok(url)
@@ -743,10 +749,23 @@ mod tests {
         assert!(remote_file_url("https://attacker.test/audio.mp3").is_err());
         assert!(remote_file_url("http://files.tablist.net/audio.mp3").is_err());
         assert!(remote_file_url("../private/audio.mp3").is_err());
+        assert!(remote_file_url("https://files.tablist.net:8443/audio.mp3").is_err());
+        assert!(remote_file_url("https://user@files.tablist.net/audio.mp3").is_err());
         assert_eq!(
             remote_file_url("looper/audio.mp3").unwrap().as_str(),
             "https://files.tablist.net/looper/audio.mp3"
         );
+    }
+
+    #[test]
+    fn redirects_must_use_the_expected_host_and_default_https_port() {
+        let trusted = |url| trusted_https_host(&Url::parse(url).unwrap(), "files.tablist.net");
+        assert!(trusted("https://files.tablist.net/audio.mp3"));
+        assert!(trusted("https://files.tablist.net:443/audio.mp3"));
+        assert!(!trusted("https://files.tablist.net:8443/audio.mp3"));
+        assert!(!trusted("https://user:secret@files.tablist.net/audio.mp3"));
+        assert!(!trusted("http://files.tablist.net/audio.mp3"));
+        assert!(!trusted("https://other.test/audio.mp3"));
     }
 
     #[test]

@@ -9,6 +9,7 @@ oLooper is a Tauri 2 app: React/TypeScript frontend in `src/`, Rust backend in `
 - Rust tests: `cargo test --manifest-path src-tauri/Cargo.toml`; focus by appending a test-name filter (use `-- --exact` for exact matching).
 - The ignored SWF fixture regression requires `OLOOPER_TURNTABLE_FIXTURE=/path/to/file.swf cargo test --manifest-path src-tauri/Cargo.toml -- --ignored turntable_fixture`. Real samples belong in gitignored `loopersFlash/`, never commits.
 - macOS: `./scripts/build.sh [--dev] [--native | --arm64 | --x64] [--no-bundle]` (default is Universal 2; sets deployment target 11.0 and generates icons only when their contents change), then `./scripts/package-dmg.sh [--arm64 | --x64]` for an unsigned DMG; match architecture flags. Use `--dev --x64 --no-bundle` for a fast Intel debug executable smoke test. See `docs/macos-release.md`.
+- macOS distribution is intentionally unsigned/unnotarized; do not introduce signing secrets or change the release workflow without the user revisiting ADR 0026. User-specific Gatekeeper steps are in README installation instructions.
 - Windows: run `scripts/install-windows.ps1` in elevated PowerShell, restart the shell, then `scripts/build.ps1` (x64 MSVC NSIS installer in `dist/installers/`) or `scripts/build.ps1 -Dev` (unbundled debug executable).
 
 ## Architecture and constraints

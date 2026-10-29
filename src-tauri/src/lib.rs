@@ -154,6 +154,7 @@ pub mod autoloop;
 mod bounded_io;
 mod bpm_jobs;
 pub mod drag_out;
+mod fs_ops;
 pub mod import;
 mod import_folder;
 #[cfg(test)]
@@ -493,6 +494,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .manage(player::spawn())
         .manage(std::sync::Mutex::new(None::<library::Library>))
+        .manage(LibrarySelection::default())
         .manage(Mutex::new(midi::MidiManager::default()))
         .manage(bpm_jobs::BpmJobs::default())
         .setup(|app| {
@@ -946,6 +948,33 @@ fn player_set_diagnostics(
 
 type Db<'a> = tauri::State<'a, std::sync::Mutex<Option<library::Library>>>;
 
+/// The newest admitted library request owns the eventual commit, even if an
+/// older disk operation finishes later. Keep the gate held through activation.
+#[derive(Default)]
+struct LibrarySelection(Mutex<u64>);
+
+impl LibrarySelection {
+    fn begin(&self) -> Result<u64, String> {
+        let mut generation = self.0.lock().map_err(|error| error.to_string())?;
+        *generation = generation
+            .checked_add(1)
+            .ok_or("library selection limit reached")?;
+        Ok(*generation)
+    }
+
+    fn commit<T>(
+        &self,
+        generation: u64,
+        activate: impl FnOnce() -> Result<T, String>,
+    ) -> Result<T, String> {
+        let current = self.0.lock().map_err(|error| error.to_string())?;
+        if *current != generation {
+            return Err("Library selection superseded by a newer request".into());
+        }
+        activate()
+    }
+}
+
 fn db<'a>(db: &'a Db<'_>) -> Result<std::sync::MutexGuard<'a, Option<library::Library>>, String> {
     db.lock().map_err(|e| e.to_string())
 }
@@ -997,23 +1026,28 @@ async fn library_init(
     db: Db<'_>,
     audio: Audio<'_>,
     jobs: tauri::State<'_, bpm_jobs::BpmJobs>,
+    selection: tauri::State<'_, LibrarySelection>,
 ) -> Result<String, String> {
-    let (lib, root) = run_blocking(move || {
+    let generation = selection.begin()?;
+    let (lib, root, log_path) = run_blocking(move || {
         let lib = library::Library::open(std::path::Path::new(&root))?;
         let canonical = lib.root.canonicalize().map_err(|e| e.to_string())?;
-        audio_log::set_library_root(&canonical)
+        let log_path = audio_log::prepare_library_root(&canonical)
             .map_err(|error| format!("cannot initialize audio log folder: {error}"))?;
         let root = canonical.to_string_lossy().to_string();
-        Ok((lib, root))
+        Ok((lib, root, log_path))
     })
     .await?;
-    let mut selected = db.lock().map_err(|e| e.to_string())?;
-    if let Some(previous) = selected.as_ref() {
-        jobs.cancel_root(&previous.root);
-    }
-    audio.unload()?;
-    *selected = Some(lib);
-    Ok(root)
+    selection.commit(generation, || {
+        let mut selected = db.lock().map_err(|e| e.to_string())?;
+        audio.unload()?;
+        if let Some(previous) = selected.as_ref() {
+            jobs.cancel_root(&previous.root);
+        }
+        audio_log::activate_library_root(log_path);
+        *selected = Some(lib);
+        Ok(root)
+    })
 }
 
 #[tauri::command]
@@ -1022,9 +1056,11 @@ async fn library_restore(
     db: Db<'_>,
     audio: Audio<'_>,
     jobs: tauri::State<'_, bpm_jobs::BpmJobs>,
+    selection: tauri::State<'_, LibrarySelection>,
 ) -> Result<Option<String>, String> {
+    let generation = selection.begin()?;
     let result = run_blocking(
-        move || -> Result<Option<(library::Library, String)>, String> {
+        move || -> Result<Option<(library::Library, String, std::path::PathBuf)>, String> {
             let root = match root {
                 Some(root) => Some(root),
                 None => take_legacy_library_root()?,
@@ -1038,22 +1074,29 @@ async fn library_restore(
             }
             let lib = library::Library::open(path)?;
             let canonical = lib.root.canonicalize().map_err(|e| e.to_string())?;
-            audio_log::set_library_root(&canonical)
+            let log_path = audio_log::prepare_library_root(&canonical)
                 .map_err(|error| format!("cannot initialize audio log folder: {error}"))?;
-            Ok(Some((lib, canonical.to_string_lossy().to_string())))
+            Ok(Some((
+                lib,
+                canonical.to_string_lossy().to_string(),
+                log_path,
+            )))
         },
     )
     .await?;
-    let Some((lib, root)) = result else {
-        return Ok(None);
-    };
-    let mut selected = db.lock().map_err(|e| e.to_string())?;
-    if let Some(previous) = selected.as_ref() {
-        jobs.cancel_root(&previous.root);
-    }
-    audio.unload()?;
-    *selected = Some(lib);
-    Ok(Some(root))
+    selection.commit(generation, || {
+        let Some((lib, root, log_path)) = result else {
+            return Ok(None);
+        };
+        let mut selected = db.lock().map_err(|e| e.to_string())?;
+        audio.unload()?;
+        if let Some(previous) = selected.as_ref() {
+            jobs.cancel_root(&previous.root);
+        }
+        audio_log::activate_library_root(log_path);
+        *selected = Some(lib);
+        Ok(Some(root))
+    })
 }
 
 #[tauri::command]
@@ -1598,17 +1641,54 @@ impl ImportQueue {
     }
 }
 
-fn run_swf_job(app: &tauri::AppHandle, job: &ImportJob) {
-    run_container_job(app, job, /* exe */ false);
+fn run_swf_job(app: &tauri::AppHandle, job: &ImportJob, checkpoint: &mut ImportCheckpoint) {
+    run_container_job(app, job, /* exe */ false, checkpoint);
 }
 
-fn run_exe_job(app: &tauri::AppHandle, job: &ImportJob) {
-    run_container_job(app, job, /* exe */ true);
+fn run_exe_job(app: &tauri::AppHandle, job: &ImportJob, checkpoint: &mut ImportCheckpoint) {
+    run_container_job(app, job, /* exe */ true, checkpoint);
 }
 
-/// Shared SWF/EXE pipeline: copy source → locate+parse → decode+BPM+insert.
+type ContainerImportResult = Result<library::ImportReport, (library::ImportReport, String)>;
+
+/// Association can fail after tracks have committed; keep the original report
+/// and any earlier import error so the terminal event reflects both outcomes.
+fn associate_container_source(
+    lib: &library::Library,
+    path: &str,
+    source_hash: &str,
+    result: ContainerImportResult,
+) -> ContainerImportResult {
+    let report = match &result {
+        Ok(report) | Err((report, _)) => report,
+    };
+    if report.added + report.already_there == 0 {
+        return result;
+    }
+    let complete = matches!(&result, Ok(report) if report.failed.is_empty());
+    match lib.record_folder_source(path, source_hash, complete) {
+        Ok(()) => result,
+        Err(error) => {
+            let association_error =
+                format!("Audio imported, but folder association failed: {error}");
+            match result {
+                Ok(report) => Err((report, association_error)),
+                Err((report, previous)) => {
+                    Err((report, format!("{previous}; {association_error}")))
+                }
+            }
+        }
+    }
+}
+
+/// Shared SWF/EXE pipeline: read → locate+parse → optional copy → decode+BPM+insert.
 /// `paths[0]` is the dropped file. Runs on the worker with its own connection.
-fn run_container_job(app: &tauri::AppHandle, job: &ImportJob, exe: bool) {
+fn run_container_job(
+    app: &tauri::AppHandle,
+    job: &ImportJob,
+    exe: bool,
+    checkpoint: &mut ImportCheckpoint,
+) {
     let path = job.paths.first().map(String::as_str).unwrap_or("");
     let fail = |error: String| {
         emit_import_progress(app, &job.job_id, "failed", 0, 0, path, true, Some(error));
@@ -1788,6 +1868,10 @@ fn run_container_job(app: &tauri::AppHandle, job: &ImportJob, exe: bool) {
             &mut report_progress,
         )
     };
+    checkpoint.total = sounds.sounds.len() + sounds.skipped.len();
+    checkpoint.report = Some(match &report {
+        Ok(report) | Err((report, _)) => report.clone(),
+    });
     let skipped = || {
         sounds.skipped.iter().map(|sound| library::FailedSound {
             id: sound.id as i64,
@@ -1804,18 +1888,15 @@ fn run_container_job(app: &tauri::AppHandle, job: &ImportJob, exe: bool) {
             Err((report, error))
         }
     };
+    checkpoint.report = Some(match &report {
+        Ok(report) | Err((report, _)) => report.clone(),
+    });
     let imported_tracks = match &report {
         Ok(report) => report.added + report.already_there,
         Err((partial, _)) => partial.added + partial.already_there,
     };
+    let report = associate_container_source(&lib, path, &source_hash, report);
     if imported_tracks > 0 {
-        let complete = matches!(&report, Ok(report) if report.failed.is_empty());
-        if let Err(error) = lib.record_folder_source(path, &source_hash, complete) {
-            fail(format!(
-                "Audio imported, but folder association failed: {error}"
-            ));
-            return;
-        }
         if let Some(cover) = sounds.cover_image.as_deref() {
             if let Err(error) = lib.save_group_cover(&source_hash, cover) {
                 eprintln!("[oLooper] SWF cover was not saved: {error}");
@@ -1841,10 +1922,10 @@ fn run_container_job(app: &tauri::AppHandle, job: &ImportJob, exe: bool) {
                 app,
                 &job.job_id,
                 processed,
-                sounds.sounds.len(),
+                sounds.sounds.len() + sounds.skipped.len(),
                 format!(
                     "{error}: {processed}/{} sounds processed",
-                    sounds.sounds.len()
+                    sounds.sounds.len() + sounds.skipped.len()
                 ),
                 Some(partial),
                 None,
@@ -1854,25 +1935,51 @@ fn run_container_job(app: &tauri::AppHandle, job: &ImportJob, exe: bool) {
     }
 }
 
+#[derive(Default)]
+struct ImportCheckpoint {
+    total: usize,
+    report: Option<library::ImportReport>,
+    custom_report: Option<Vec<library::CustomReport>>,
+}
+
+impl ImportCheckpoint {
+    fn panic_event(self, job_id: &str) -> ImportProgress {
+        let current = self.report.as_ref().map_or_else(
+            || self.custom_report.as_ref().map_or(0, Vec::len),
+            |report| report.added + report.already_there + report.failed.len(),
+        );
+        ImportProgress {
+            job_id: job_id.to_owned(),
+            stage: "complete".into(),
+            current,
+            total: self.total,
+            detail: "Import failed unexpectedly; the current item may already be in the library"
+                .into(),
+            done: true,
+            error: Some(
+                "import worker failed unexpectedly; the current item may already be in the library"
+                    .into(),
+            ),
+            report: self.report,
+            custom_report: self.custom_report,
+        }
+    }
+}
+
 fn import_worker_loop(app: tauri::AppHandle, rx: std::sync::mpsc::Receiver<ImportJob>) {
     for job in rx {
         IMPORT_CONTEXT.with(|context| *context.borrow_mut() = Some(job.job_id.clone()));
+        let mut checkpoint = ImportCheckpoint::default();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match job.kind {
-            ImportKind::Swf => run_swf_job(&app, &job),
-            ImportKind::Exe => run_exe_job(&app, &job),
-            ImportKind::Custom => run_custom_job(&app, &job),
-            ImportKind::Tablist => run_tablist_job(&app, &job),
+            ImportKind::Swf => run_swf_job(&app, &job, &mut checkpoint),
+            ImportKind::Exe => run_exe_job(&app, &job, &mut checkpoint),
+            ImportKind::Custom => run_custom_job(&app, &job, &mut checkpoint),
+            ImportKind::Tablist => run_tablist_job(&app, &job, &mut checkpoint),
         }));
         if result.is_err() {
-            emit_import_done(
-                &app,
-                &job.job_id,
-                0,
-                0,
-                "Import worker failed; completed tracks remain in the library",
-                None,
-                None,
-                Some("import decoder failed".into()),
+            let _ = app.emit(
+                "olooper:import-progress",
+                checkpoint.panic_event(&job.job_id),
             );
         }
         import_unmark_cancelled(&job.job_id);
@@ -1883,8 +1990,10 @@ fn import_worker_loop(app: tauri::AppHandle, rx: std::sync::mpsc::Receiver<Impor
 /// Custom audio imports: per-file decode → copy → BPM → row, with progress
 /// per file so the modal tracks each entry. The final `done` event carries
 /// the per-file reports (same shape as the old synchronous return).
-fn run_custom_job(app: &tauri::AppHandle, job: &ImportJob) {
+fn run_custom_job(app: &tauri::AppHandle, job: &ImportJob, checkpoint: &mut ImportCheckpoint) {
     let total = job.paths.len();
+    checkpoint.total = total;
+    checkpoint.custom_report = Some(Vec::with_capacity(total));
     let fail = |error: String| {
         emit_import_progress(app, &job.job_id, "failed", 0, total, "", true, Some(error));
     };
@@ -1901,7 +2010,10 @@ fn run_custom_job(app: &tauri::AppHandle, job: &ImportJob) {
             return;
         }
     };
-    let mut reports = Vec::with_capacity(total);
+    let reports = checkpoint
+        .custom_report
+        .as_mut()
+        .expect("initialized above");
     let mut cancellation = None;
     for (i, path) in job.paths.iter().enumerate() {
         if import_cancelled(&job.job_id) {
@@ -1939,13 +2051,13 @@ fn run_custom_job(app: &tauri::AppHandle, job: &ImportJob) {
         total,
         format!("{added} of {total} audio file(s) imported"),
         None,
-        Some(reports),
+        Some(reports.clone()),
         cancellation,
     );
 }
 
 /// Resolve one public Tablist looper and import its pre-looped audio tracks.
-fn run_tablist_job(app: &tauri::AppHandle, job: &ImportJob) {
+fn run_tablist_job(app: &tauri::AppHandle, job: &ImportJob, checkpoint: &mut ImportCheckpoint) {
     let input = job.paths.first().map(String::as_str).unwrap_or("");
     let fail = |error: String| {
         emit_import_progress(app, &job.job_id, "failed", 0, 0, input, true, Some(error));
@@ -1989,7 +2101,12 @@ fn run_tablist_job(app: &tauri::AppHandle, job: &ImportJob) {
         }
     });
     let total = page.tracks.len();
-    let mut reports = Vec::with_capacity(total);
+    checkpoint.total = total;
+    checkpoint.custom_report = Some(Vec::with_capacity(total));
+    let reports = checkpoint
+        .custom_report
+        .as_mut()
+        .expect("initialized above");
     let mut cancellation = None;
     for (index, track) in page.tracks.iter().enumerate() {
         if import_cancelled(&job.job_id) {
@@ -2057,7 +2174,7 @@ fn run_tablist_job(app: &tauri::AppHandle, job: &ImportJob) {
         total,
         format!("{added} of {total} Tablist track(s) imported"),
         None,
-        Some(reports),
+        Some(reports.clone()),
         cancellation,
     );
 }
@@ -2192,6 +2309,121 @@ async fn tablist_search(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn panic_checkpoint_preserves_partial_reports_in_terminal_event() {
+        let mut checkpoint = ImportCheckpoint {
+            total: 3,
+            custom_report: Some(Vec::new()),
+            ..Default::default()
+        };
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            checkpoint
+                .custom_report
+                .as_mut()
+                .unwrap()
+                .push(library::CustomReport {
+                    file: "first.wav".into(),
+                    added: true,
+                    track_id: Some(42),
+                    bpm: None,
+                    bpm_confidence: None,
+                    error: None,
+                });
+            panic!("injected worker panic");
+        }));
+        assert!(result.is_err());
+        let event = serde_json::to_value(checkpoint.panic_event("job")).unwrap();
+        assert_eq!(event["done"], true);
+        assert_eq!(event["current"], 1);
+        assert_eq!(event["total"], 3);
+        assert_eq!(event["custom_report"][0]["track_id"], 42);
+        assert!(event["error"].as_str().unwrap().contains("current item"));
+
+        let checkpoint = ImportCheckpoint {
+            total: 2,
+            report: Some(library::ImportReport {
+                looper: "Looper".into(),
+                added: 1,
+                already_there: 0,
+                failed: vec![],
+                track_ids: vec![7],
+            }),
+            ..Default::default()
+        };
+        let event = serde_json::to_value(checkpoint.panic_event("container")).unwrap();
+        assert_eq!(event["current"], 1);
+        assert_eq!(event["report"]["track_ids"][0], 7);
+    }
+
+    #[test]
+    fn newest_library_selection_wins_when_preparation_finishes_out_of_order() {
+        let selection = LibrarySelection::default();
+        let old = selection.begin().unwrap();
+        let new = selection.begin().unwrap();
+        let active = Mutex::new(("initial", "initial"));
+        selection
+            .commit(new, || {
+                *active.lock().unwrap() = ("new catalog", "new log");
+                Ok(())
+            })
+            .unwrap();
+        let stale = selection.commit(old, || {
+            *active.lock().unwrap() = ("old catalog", "old log");
+            Ok(())
+        });
+        assert!(stale.unwrap_err().contains("superseded"));
+        assert_eq!(*active.lock().unwrap(), ("new catalog", "new log"));
+    }
+
+    #[test]
+    fn delayed_library_preparation_cannot_commit_after_newer_request() {
+        use std::sync::{mpsc, Arc};
+        let selection = Arc::new(LibrarySelection::default());
+        let active = Arc::new(Mutex::new("initial"));
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let old_selection = selection.clone();
+        let old_active = active.clone();
+        let worker = std::thread::spawn(move || {
+            let old = old_selection.begin().unwrap();
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            old_selection.commit(old, || {
+                *old_active.lock().unwrap() = "old";
+                Ok(())
+            })
+        });
+        started_rx.recv().unwrap();
+        let new = selection.begin().unwrap();
+        selection
+            .commit(new, || {
+                *active.lock().unwrap() = "new";
+                Ok(())
+            })
+            .unwrap();
+        release_tx.send(()).unwrap();
+        assert!(worker.join().unwrap().is_err());
+        assert_eq!(*active.lock().unwrap(), "new");
+    }
+
+    #[test]
+    fn failed_newer_library_selection_does_not_let_older_request_commit() {
+        let selection = LibrarySelection::default();
+        let old = selection.begin().unwrap();
+        let newest = selection.begin().unwrap();
+        let active = Mutex::new("original");
+        let result: Result<(), String> =
+            selection.commit(newest, || Err("cannot open library".into()));
+        assert!(result.is_err());
+        assert!(selection
+            .commit(old, || {
+                *active.lock().unwrap() = "stale";
+                Ok(())
+            })
+            .is_err());
+        assert_eq!(*active.lock().unwrap(), "original");
+    }
 
     #[test]
     fn status_reports_crate_version_and_os() {
@@ -2345,6 +2577,71 @@ mod tests {
         }
 
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn folder_association_failure_retains_committed_import_and_original_error() {
+        let root = tempfile::tempdir().unwrap();
+        let sources = tempfile::tempdir().unwrap();
+        let path = sources.path().canonicalize().unwrap().join("source.swf");
+        std::fs::write(&path, b"synthetic source").unwrap();
+        let lib = library::Library::open(root.path()).unwrap();
+        lib.link_folder(path.parent().unwrap(), true, false)
+            .unwrap();
+
+        // Import real PCM into a real catalog before injecting a folder-write failure.
+        let mut wav = b"RIFF".to_vec();
+        wav.extend_from_slice(&16036u32.to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&8000u32.to_le_bytes());
+        wav.extend_from_slice(&16000u32.to_le_bytes());
+        wav.extend_from_slice(&2u16.to_le_bytes());
+        wav.extend_from_slice(&16u16.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&16000u32.to_le_bytes());
+        wav.resize(16044, 0);
+        let source = path.to_str().unwrap();
+        let report = lib
+            .import_sounds(
+                "Test",
+                "swf",
+                source,
+                "source-hash",
+                None,
+                None,
+                &[import::swf::Sound {
+                    id: 1,
+                    format: 0,
+                    codec: "wav".into(),
+                    sample_count: 8000,
+                    seek_samples: 0,
+                    trimmed_leading: 0,
+                    frames: wav,
+                }],
+            )
+            .unwrap();
+        assert_eq!(report.added, 1);
+        let conn = rusqlite::Connection::open(root.path().join("olooper.db")).unwrap();
+        conn.execute_batch("CREATE TRIGGER reject_folder_association BEFORE INSERT ON linked_folder_sources BEGIN SELECT RAISE(ABORT, 'injected association failure'); END;").unwrap();
+
+        for (result, cancelled) in [
+            (Ok(report.clone()), false),
+            (Err((report.clone(), "import cancelled".into())), true),
+        ] {
+            let (partial, error) = associate_container_source(&lib, source, "source-hash", result)
+                .expect_err("folder association should fail");
+            assert_eq!(partial.added, 1);
+            assert_eq!(partial.track_ids, report.track_ids);
+            assert!(error.contains("injected association failure"));
+            assert!(error.contains("folder association failed"));
+            assert_eq!(error.starts_with("import cancelled"), cancelled);
+            assert!(lib.get_track(partial.track_ids[0]).unwrap().is_some());
+        }
+        assert_eq!(lib.list_tracks().unwrap().len(), 1);
+        assert!(path.exists());
     }
 }
 #[test]

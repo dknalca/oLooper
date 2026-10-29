@@ -2,6 +2,7 @@ import { useEffect, useLayoutEffect, useRef, useState, type RefObject } from "re
 import { createPortal } from "react-dom";
 import useIdleCover, { type IdleCoverPhase } from "../hooks/useIdleCover";
 import type { PlayerStatus, Track } from "../tauri";
+import { coverOriginTransform, fitCover } from "../coverGeometry";
 
 export interface ActiveCoverState {
   sourceHash: string;
@@ -97,18 +98,11 @@ export function IdleCoverOverlay({ image, phase, originRef, onClose, onTransitio
     const node = imageRef.current;
     const background = backgroundRef.current;
     if (!node || !background) return;
-    const scale = Math.min(viewport.width / image.width, viewport.height / image.height);
-    const width = image.width * scale;
-    const height = image.height * scale;
-    const left = (viewport.width - width) / 2;
-    const top = (viewport.height - height) / 2;
+    const { width, height, left, top } = fitCover(viewport, image);
     const previousTransform = getComputedStyle(node).transform;
     Object.assign(node.style, { width: `${width}px`, height: `${height}px`, left: `${left}px`, top: `${top}px` });
     const rect = originRef.current?.getBoundingClientRect();
-    const smallScale = rect ? Math.min(rect.width / width, rect.height / height) : 0;
-    const destination = rect && smallScale > 0
-      ? `translate(${rect.left + (rect.width - width * smallScale) / 2 - left}px, ${rect.top + (rect.height - height * smallScale) / 2 - top}px) scale(${smallScale})`
-      : null;
+    const destination = coverOriginTransform({ width, height, left, top }, rect);
     if (phase === "visible") { node.style.transform = "none"; background.style.opacity = "1"; return; }
     const reduced = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ?? false;
     if (reduced || !node.animate) { node.style.transform = "none"; onTransitionEnd(); return; }

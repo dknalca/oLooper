@@ -54,7 +54,7 @@ impl Library {
                 continue;
             } // Legacy quarantine: never guess ownership.
             let mut data = Vec::new();
-            std::fs::File::open(&manifest_path)
+            crate::bounded_io::open_regular(&manifest_path)
                 .and_then(|file| file.take(16 * 1024 * 1024 + 1).read_to_end(&mut data))
                 .map_err(|e| format!("cannot read recovery manifest: {e}"))?;
             if data.len() > 16 * 1024 * 1024 {
@@ -62,6 +62,7 @@ impl Library {
             }
             let files: QuarantinedFiles = serde_json::from_slice(&data)
                 .map_err(|e| format!("invalid recovery manifest: {e}"))?;
+            validate_quarantine_contents(&directory, &files.moved)?;
             let mut restore = false;
             for (index, (original, staged)) in files.moved.iter().enumerate() {
                 let parent = original
@@ -87,31 +88,81 @@ impl Library {
             }
             if restore {
                 for (original, staged) in &files.moved {
-                    if !staged.exists() {
-                        continue;
+                    let metadata = match std::fs::symlink_metadata(staged) {
+                        Ok(metadata) => metadata,
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                        Err(error) => return Err(error.to_string()),
+                    };
+                    // Staging accepts regular files and symlinks. Move the link
+                    // itself back, including dangling links, without following it.
+                    if !metadata.is_file() && !metadata.file_type().is_symlink() {
+                        return Err("recovery asset is not a file or symlink".into());
                     }
-                    if !std::fs::symlink_metadata(staged)
-                        .map_err(|e| e.to_string())?
-                        .is_file()
-                    {
-                        return Err("recovery asset is not a regular file".into());
+                    match std::fs::symlink_metadata(original) {
+                        Ok(_) => {
+                            return Err(format!(
+                                "recovery would overwrite {}; staged audio retained",
+                                original.display()
+                            ));
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) => return Err(error.to_string()),
                     }
-                    if original.exists() {
-                        return Err(format!(
-                            "recovery would overwrite {}; staged audio retained",
-                            original.display()
-                        ));
-                    }
-                    std::fs::rename(staged, original).map_err(|e| e.to_string())?;
+                    crate::fs_ops::rename_noreplace(staged, original).map_err(|e| e.to_string())?;
                     sync_directory(original.parent().ok_or("invalid recovery path")?)?;
                 }
             }
             // Use the validated directory, never the directory field from JSON.
-            std::fs::remove_dir_all(&directory).map_err(|e| e.to_string())?;
+            remove_quarantine(&directory, &files.moved)?;
             sync_directory(&root)?;
         }
         Ok(())
     }
+}
+
+/// Reject unknown entries before deleting or restoring anything. A quarantine
+/// may contain only its manifest and the flat, indexed assets it describes.
+fn validate_quarantine_contents(
+    directory: &std::path::Path,
+    moved: &[(std::path::PathBuf, std::path::PathBuf)],
+) -> Result<(), String> {
+    let mut expected = std::collections::HashSet::new();
+    expected.insert(std::ffi::OsString::from("manifest.json"));
+    for (index, (_, staged)) in moved.iter().enumerate() {
+        let name = format!("asset-{index}");
+        if staged != &directory.join(&name) {
+            return Err("invalid quarantine asset path".into());
+        }
+        expected.insert(name.into());
+    }
+    for entry in std::fs::read_dir(directory).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        if !expected.contains(&entry.file_name())
+            || entry.file_type().map_err(|e| e.to_string())?.is_dir()
+        {
+            return Err(format!(
+                "unexpected quarantine entry {}; nothing removed",
+                entry.path().display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn remove_quarantine(
+    directory: &std::path::Path,
+    moved: &[(std::path::PathBuf, std::path::PathBuf)],
+) -> Result<(), String> {
+    validate_quarantine_contents(directory, moved)?;
+    for (_, staged) in moved {
+        match std::fs::remove_file(staged) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("cannot remove staged audio: {error}")),
+        }
+    }
+    std::fs::remove_file(directory.join("manifest.json")).map_err(|e| e.to_string())?;
+    std::fs::remove_dir(directory).map_err(|e| e.to_string())
 }
 
 pub(super) fn sync_directory(path: &std::path::Path) -> Result<(), String> {

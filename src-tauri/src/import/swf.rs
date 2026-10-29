@@ -1,8 +1,8 @@
-//! SWF container parsing + `DefineSound` MP3 extraction.
+//! SWF container parsing, embedded/streaming MP3 and ADPCM audio, and covers.
 //!
 //! Supports `FWS` (raw) and `CWS` (zlib) containers. `ZWS` (LZMA) is reported
-//! as unsupported, never guessed. All reads are bounds-checked; allocations
-//! are capped by the header-declared length.
+//! as unsupported, never guessed. Reads are bounds-checked and the declared
+//! container length and materialized audio are subject to independent budgets.
 
 use std::fmt;
 use std::io::{Cursor, Read as _};

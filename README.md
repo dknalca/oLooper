@@ -75,7 +75,7 @@ It is designed for **scratch DJs, beat jugglers, and turntablists** who want to 
 
 ### Bring your loopers into one library
 
-- **Import legacy SWF and projector EXE loopers.** Choose to extract embedded MP3/ADPCM tracks or play directly from the source copy. Projector files are parsed as data—oLooper never runs them.
+- **Import legacy SWF and projector EXE loopers.** Choose to extract embedded MP3/ADPCM tracks or play directly from the original source or an optional library copy. Projector files are parsed as data—oLooper never runs them.
 - **Import your own audio.** Add supported audio files by drag-and-drop or file picker; the originals stay where they are.
 - **Discover more loopers.** Browse and search the public Tablist catalog, then import a pack or grab a random one.
 - **Stay organized.** Browse ALL tracks, make playlists, reorder looper groups, search and filter by BPM, and keep Favorites in your persistent local library.
@@ -96,8 +96,11 @@ It is designed for **scratch DJs, beat jugglers, and turntablists** who want to 
 Download the [macOS v0.8.0 release](https://github.com/dknalca/oLooper/releases/tag/v0.8.0). Its Universal 2 DMG contains native Intel (`x86_64`) and Apple silicon (`arm64`) versions; Rosetta is not required.
 
 1. Open the downloaded `.dmg` and drag **oLooper** into **Applications**.
-2. Eject the oLooper disk image, then launch the app from Applications.
-3. The DMG is not signed or notarized. On the first launch, Control-click oLooper, choose **Open**, then confirm. If macOS still blocks it, follow [Apple's instructions for opening an app from an unidentified developer](https://support.apple.com/en-us/102445).
+2. Eject the oLooper disk image.
+3. On first launch, Control-click **oLooper** in Applications, choose **Open**, then confirm **Open** in the dialog. This records the exception for oLooper.
+4. If macOS still blocks it, open **System Settings → Privacy & Security**, scroll to **Security**, choose **Open Anyway** for oLooper, authenticate if asked, then confirm **Open**. On macOS 11, use **System Preferences → Security & Privacy → General → Open Anyway**. See [Apple's instructions](https://support.apple.com/en-us/102445).
+
+The DMG is intentionally unsigned and unnotarized. macOS displays this first-launch warning because oLooper is not distributed with an Apple Developer ID signature; follow the steps above for this app only. The release does not disable Gatekeeper.
 
 The v0.8.0 DMG is built with a **macOS 11.0 (Big Sur) minimum deployment target**. CI verifies the Universal 2 binary and bundle metadata; runtime testing on a Big Sur machine is still pending. No additional runtime or developer tools are needed to install the DMG.
 
@@ -110,13 +113,13 @@ The unsigned installer may prompt Windows SmartScreen. The app's library and pre
 ## Build from source
 
 ```bash
-pnpm install
+pnpm install --frozen-lockfile
 pnpm tauri dev
 ```
 
-For a bundled macOS app, run `./scripts/build.sh`; see the [macOS release notes](docs/macos-release.md). Building on macOS requires [Xcode](https://developer.apple.com/xcode/) (or a [compatible older version](https://developer.apple.com/download/all/?q=Xcode)), [Node.js](https://nodejs.org/en/download/), [pnpm](https://pnpm.io/installation), and [Rust](https://www.rust-lang.org/tools/install).
+The project uses Node.js 24, pnpm 12.9.1 and Rust 1.89 or newer. For a bundled macOS app, run `./scripts/build.sh`; see the [macOS release notes](docs/macos-release.md). Building on macOS also requires [Xcode](https://developer.apple.com/xcode/) (or a [compatible older version](https://developer.apple.com/download/all/?q=Xcode)), [Node.js](https://nodejs.org/en/download/), [pnpm](https://pnpm.io/installation), and [Rust](https://www.rust-lang.org/tools/install).
 
-On Windows, install [App Installer (winget)](https://apps.microsoft.com/detail/9nblggh4nns1) if it is not present. Open PowerShell as Administrator and run `scripts/install-windows.ps1`; it installs Node.js, pnpm, Rust MSVC, Visual Studio C++ Build Tools, and WebView2. Restart PowerShell, then run `scripts/build.ps1` to create `dist/installers/oLooper-0.7.1-windows-x64-setup.exe`. Use `scripts/build.ps1 -Dev` for an unbundled debug executable. The setup script's prerequisites can also be installed individually: [Node.js](https://nodejs.org/en/download/), [pnpm](https://pnpm.io/installation), [Rust](https://www.rust-lang.org/tools/install), and [Visual Studio C++ Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/).
+On Windows, install [App Installer (winget)](https://apps.microsoft.com/detail/9nblggh4nns1) if it is not present. Open PowerShell as Administrator and run `scripts/install-windows.ps1`; it installs Node.js, pnpm, Rust MSVC, Visual Studio C++ Build Tools, and WebView2. Restart PowerShell, then run `scripts/build.ps1` to create `dist/installers/oLooper-0.8.0-windows-x64-setup.exe` (the name follows the version in `src-tauri/tauri.conf.json`). Use `scripts/build.ps1 -Dev` for an unbundled debug executable. The setup script's prerequisites can also be installed individually: [Node.js](https://nodejs.org/en/download/), [pnpm](https://pnpm.io/installation), [Rust](https://www.rust-lang.org/tools/install), and [Visual Studio C++ Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/).
 
 ## Checks
 
@@ -130,6 +133,7 @@ cargo test --manifest-path src-tauri/Cargo.toml
 
 - [Product and feature specifications](specs/)
 - [Architecture decisions](docs/adr/)
+- [Codebase and maintenance guide](docs/codebase-guide.md)
 - [macOS release guide](docs/macos-release.md)
 - [Release notes](CHANGELOG.md)
 - [Documentation review and audit follow-up](docs/documentation-review-2026-10-26.md)

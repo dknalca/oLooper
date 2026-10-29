@@ -23,7 +23,6 @@ import {
   librarySyncSeratoMetadata,
   libraryUpdateMetadata,
   libraryAnalyzeBpm,
-  playerLoadTrack,
   playerPause,
   playerPrefetch,
   playerSetDiagnostics,
@@ -35,11 +34,15 @@ import {
   type Track,
 } from "../tauri";
 import { recordTempoTap } from "../tapTempo";
+import { prepareTrackMetadata } from "../trackMetadata";
+import { waitForLibraryTrack } from "../libraryTrackLoad";
 import { bpmOptions, formatBpm, validBpm, type BpmBase } from "../bpmOptions";
 import { requestBpmReanalysis } from "../bpmReanalysis";
 import { IMPORTED_AUDIO_GROUP_KEY, libraryGroupKey, libraryGroupName } from "../libraryGroups";
 import { navigateMidiLibrary, type MidiLibraryNavigationAction, type MidiLibraryNavigationState } from "../midiLibraryNavigation";
 import LibraryViewTabs, { type LibraryView } from "./LibraryViewTabs";
+import LibraryEmptyState from "./LibraryEmptyState";
+import DeleteLooperDialog from "./DeleteLooperDialog";
 
 interface Props {
   libraryReady: boolean;
@@ -83,10 +86,6 @@ type LibraryDropTarget =
   | { kind: "waveform"; element: HTMLElement }
   | { kind: "looper"; sourceHash: string; element: HTMLElement }
   | null;
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
 
 function Sidebar({ libraryReady, libraryGeneration, refreshKey, activeTrackId, onLibraryViewChange, onRegisterTrackNavigation, onRegisterRandomScope, onRegisterMidiLibraryNavigation, onTrackLoading, onTrackSelected }: Props) {
   const [tracks, setTracks] = useState<Track[]>([]);
@@ -544,8 +543,10 @@ function Sidebar({ libraryReady, libraryGeneration, refreshKey, activeTrackId, o
       return;
     }
     onTrackLoading();
+    const owner = refreshOwner.current;
     const my = loadSeq.current + 1;
     loadSeq.current = my;
+    const isCurrent = () => loadSeq.current === my && refreshOwner.current === owner;
     const previousId = activeId;
     setError(null);
     // Immediate visual selection; decode happens in the background and the
@@ -553,32 +554,23 @@ function Sidebar({ libraryReady, libraryGeneration, refreshKey, activeTrackId, o
     setActiveId(track.id);
     setLoadingId(track.id);
     try {
-      let st = await playerLoadTrack(track.id);
-      const deadline = Date.now() + 120_000;
-      while (st.loading && Date.now() < deadline) {
-        if (loadSeq.current !== my) return; // superseded by newer selection
-        await sleep(150);
-        st = await playerStatus();
-      }
-      if (loadSeq.current !== my) return;
-      if (st.loading) throw new Error("load timed out");
-      if (st.load_error) throw new Error(st.load_error);
-      if (st.path !== track.playback_path) return; // another track won meanwhile
+      const loaded = await waitForLibraryTrack(track.id, track.playback_path, isCurrent);
+      if (!loaded || !isCurrent()) return; // superseded during load or handoff
       setLoadingId(null);
       playerSetDiagnostics(track.loop_origin, track.loop_quality).catch(() => {});
       const finalStatus = resumeAfterLoad ? await playerPlay() : await playerStatus();
-      if (loadSeq.current !== my || finalStatus.path !== track.playback_path) return;
+      if (!isCurrent() || finalStatus.path !== track.playback_path) return;
       onTrackSelected(track, finalStatus);
       if (resumeAfterLoad) libraryMarkPlayed(track.id).then(refresh).catch(() => {});
     } catch (e) {
-      if (loadSeq.current !== my) return;
+      if (!isCurrent()) return;
       setLoadingId(null);
       setActiveId(previousId); // keep the previous (still sounding) track
       setError(String(e));
       // Availability may have changed since the catalog was last rendered.
       try {
         const fresh = await libraryList();
-        if (loadSeq.current !== my) return;
+        if (!isCurrent()) return;
         const missing = fresh.find((item) => item.id === track.id);
         if (missing && !missing.exists) {
           setMissingSourcePrompt({ sourceHash: track.source_hash, name: groupName(track), path: track.file_path, trackId: track.id });
@@ -1071,23 +1063,16 @@ function Sidebar({ libraryReady, libraryGeneration, refreshKey, activeTrackId, o
     const owner = refreshOwner.current;
     event.preventDefault();
     if (!editingTrack) return;
-    const title = metadataDraft.title.trim();
-    if (!title) {
-      setMetadataError("Loop title cannot be empty.");
-      return;
-    }
-    const bpmText = metadataDraft.bpm.trim();
-    const bpm = bpmText ? Number(bpmText) : editingTrack.bpm;
-    if (bpm !== null && (!Number.isFinite(bpm) || bpm < 20 || bpm > 300)) {
-      setMetadataError("BPM must be between 20 and 300.");
+    const prepared = prepareTrackMetadata(metadataDraft, editingTrack.bpm, bpmConfirmed);
+    if (!prepared.ok) {
+      setMetadataError(prepared.error);
       return;
     }
 
-    const confirmManualBpm = bpmText.length > 0 && (bpmConfirmed || bpm !== editingTrack.bpm);
     setMetadataBusy(true);
     setMetadataError(null);
     try {
-      const updated = await libraryUpdateMetadata(editingTrack.id, title, bpm, metadataDraft.tags.trim(), confirmManualBpm);
+      const updated = await libraryUpdateMetadata(editingTrack.id, prepared.title, prepared.bpm, prepared.tags, prepared.confirmManualBpm);
       if (owner !== refreshOwner.current) return;
       setTracks((current) => current.map((track) => track.id === updated.id ? updated : track));
       closeTrackEditor();
@@ -1103,7 +1088,7 @@ function Sidebar({ libraryReady, libraryGeneration, refreshKey, activeTrackId, o
       }
       if (updated.audio_storage === "extracted"
         && updated.bpm !== null
-        && confirmManualBpm) {
+        && prepared.confirmManualBpm) {
         try {
           await librarySyncSeratoMetadata(editingTrack.id);
         } catch (cause) {
@@ -1358,23 +1343,9 @@ function Sidebar({ libraryReady, libraryGeneration, refreshKey, activeTrackId, o
             <span className="text-right">Actions</span>
           </div>
           <div ref={listRef} onScroll={(event) => setViewport({ top: event.currentTarget.scrollTop, height: event.currentTarget.clientHeight })} className="min-h-0 flex-1 overflow-y-auto">
-            {!libraryReady && <div className="empty-state">
-              <h3 className="text-base font-semibold text-text">Your practice space starts here</h3>
-              <p>Choose a folder for your library, then bring in your favorite loops.</p>
-              <button className="toolbar-button" onClick={() => window.dispatchEvent(new Event("olooper:choose-library"))}>Choose library folder</button>
-            </div>}
-            {libraryReady && !catalogLoaded && <p className="empty-state" role="status">Loading your library…</p>}
-            {libraryReady && catalogLoaded && selectedTracks.length === 0 && (
-              <div className="empty-state">
-                <h3 className="text-base font-semibold text-text">{tracks.length === 0 ? "Bring your first loop" : hasFilters ? "No matching tracks" : selectedGroup === FAVORITES_GROUP ? "Your favorites belong here" : "This collection is empty"}</h3>
-                <p>{tracks.length === 0 ? "Import SWF, EXE or audio files, or drop them into this window." : hasFilters ? "Try another search or clear your filters to see more tracks." : selectedGroup === FAVORITES_GROUP ? "Use the heart beside any track to keep it close for your next session." : "Add tracks from their context menu, or drag them onto a playlist."}</p>
-                {tracks.length === 0
-                  ? <button className="toolbar-button" onClick={() => window.dispatchEvent(new CustomEvent("olooper:import-command", { detail: "import-files" }))}>Import files</button>
-                  : hasFilters
-                    ? <button className="toolbar-button" onClick={clearFilters}>Clear filters</button>
-                    : <button className="toolbar-button" onClick={() => setSelectedGroup(ALL_GROUP)}>Browse all tracks</button>}
-              </div>
-            )}
+            <LibraryEmptyState libraryReady={libraryReady} catalogLoaded={catalogLoaded} trackCount={tracks.length}
+              selectedTrackCount={selectedTracks.length} hasFilters={hasFilters} favoritesSelected={selectedGroup === FAVORITES_GROUP}
+              onClearFilters={clearFilters} onBrowseAll={() => setSelectedGroup(ALL_GROUP)} />
             <div style={{ height: firstVisible * TRACK_ROW_HEIGHT }} aria-hidden="true" />
             {selectedTracks.slice(firstVisible, lastVisible).map((track) => (
               <div
@@ -1529,31 +1500,9 @@ function Sidebar({ libraryReady, libraryGeneration, refreshKey, activeTrackId, o
           </div>
         );
       })()}
-      {groupDeletePrompt && (() => {
-        const groupTracks = tracks.filter((track) => track.source_hash === groupDeletePrompt.sourceHash);
-        const hasImportedContainer = groupTracks.some((track) => track.source_type === "swf" || track.source_type === "exe");
-        const hasStoredAudio = groupTracks.some((track) => track.audio_storage === "extracted");
-        return (
-          <div
-            className="fixed inset-0 z-[120] flex items-center justify-center bg-black/65 p-4 backdrop-blur-sm"
-            onMouseDown={(event) => { if (event.target === event.currentTarget) setGroupDeletePrompt(null); }}
-          >
-            <section role="dialog" aria-modal="true" aria-labelledby="delete-looper-title" aria-describedby="delete-looper-description" className="w-full max-w-md rounded-lg border border-border bg-surface p-5 shadow-2xl">
-              <h2 id="delete-looper-title" className="text-sm font-semibold text-text">Delete looper “{groupDeletePrompt.name}”?</h2>
-              <div id="delete-looper-description" className="mt-3 space-y-2 text-xs leading-relaxed text-text-secondary">
-                {hasImportedContainer && <p>The imported SWF/EXE copy in the library will be deleted when no other tracks use it.</p>}
-                {hasStoredAudio && <p>All extracted or downloaded audio files for this looper will be deleted.</p>}
-                <p>The library cover will also be deleted. Original files outside the library will be kept.</p>
-                <p>This cannot be undone. Confirm to continue.</p>
-              </div>
-              <div className="mt-5 flex justify-end gap-2">
-                <button autoFocus onClick={() => setGroupDeletePrompt(null)} className="dialog-close">Cancel</button>
-                <button onClick={confirmRemoveGroup} className="rounded bg-danger px-3 py-2 text-xs font-medium text-white hover:bg-danger/85">Delete looper</button>
-              </div>
-            </section>
-          </div>
-        );
-      })()}
+      {groupDeletePrompt && <DeleteLooperDialog name={groupDeletePrompt.name}
+        tracks={tracks.filter((track) => track.source_hash === groupDeletePrompt.sourceHash)}
+        onCancel={() => setGroupDeletePrompt(null)} onConfirm={confirmRemoveGroup} />}
       {missingSourcePrompt && (
         <div className="fixed inset-0 z-[125] flex items-center justify-center bg-black/65 p-4 backdrop-blur-sm" onMouseDown={(event) => { if (event.target === event.currentTarget) setMissingSourcePrompt(null); }}>
           <section role="dialog" aria-modal="true" aria-labelledby="missing-looper-title" className="w-full max-w-md rounded-lg border border-border bg-surface p-5 shadow-2xl">
@@ -1671,7 +1620,7 @@ function Sidebar({ libraryReady, libraryGeneration, refreshKey, activeTrackId, o
                 disabled={metadataBusy}
                 className="mt-1 block w-full rounded border border-border bg-elevated px-2.5 py-2 text-sm text-text disabled:opacity-50"
               />
-              {editingTrack.bpm_source === "analyzed" && editingTrack.bpm_confidence !== null && editingTrack.bpm_confidence < BPM_REVIEW_THRESHOLD && (
+              {!bpmConfirmed && editingTrack.bpm_source === "analyzed" && editingTrack.bpm_confidence !== null && editingTrack.bpm_confidence < BPM_REVIEW_THRESHOLD && (
                 <span className="mt-1 block text-[10px] text-warning">Low-confidence estimate ({Math.round(editingTrack.bpm_confidence * 100)}%). Adjust it here if needed.</span>
               )}
             </label>

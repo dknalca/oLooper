@@ -1,10 +1,10 @@
 //! Waveform peaks: decode → mono mixdown → per-bucket max-abs, normalized.
 //!
-//! Computed once per (path, bucket-count) and cached in frontend memory.
-//! No per-frame decoding: rendering works purely from this aggregate.
+//! The frontend renders aggregate peaks rather than decoding each frame. For
+//! file-backed audio, the backend also maintains a bounded persistent cache
+//! keyed by file identity, bucket count and algorithm version.
 
 use serde::{Deserialize, Serialize};
-use sha2::{Digest as _, Sha256};
 
 /// Bounds for client-requested bucket counts (allocation safety).
 pub const MIN_BUCKETS: usize = 64;
@@ -84,18 +84,15 @@ fn cache_key(path: &std::path::Path, buckets: usize) -> Result<String, String> {
         .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|time| time.as_nanos())
         .unwrap_or(0);
-    Ok(format!(
-        "{:x}",
-        Sha256::digest(
-            format!(
-                "v{}:{}:{}:{modified}:{}",
-                CACHE_ALGORITHM_VERSION,
-                canonical.display(),
-                meta.len(),
-                clamp_buckets(buckets)
-            )
-            .as_bytes()
+    Ok(crate::library::sha256_hex(
+        format!(
+            "v{}:{}:{}:{modified}:{}",
+            CACHE_ALGORITHM_VERSION,
+            canonical.display(),
+            meta.len(),
+            clamp_buckets(buckets)
         )
+        .as_bytes(),
     ))
 }
 

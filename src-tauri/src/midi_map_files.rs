@@ -5,7 +5,7 @@ use tauri_plugin_dialog::DialogExt;
 const MAX_MAP_BYTES: usize = 64 * 1024;
 
 fn read_map(path: &Path) -> Result<String, String> {
-    let file = std::fs::File::open(path).map_err(|error| error.to_string())?;
+    let file = crate::bounded_io::open_regular(path).map_err(|error| error.to_string())?;
     let mut contents = String::new();
     file.take((MAX_MAP_BYTES + 1) as u64)
         .read_to_string(&mut contents)
