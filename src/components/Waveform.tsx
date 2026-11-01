@@ -2,15 +2,17 @@ import { useEffect, useRef, useState, type Ref } from "react";
 import {
   playerSeek,
   playerSetLoopSnapped,
-  playerWaveformPeaks,
   type PlayerStatus,
   type SeratoCue,
   type WaveformData,
 } from "../tauri";
 import Logo from "./Logo";
+import { waveformWindowStart } from "../waveformRender";
+import { useWaveformPeaks } from "../hooks/useWaveformPeaks";
+import { useWaveformDrawing } from "../hooks/useWaveformDrawing";
 
 interface Props {
-  refreshKey: number;
+  renderingPaused?: boolean;
   status: PlayerStatus | null;
   trackTitle: string | null;
   trackCover: string | null;
@@ -22,9 +24,9 @@ interface Props {
   onStatusChange: (status: PlayerStatus) => void;
 }
 
-export default function Waveform({ refreshKey, status, trackTitle, trackCover, coverRef, trackId, playbackPath, showCover, loopEditing, onStatusChange }: Props) {
+export default function Waveform({ status, trackTitle, trackCover, coverRef, trackId, playbackPath, showCover, loopEditing, onStatusChange, renderingPaused = false }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const wrapRef = useRef<HTMLDivElement>(null);
+  const wrapRef = useRef<HTMLDivElement | null>(null);
   const statusRef = useRef<PlayerStatus | null>(null);
   const waveRef = useRef<WaveformData | null>(null);
   const waveTrackIdRef = useRef<number | null>(null);
@@ -43,6 +45,7 @@ export default function Waveform({ refreshKey, status, trackTitle, trackCover, c
   const [trackDropActive, setTrackDropActive] = useState(false);
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; time: number } | null>(null);
   const loadedPath = !playbackPath || status?.path === playbackPath ? status?.path ?? null : null;
+  const redraw = useWaveformDrawing({ paused: renderingPaused, canvasRef, statusRef, waveRef, waveTrackIdRef, wavePathRef, trackIdRef, cuesRef, zoomRef, previewRef, loopEditingRef });
 
   useEffect(() => {
     const updateLibraryDrag = (event: Event) => {
@@ -60,7 +63,8 @@ export default function Waveform({ refreshKey, status, trackTitle, trackCover, c
 
   useEffect(() => {
     statusRef.current = status;
-  }, [status]);
+    redraw();
+  }, [status, redraw]);
 
   useEffect(() => {
     waveRef.current = null;
@@ -70,9 +74,9 @@ export default function Waveform({ refreshKey, status, trackTitle, trackCover, c
     setGenerating(false);
     setDragging(null);
     previewRef.current = null;
-  }, [trackId, loadedPath]);
+  }, [trackId, loadedPath, status?.generation]);
 
-  useEffect(() => { zoomRef.current = zoom; }, [zoom]);
+  useEffect(() => { zoomRef.current = zoom; redraw(); }, [zoom, redraw]);
 
   useEffect(() => {
     loopEditingRef.current = loopEditing;
@@ -80,7 +84,8 @@ export default function Waveform({ refreshKey, status, trackTitle, trackCover, c
       previewRef.current = null;
       setDragging(null);
     }
-  }, [loopEditing]);
+    redraw();
+  }, [loopEditing, redraw]);
 
   useEffect(() => {
     if (!contextMenu) return;
@@ -94,90 +99,13 @@ export default function Waveform({ refreshKey, status, trackTitle, trackCover, c
   }, [contextMenu]);
 
   useEffect(() => {
-    const setCues = (event: Event) => { cuesRef.current = (event as CustomEvent<SeratoCue[]>).detail; };
+    const setCues = (event: Event) => { cuesRef.current = (event as CustomEvent<SeratoCue[]>).detail; redraw(); };
     window.addEventListener("olooper:cues", setCues);
     return () => window.removeEventListener("olooper:cues", setCues);
-  }, []);
+  }, [redraw]);
 
-  // (Re)compute peaks once per loaded path. Delayed until the new audio
-  // is actually ready: while the backend reports `loading`, `loadedPath`
-  // still points at the previous track, so fetching now would only feed a
-  // job the backend is about to discard.
-  useEffect(() => {
-    if (!loadedPath || status?.loading) {
-      if (!loadedPath) waveRef.current = null;
-      return;
-    }
-    let cancelled = false;
-    // Let selection and audio playback paint before starting the second decode.
-    const timer = window.setTimeout(() => {
-      const width = wrapRef.current?.clientWidth ?? 800;
-      // A zoomed view needs proportionally more source peaks; otherwise it
-      // magnifies one coarse bucket into a blocky waveform.
-      const density = window.devicePixelRatio || 1;
-      const buckets = Math.min(8192, Math.max(256, Math.ceil(width * density * zoom)));
-      setGenerating(true);
-      playerWaveformPeaks(loadedPath, buckets)
-        .then((w) => {
-          if (cancelled) return;
-          waveRef.current = w;
-          waveTrackIdRef.current = trackId;
-          wavePathRef.current = loadedPath;
-          setError(null);
-        })
-        .catch((e) => {
-          if (cancelled) return;
-          // Stale-job discard ("track changed …"): a newer job owns this
-          // path, or the previous peaks are still valid — never a sticky
-          // error.
-          if (String(e).includes("track changed")) return;
-          setError(String(e));
-        })
-        .finally(() => {
-          if (!cancelled) setGenerating(false);
-        });
-    }, 120);
-    return () => {
-      cancelled = true;
-      setGenerating(false);
-      window.clearTimeout(timer);
-    };
-  }, [loadedPath, status?.loading, refreshKey, zoom, trackId]);
-
-  // Render loop: interpolate between polls while playing.
-  useEffect(() => {
-    let raf = 0;
-    let lastPoll = performance.now();
-    let lastPos = 0;
-    let lastPaint = 0;
-    let lastInputs: unknown[] = [];
-    const draw = () => {
-      raf = requestAnimationFrame(draw);
-      const now = performance.now();
-      if (document.hidden || now - lastPaint < 1000 / 30) return;
-      const canvas = canvasRef.current;
-      const st = statusRef.current;
-      const wave = waveRef.current;
-      if (!canvas || !st?.loaded || st.loading || !wave || wave.peaks.length === 0
-        || waveTrackIdRef.current !== trackIdRef.current || wavePathRef.current !== st.path) return;
-      if (st.position_ms !== lastPos) {
-        lastPos = st.position_ms;
-        lastPoll = performance.now();
-      }
-      const pos = st.playing
-        ? lastPos + (now - lastPoll) * st.speed_pct / 100
-        : lastPos;
-      const inputs = [wave, pos, st.loop_start_ms, st.loop_end_ms, st.loop_enabled,
-        cuesRef.current, zoomRef.current, previewRef.current, loopEditingRef.current,
-        canvas.clientWidth, canvas.clientHeight, window.devicePixelRatio];
-      if (inputs.every((value, index) => value === lastInputs[index])) return;
-      lastInputs = inputs;
-      lastPaint = now;
-      render(canvas, wave, st, pos, cuesRef.current, zoomRef.current, previewRef.current, loopEditingRef.current);
-    };
-    raf = requestAnimationFrame(draw);
-    return () => cancelAnimationFrame(raf);
-  }, []);
+  useWaveformPeaks({ loadedPath, loading: status?.loading, generation: status?.generation, zoom, trackId, wrapRef,
+    waveRef, waveTrackIdRef, wavePathRef, setGenerating, setError, onReady: redraw });
 
   const timeAtPointer = (e: { clientX: number }) => {
     const canvas = canvasRef.current;
@@ -188,7 +116,7 @@ export default function Waveform({ refreshKey, status, trackTitle, trackCover, c
     const rect = canvas.getBoundingClientRect();
     const frac = Math.min(1, Math.max(0, (e.clientX - rect.left) / rect.width));
     const view = Math.min(wave.duration_ms, Math.max(20, wave.duration_ms / zoomRef.current));
-    const start = windowStart(st.position_ms, wave.duration_ms, view);
+    const start = waveformWindowStart(st.position_ms, wave.duration_ms, view);
     return Math.round(start + frac * view);
   };
 
@@ -202,7 +130,7 @@ export default function Waveform({ refreshKey, status, trackTitle, trackCover, c
     if (loopEditing) {
       const rect = canvas.getBoundingClientRect();
       const view = Math.min(wave.duration_ms, Math.max(20, wave.duration_ms / zoomRef.current));
-      const start = windowStart(st.position_ms, wave.duration_ms, view);
+      const start = waveformWindowStart(st.position_ms, wave.duration_ms, view);
       const xOf = (ms: number) => ((ms - start) / view) * rect.width;
       const pointerX = e.clientX - rect.left;
       const startDistance = Math.abs(pointerX - xOf(st.loop_start_ms));
@@ -215,6 +143,7 @@ export default function Waveform({ refreshKey, status, trackTitle, trackCover, c
         e.currentTarget.setPointerCapture(e.pointerId);
         previewRef.current = { start: st.loop_start_ms, end: st.loop_end_ms };
         setDragging(boundary);
+        redraw();
         return;
       }
     }
@@ -229,6 +158,7 @@ export default function Waveform({ refreshKey, status, trackTitle, trackCover, c
     if (dragging === "start") preview.start = Math.max(0, Math.min(time, preview.end - 1));
     else preview.end = Math.min(statusRef.current?.duration_ms ?? time, Math.max(time, preview.start + 1));
     previewRef.current = preview;
+    redraw();
   };
 
   const onPointerUp = (e: React.PointerEvent<HTMLCanvasElement>) => {
@@ -236,6 +166,7 @@ export default function Waveform({ refreshKey, status, trackTitle, trackCover, c
     const preview = previewRef.current;
     previewRef.current = null;
     setDragging(null);
+    redraw();
     if (e.currentTarget.hasPointerCapture(e.pointerId)) e.currentTarget.releasePointerCapture(e.pointerId);
     playerSetLoopSnapped(preview.start, preview.end, statusRef.current?.generation)
       .then(onStatusChange)
@@ -363,7 +294,7 @@ export default function Waveform({ refreshKey, status, trackTitle, trackCover, c
             onContextMenu={openWaveformMenu}
             onPointerMove={onPointerMove}
             onPointerUp={onPointerUp}
-            onPointerCancel={() => { previewRef.current = null; setDragging(null); }}
+            onPointerCancel={() => { previewRef.current = null; setDragging(null); redraw(); }}
             className={`h-full w-full ${loopEditing ? "cursor-col-resize" : "cursor-crosshair"}`}
           />
         {contextMenu && status?.loaded && (
@@ -400,101 +331,4 @@ export default function Waveform({ refreshKey, status, trackTitle, trackCover, c
       )}
     </div>
   );
-}
-
-function windowStart(posMs: number, durationMs: number, viewMs: number): number {
-  if (durationMs <= viewMs) return 0;
-  return Math.min(Math.max(0, posMs - viewMs / 2), durationMs - viewMs);
-}
-
-function render(
-  canvas: HTMLCanvasElement,
-  wave: WaveformData,
-  st: PlayerStatus,
-  posMs: number,
-  cues: SeratoCue[],
-  zoom: number,
-  preview: { start: number; end: number } | null,
-  loopEditing: boolean,
-) {
-  const dpr = window.devicePixelRatio || 1;
-  const width = canvas.clientWidth;
-  const height = canvas.clientHeight;
-  const pixelWidth = Math.round(width * dpr);
-  const pixelHeight = Math.round(height * dpr);
-  if (canvas.width !== pixelWidth || canvas.height !== pixelHeight) {
-    canvas.width = pixelWidth;
-    canvas.height = pixelHeight;
-  }
-  const ctx = canvas.getContext("2d");
-  if (!ctx) return;
-  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-  ctx.clearRect(0, 0, width, height);
-
-  const view = Math.min(wave.duration_ms, Math.max(20, wave.duration_ms / zoom));
-  const start = windowStart(posMs, wave.duration_ms, view);
-  const xOf = (t: number) => ((t - start) / view) * width;
-  const peakAt = (t: number) =>
-    wave.peaks[Math.min(wave.peaks.length - 1, Math.floor((t / wave.duration_ms) * wave.peaks.length))];
-
-  const loopStart = preview?.start ?? st.loop_start_ms;
-  const loopEnd = preview?.end ?? st.loop_end_ms;
-  if (st.loop_enabled) {
-    const x0 = Math.max(0, xOf(loopStart));
-    const x1 = Math.min(width, xOf(loopEnd));
-    ctx.fillStyle = "rgba(52, 211, 153, 0.12)";
-    ctx.fillRect(x0, 0, Math.max(0, x1 - x0), height);
-  }
-  if (st.loop_enabled || loopEditing) {
-    const x0 = xOf(loopStart);
-    const x1 = xOf(loopEnd);
-    ctx.strokeStyle = loopEditing ? "rgba(74, 163, 255, 0.9)" : "rgba(52, 211, 153, 0.3)";
-    ctx.lineWidth = 1;
-    if (x0 >= 0 && x0 <= width) {
-      ctx.beginPath();
-      ctx.moveTo(x0, 0);
-      ctx.lineTo(x0, height);
-      ctx.stroke();
-    }
-    if (x1 >= 0 && x1 <= width) {
-      ctx.beginPath();
-      ctx.moveTo(x1, 0);
-      ctx.lineTo(x1, height);
-      ctx.stroke();
-    }
-    if (loopEditing) {
-      ctx.fillStyle = "#4aa3ff";
-      for (const [x, label] of [[x0, "START"], [x1, "END"]] as const) {
-        if (x < 0 || x > width) continue;
-        ctx.fillRect(x - 3, 0, 6, 10);
-        ctx.font = "9px sans-serif";
-        ctx.fillText(label, Math.min(width - 32, Math.max(4, x + 5)), 19);
-      }
-    }
-  }
-
-  // Bars.
-  const mid = height / 2;
-  const step = Math.max(1, Math.floor(width / wave.peaks.length / 2));
-  for (let x = 0; x < width; x += step) {
-    const t = start + (x / width) * view;
-    const h = Math.max(1, peakAt(t) * (mid - 4));
-    const played = t <= posMs;
-    ctx.fillStyle = played ? "#4aa3ff" : "#1e3a54";
-    ctx.fillRect(x, mid - h, Math.max(1, step - 1), h * 2);
-  }
-
-  cues.forEach((cue) => {
-    const cx = xOf(cue.position_ms);
-    if (cx < 0 || cx > width) return;
-    ctx.fillStyle = "#f97316";
-    ctx.fillRect(cx - 1, 0, 2, height);
-    ctx.font = "10px sans-serif";
-    ctx.fillText(String(cue.slot), cx + 3, 11);
-  });
-
-  // Fixed playhead.
-  const px = xOf(Math.min(posMs, wave.duration_ms));
-  ctx.fillStyle = "#ffffff";
-  ctx.fillRect(px - 1, 0, 2, height);
 }

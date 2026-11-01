@@ -94,7 +94,14 @@ function parseSavedMaps(text: string, defaults: MidiMapState): MidiMapState {
   });
   if (new Set(presets.map((preset) => preset.name)).size !== presets.length) throw new Error("Duplicate presets.");
   for (const preset of defaults.presets) {
-    if (!presets.some((existing) => existing.name === preset.name)) presets.push(preset);
+    const existingIndex = presets.findIndex((existing) => existing.name === preset.name);
+    if (existingIndex === -1) {
+      presets.push(preset);
+    } else if (Object.keys(presets[existingIndex].bindings).length === 0
+      && Object.keys(preset.bindings).length > 0) {
+      // Refresh an untouched empty built-in template, but preserve user-edited presets.
+      presets[existingIndex] = preset;
+    }
   }
   const activeName = midiMapName(value.activeName);
   if (!presets.some((preset) => preset.name === activeName)) throw new Error("Unknown active preset.");

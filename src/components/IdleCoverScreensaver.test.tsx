@@ -49,7 +49,8 @@ it("keeps a valid cover through a pending automatic change and rejects late imag
   });
   const track = { playback_path: "embedded:1", source_hash: "first", source_type: "swf", title: "First" } as Track;
   const status = { path: "embedded:1", loaded: true, playing: true, loading: false } as PlayerStatus;
-  const props = { enabled: true, delayMs: 120_000, ready: true, libraryGeneration: 0, track, status, originRef: createRef<HTMLDivElement>(), cover: { sourceHash: "first", generation: 0, src: "first.jpg", pending: false } };
+  const onVisibilityChange = vi.fn();
+  const props = { enabled: true, delayMs: 120_000, ready: true, libraryGeneration: 0, track, status, originRef: createRef<HTMLDivElement>(), onVisibilityChange, cover: { sourceHash: "first", generation: 0, src: "first.jpg", pending: false } };
   const view = render(<IdleCoverScreensaver {...props} />);
   const lateLoad = preloads[0].onload;
   await act(async () => { preloads[0].onload?.(); });
@@ -57,6 +58,7 @@ it("keeps a valid cover through a pending automatic change and rejects late imag
   expect(screen.queryByRole("dialog")).toBeNull();
   await act(async () => { await vi.advanceTimersByTimeAsync(1); });
   expect(screen.getByRole("img").getAttribute("src")).toBe("first.jpg");
+  expect(onVisibilityChange).toHaveBeenLastCalledWith(true);
   const next = { ...props, track: { ...track, playback_path: "embedded:2", source_hash: "second", title: "Second" }, status: { ...status, path: "embedded:2" }, cover: { sourceHash: "second", generation: 0, src: null as string | null, pending: true } };
   view.rerender(<IdleCoverScreensaver {...next} />);
   expect(screen.getByRole("img").getAttribute("src")).toBe("first.jpg");
@@ -65,4 +67,5 @@ it("keeps a valid cover through a pending automatic change and rejects late imag
   expect(screen.getByRole("img").getAttribute("src")).toBe("second.jpg");
   view.rerender(<IdleCoverScreensaver {...next} cover={{ ...next.cover, pending: false }} />);
   expect(screen.queryByRole("dialog")).toBeNull();
+  expect(onVisibilityChange).toHaveBeenLastCalledWith(false);
 });

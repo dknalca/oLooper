@@ -18,6 +18,9 @@ use sha2::{Digest as _, Sha256};
 
 use crate::import::swf::Sound;
 
+mod availability;
+use availability::FileAvailability;
+
 mod bpm;
 mod embedded;
 mod folders;
@@ -425,6 +428,16 @@ impl Library {
         id: Option<i64>,
         source_hash: Option<&str>,
     ) -> Result<Vec<Track>, String> {
+        let mut availability = FileAvailability::new(|path: &str| Path::new(path).is_file());
+        self.query_tracks_with_availability(id, source_hash, &mut availability)
+    }
+
+    fn query_tracks_with_availability(
+        &self,
+        id: Option<i64>,
+        source_hash: Option<&str>,
+        availability: &mut FileAvailability<impl FnMut(&str) -> bool>,
+    ) -> Result<Vec<Track>, String> {
         // Keep point lookups indexable, and never stat every library file merely
         // to load or edit one row. The row projection stays shared with listing.
         let predicate = match (id, source_hash) {
@@ -458,7 +471,7 @@ impl Library {
                     } else {
                         file_path.clone()
                     },
-                    exists: Path::new(&file_path).is_file(),
+                    exists: availability.is_file(&file_path),
                     audio_storage: audio_storage.clone(),
                     source_type: r.get(4)?,
                     source_path: r.get(5)?,
@@ -924,25 +937,84 @@ impl Library {
         exclude_id: Option<i64>,
         source_hash: Option<&str>,
     ) -> Result<Option<Track>, String> {
-        let mut tracks: Vec<_> = self
-            .query_tracks(None, source_hash)?
-            .into_iter()
-            .filter(|track| track.exists)
-            .collect();
-        if tracks.len() > 1 {
-            if let Some(exclude_id) = exclude_id {
-                tracks.retain(|track| track.id != exclude_id);
+        self.random_track_with(
+            exclude_id,
+            source_hash,
+            |count| {
+                let random: i64 = self
+                    .conn
+                    .query_row("SELECT random()", [], |row| row.get(0))
+                    .map_err(|error| error.to_string())?;
+                Ok(random.unsigned_abs() as usize % count)
+            },
+            |path: &str| Path::new(path).is_file(),
+        )
+    }
+
+    fn random_track_with(
+        &self,
+        exclude_id: Option<i64>,
+        source_hash: Option<&str>,
+        mut choose: impl FnMut(usize) -> Result<usize, String>,
+        probe: impl FnMut(&str) -> bool,
+    ) -> Result<Option<Track>, String> {
+        // Read only IDs/paths, not every track's metadata and file status. Drop the
+        // reader before the point lookups, so writers are not held by this scan.
+        let mut candidates = {
+            let predicate = if source_hash.is_some() {
+                "source_hash=?1"
+            } else {
+                "?1 IS NULL"
+            };
+            let mut statement = self
+                .conn
+                .prepare(&format!(
+                    "SELECT id,file_path FROM tracks WHERE {predicate} ORDER BY id"
+                ))
+                .map_err(|error| error.to_string())?;
+            let rows = statement
+                .query_map([source_hash], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(|error| error.to_string())?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|error| error.to_string())?
+        };
+        let mut fallback = None;
+        candidates.retain(|(id, path)| {
+            if Some(*id) == exclude_id {
+                fallback = Some((*id, path.clone()));
+                false
+            } else {
+                true
+            }
+        });
+        let mut availability = FileAvailability::new(probe);
+        // Random draws without replacement: missing files cannot favor nearby
+        // IDs or weight a shared embedded container as one track. Hydrate only
+        // attempted candidates, rechecking their row and scope after the scan.
+        while !candidates.is_empty() {
+            let index = choose(candidates.len())?;
+            let (id, path) = candidates.swap_remove(index);
+            if !availability.is_file(&path) {
+                continue;
+            }
+            if let Some(track) = self
+                .query_tracks_with_availability(Some(id), source_hash, &mut availability)?
+                .into_iter()
+                .find(|track| track.exists)
+            {
+                return Ok(Some(track));
             }
         }
-        if tracks.is_empty() {
-            return Ok(None);
+        // Repeat the current track only when no other candidate is playable.
+        match fallback {
+            Some((id, path)) if availability.is_file(&path) => Ok(self
+                .query_tracks_with_availability(Some(id), source_hash, &mut availability)?
+                .into_iter()
+                .find(|track| track.exists)),
+            _ => Ok(None),
         }
-        let random: i64 = self
-            .conn
-            .query_row("SELECT random()", [], |row| row.get(0))
-            .map_err(|error| error.to_string())?;
-        let index = random.unsigned_abs() as usize % tracks.len();
-        Ok(Some(tracks.swap_remove(index)))
     }
 
     /// Insert or return the existing row id on `(source_hash, source_sound_id)`.
@@ -3471,5 +3543,7 @@ fn migrate(conn: &Connection) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(test)]
+mod catalog_tests;
 #[cfg(test)]
 pub(crate) mod tests;

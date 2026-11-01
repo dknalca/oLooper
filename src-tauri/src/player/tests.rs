@@ -584,9 +584,75 @@ fn synthetic_wav_decodes_end_to_end() {
 }
 
 #[test]
+fn owned_and_borrowed_wav_decode_to_identical_pcm() {
+    for channels in [1u16, 2] {
+        let mut bytes = pcm_wav(800);
+        bytes[22..24].copy_from_slice(&channels.to_le_bytes());
+        bytes[28..32].copy_from_slice(&(8000 * u32::from(channels) * 2).to_le_bytes());
+        bytes[32..34].copy_from_slice(&(channels * 2).to_le_bytes());
+        let expected = decode_bytes(&bytes).unwrap();
+        let actual = decode_job(bytes).unwrap();
+        assert_eq!(actual.samples, expected.samples);
+        assert_eq!(actual.channels, channels);
+        assert_eq!(actual.rate, expected.rate);
+        assert_eq!(actual.frames(), expected.frames());
+        assert_eq!(actual.duration_ms(), expected.duration_ms());
+    }
+}
+
+#[test]
+fn owned_and_borrowed_mp3_decode_to_identical_pcm() {
+    let original = LoopBuffer {
+        samples: (0..22_050)
+            .map(|sample| (sample % 1000) as i16 - 500)
+            .collect(),
+        channels: 2,
+        rate: 44_100,
+    };
+    let bytes = crate::audio_conversion::wav_pcm_to_mp3_320(&original).unwrap();
+    let expected = decode_bytes(&bytes).unwrap();
+    let actual = decode_job(bytes).unwrap();
+    assert!(!actual.samples.is_empty());
+    assert_eq!(actual.samples, expected.samples);
+    assert_eq!(actual.channels, expected.channels);
+    assert_eq!(actual.rate, expected.rate);
+    assert_eq!(actual.frames(), expected.frames());
+}
+
+#[test]
+fn cancelled_decode_does_not_wait_for_the_transient_work_slot() {
+    let work = crate::memory::work_guard();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let id = "cancelled-decode-before-work-slot".to_string();
+        crate::CANCELLED_IMPORTS
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap()
+            .insert(id.clone(), true);
+        let previous = crate::IMPORT_CONTEXT.with(|context| context.replace(Some(id.clone())));
+        let owned = decode_job(Vec::new());
+        let borrowed = decode_bytes(&[]);
+        crate::IMPORT_CONTEXT.with(|context| context.replace(previous));
+        crate::import_unmark_cancelled(&id);
+        let _ = sender.send((owned, borrowed));
+    });
+    let result = receiver.recv_timeout(std::time::Duration::from_secs(2));
+    // Release even on a timeout so a regression cannot leave a stuck test worker.
+    drop(work);
+    worker.join().unwrap();
+    let (owned, borrowed) = result.expect("cancelled decode must not wait for the occupied slot");
+    assert_eq!(owned.unwrap_err(), "import cancelled");
+    assert_eq!(borrowed.unwrap_err(), "import cancelled");
+}
+
+#[test]
 fn decoding_stops_when_pcm_exceeds_the_practice_duration() {
     let frames = (MAX_DURATION_MS as usize + 1) * 8;
-    let error = decode_bytes(&pcm_wav(frames)).unwrap_err();
+    let bytes = pcm_wav(frames);
+    let error = decode_bytes(&bytes).unwrap_err();
+    assert!(error.contains("15 min practice limit"), "{error}");
+    let error = decode_job(bytes).unwrap_err();
     assert!(error.contains("15 min practice limit"), "{error}");
 }
 
@@ -602,10 +668,34 @@ fn trims_short_aac_edge_silence_from_playback_buffer() {
         channels: 1,
         rate: 1000,
     };
+    let allocation = buffer.samples.as_ptr();
     let trimmed = trim_aac_edge_silence(buffer);
+    assert_eq!(allocation, trimmed.samples.as_ptr());
     assert_eq!(trimmed.frames(), 75);
     assert_eq!(trimmed.samples[0], 1000);
     assert_eq!(trimmed.samples.last(), Some(&1000));
+}
+
+#[test]
+fn aac_edge_trim_reuses_allocation_and_preserves_stereo_frame_order() {
+    let mut samples = vec![0i16; 8 * 2];
+    let expected: Vec<i16> = (0..24)
+        .flat_map(|frame| [1000 + frame, -2000 - frame])
+        .collect();
+    samples.extend_from_slice(&expected);
+    samples.extend_from_slice(&[0; 6 * 2]);
+    let allocation = samples.as_ptr();
+    let capacity = samples.capacity();
+    let trimmed = trim_aac_edge_silence(LoopBuffer {
+        samples,
+        channels: 2,
+        rate: 1000,
+    });
+    assert_eq!(trimmed.samples.as_ptr(), allocation);
+    assert_eq!(trimmed.samples.capacity(), capacity);
+    assert_eq!(trimmed.samples, expected);
+    assert_eq!(trimmed.channels, 2);
+    assert_eq!(trimmed.rate, 1000);
 }
 
 #[test]
@@ -652,6 +742,8 @@ fn tablist_m4a_fixture_decodes_through_player_load_path() {
 fn garbage_is_not_audio() {
     assert!(decode_bytes(b"definitely not audio").is_err());
     assert!(decode_bytes(&[]).is_err());
+    assert!(decode_job(b"definitely not audio".to_vec()).is_err());
+    assert!(decode_job(Vec::new()).is_err());
 }
 
 #[test]
@@ -794,6 +886,50 @@ fn memory_pressure_evicts_old_pcm_without_dropping_the_playback_snapshot() {
 }
 
 #[test]
+fn decoded_cache_accounts_for_retained_pcm_capacity_after_aac_trim() {
+    let mut samples = Vec::with_capacity(128);
+    samples.extend_from_slice(&[0; 8]);
+    samples.extend_from_slice(&[1000; 24]);
+    samples.extend_from_slice(&[0; 6]);
+    let allocation_bytes = samples.capacity() * std::mem::size_of::<i16>();
+    let buffer = Arc::new(trim_aac_edge_silence(LoopBuffer {
+        samples,
+        channels: 1,
+        rate: 1000,
+    }));
+    let sample_bytes = buffer.samples.len() * std::mem::size_of::<i16>();
+    assert_eq!(buffer.samples.len(), 24);
+    assert!(allocation_bytes > sample_bytes);
+    assert_eq!(buffer.memory_bytes(), allocation_bytes);
+
+    let snapshot = Arc::new(std::sync::RwLock::new(Some((
+        "trimmed".to_string(),
+        1,
+        buffer.clone(),
+    ))));
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let mut engine = Engine::new(snapshot.clone(), tx);
+    engine.cache_decoded(
+        "trimmed".to_string(),
+        FileIdentity {
+            size: 4,
+            modified: None,
+        },
+        buffer.clone(),
+    );
+    assert_eq!(engine.decoded_cache_bytes, allocation_bytes);
+    engine.trim_decoded_cache(allocation_bytes);
+    assert_eq!(engine.decoded_cache.len(), 1);
+    engine.trim_decoded_cache(sample_bytes);
+    assert!(engine.decoded_cache.is_empty());
+    assert_eq!(engine.decoded_cache_bytes, 0);
+    assert!(Arc::ptr_eq(
+        &snapshot.read().unwrap().as_ref().unwrap().2,
+        &buffer
+    ));
+}
+
+#[test]
 fn prefetch_decodes_a_candidate_without_changing_the_playing_track() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("next.wav");
@@ -901,6 +1037,97 @@ fn waveform_snapshot_current_matches_path_and_generation() {
     assert!(!waveform_snapshot_current(&loaded, "/a.wav", 2)); // reloaded track
     assert!(!waveform_snapshot_current(&loaded, "/b.wav", 1)); // other track
     assert!(!waveform_snapshot_current(&None, "/a.wav", 1));
+}
+
+#[test]
+fn queued_waveform_owner_keeps_only_identity_and_rejects_same_path_reload() {
+    let buffer = mono(vec![1, 2, 3]);
+    let mut loaded = Some(("embedded:1".to_string(), 1, buffer.clone()));
+    let owner = WaveformOwner::capture(&loaded, "embedded:1").unwrap();
+    assert_eq!(Arc::strong_count(&buffer), 2);
+    assert!(owner.current(&loaded));
+    loaded.as_mut().unwrap().1 = 2;
+    assert!(!owner.current(&loaded));
+    loaded = None;
+    assert!(!owner.current(&loaded));
+    assert_eq!(Arc::strong_count(&buffer), 1);
+    assert!(WaveformOwner::capture(&loaded, "embedded:1").is_err());
+}
+
+#[test]
+fn waveform_checkpoints_never_wait_on_a_snapshot_writer() {
+    let loaded = std::sync::RwLock::new(Some(("embedded:1".to_string(), 1, mono(vec![1, 2, 3]))));
+    let owner = WaveformOwner::capture(&loaded.read().unwrap(), "embedded:1").unwrap();
+    let mut writer = loaded.write().unwrap();
+    assert!(owner.check(&loaded).is_ok()); // WouldBlock is not evidence of staleness.
+    writer.as_mut().unwrap().1 = 2;
+    drop(writer);
+    assert_eq!(owner.check(&loaded).unwrap_err(), WAVEFORM_CHANGED);
+}
+
+#[test]
+fn waveform_scan_cooperatively_stops_on_unload_reload_or_another_path() {
+    for replacement in [None, Some(("embedded:1", 2)), Some(("embedded:2", 1))] {
+        let buffer = mono(vec![1000; 65_536 * 4]);
+        let loaded = std::sync::RwLock::new(Some(("embedded:1".to_string(), 1, buffer.clone())));
+        let owner = WaveformOwner::capture(&loaded.read().unwrap(), "embedded:1").unwrap();
+        let mut checks = 0;
+        let result = crate::waveform::from_buffer_checked(&buffer, 64, || {
+            checks += 1;
+            if checks == 2 {
+                *loaded.write().unwrap() = replacement
+                    .map(|(path, generation)| (path.to_string(), generation, mono(vec![2, 3, 4])));
+            }
+            owner.check(&loaded)
+        });
+        assert_eq!(result.unwrap_err(), WAVEFORM_CHANGED);
+        assert_eq!(checks, 2);
+    }
+}
+
+#[test]
+fn obsolete_waveform_path_does_not_wait_for_the_occupied_compute_slot() {
+    let client = spawn();
+    *client.loaded_buffer.write().unwrap() =
+        Some(("embedded:2".to_string(), 2, mono(vec![1, 2, 3])));
+    let cache = tempfile::tempdir().unwrap();
+    let directory = cache.path().to_path_buf();
+    let compute = client.waveform_compute_lock.lock().unwrap();
+    let worker_client = client.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let _ = tx.send(worker_client.waveform_peaks("embedded:1", 64, &directory));
+    });
+    let result = rx.recv_timeout(std::time::Duration::from_secs(2));
+    // Release even on failure so a regression cannot strand the worker.
+    drop(compute);
+    worker.join().unwrap();
+    assert_eq!(
+        result
+            .expect("obsolete requests must not wait for waveform admission")
+            .unwrap_err(),
+        WAVEFORM_CHANGED
+    );
+    assert_eq!(std::fs::read_dir(cache.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn live_embedded_waveform_still_matches_pure_peaks_without_materializing_audio() {
+    let client = spawn();
+    let buffer = mono(
+        (0..100_000)
+            .map(|sample| (sample % 30_000) as i16)
+            .collect(),
+    );
+    *client.loaded_buffer.write().unwrap() = Some(("embedded:1".to_string(), 1, buffer.clone()));
+    let cache = tempfile::tempdir().unwrap();
+    let actual = client
+        .waveform_peaks("embedded:1", 8192, cache.path())
+        .unwrap();
+    let expected = crate::waveform::from_buffer(&buffer, 8192);
+    assert_eq!(actual.peaks, expected.peaks);
+    assert_eq!(actual.duration_ms, expected.duration_ms);
+    assert_eq!(std::fs::read_dir(cache.path()).unwrap().count(), 0);
 }
 
 fn loaded_for_pitch() -> Loaded {

@@ -1,9 +1,5 @@
-import { useEffect, useRef, useState } from "react";
-import {
-  bpmReanalysisStatus, cancelBpmReanalysis, listenBpmReanalysisProgress,
-  newImportJobId, reanalyzeBpm, type BpmReanalysisProgress, type Track,
-} from "../tauri";
-import type { BpmReanalysisRequest } from "../bpmReanalysis";
+import type { Track } from "../tauri";
+import { useBpmReanalysis } from "../hooks/useBpmReanalysis";
 
 interface Props {
   libraryRoot: string | null;
@@ -13,87 +9,7 @@ interface Props {
 }
 
 export default function BpmReanalysisPanel({ libraryRoot, libraryGeneration, onUpdated, onFinished }: Props) {
-  const [progress, setProgress] = useState<BpmReanalysisProgress | null>(null);
-  const [pending, setPending] = useState(false);
-  const [cancelling, setCancelling] = useState(false);
-  const [label, setLabel] = useState("Library");
-  const [error, setError] = useState<string | null>(null);
-  const callbacks = useRef({ onUpdated, onFinished });
-  callbacks.current = { onUpdated, onFinished };
-  const owner = useRef({ libraryRoot, libraryGeneration });
-  owner.current = { libraryRoot, libraryGeneration };
-  const job = useRef<string | null>(null);
-  const cancelRequested = useRef(false);
-
-  useEffect(() => {
-    let disposed = false;
-    let off: (() => void) | undefined;
-    const finished = new Set<string>();
-    job.current = null;
-    cancelRequested.current = false;
-    setProgress(null); setPending(false); setCancelling(false); setError(null);
-    const apply = (value: BpmReanalysisProgress) => {
-      if (disposed || owner.current.libraryRoot !== libraryRoot || owner.current.libraryGeneration !== libraryGeneration || value.library_root !== libraryRoot || (job.current && value.job_id !== job.current)) return;
-      job.current = value.job_id;
-      setProgress(value);
-      setPending(false);
-      if (value.updated_track) callbacks.current.onUpdated(value.updated_track, { libraryRoot: value.library_root, libraryGeneration });
-      if (value.state !== "running" && !finished.has(value.job_id)) {
-        finished.add(value.job_id);
-        setCancelling(false);
-        callbacks.current.onFinished();
-      }
-    };
-    // Admission waits for this subscription, including very fast completions.
-    const ready = listenBpmReanalysisProgress(apply).then((release) => {
-      off = release;
-      if (disposed) release();
-    });
-    void ready.then(async () => {
-      if (!disposed && job.current === null) {
-        const value = await bpmReanalysisStatus();
-        if (!disposed && job.current === null && value?.library_root === libraryRoot) apply(value);
-      }
-    }).catch((cause) => { if (!disposed) setError(String(cause)); });
-    const request = (event: Event) => {
-      if (!libraryRoot || disposed) return;
-      const detail = (event as CustomEvent<BpmReanalysisRequest>).detail;
-      if (!detail || (job.current && !finished.has(job.current))) return;
-      const id = newImportJobId();
-      job.current = id;
-      cancelRequested.current = false;
-      setLabel(detail.label); setProgress(null); setPending(true); setError(null); setCancelling(false);
-      void (async () => {
-        try {
-          await ready;
-          if (disposed) return;
-          await reanalyzeBpm(detail.scope, id);
-          if (disposed || cancelRequested.current) await cancelBpmReanalysis(id);
-        } catch (cause) {
-          if (!disposed && job.current === id) {
-            finished.add(id); setPending(false); setCancelling(false); setError(String(cause));
-          }
-        }
-      })();
-    };
-    window.addEventListener("olooper:reanalyze-bpm", request);
-    return () => {
-      disposed = true;
-      off?.();
-      window.removeEventListener("olooper:reanalyze-bpm", request);
-      // Root changes are also cancelled by the backend. A pending admission
-      // repeats cancellation after its command resolves, avoiding an early race.
-      if (job.current && !finished.has(job.current)) void cancelBpmReanalysis(job.current).catch(() => {});
-    };
-  }, [libraryRoot, libraryGeneration]);
-
-  const cancel = () => {
-    cancelRequested.current = true;
-    setCancelling(true);
-    if (job.current) void cancelBpmReanalysis(job.current).catch((cause) => {
-      setCancelling(false); setError(String(cause));
-    });
-  };
+  const { progress, pending, cancelling, label, error, cancel, dismiss } = useBpmReanalysis(libraryRoot, libraryGeneration, onUpdated, onFinished);
   if (!progress && !pending && !error) return null;
   const running = pending || progress?.state === "running";
   const report = progress?.report;
@@ -106,7 +22,7 @@ export default function BpmReanalysisPanel({ libraryRoot, libraryGeneration, onU
         </span>
         {running
           ? <button onClick={cancel} disabled={cancelling} className="toolbar-button">{cancelling ? "Cancelling…" : "Cancel analysis"}</button>
-          : <button onClick={() => { setProgress(null); setError(null); }} className="toolbar-button" aria-label="Dismiss BPM analysis">Dismiss</button>}
+          : <button onClick={dismiss} className="toolbar-button" aria-label="Dismiss BPM analysis">Dismiss</button>}
       </div>
       {report && <>
         <progress aria-label="BPM analysis progress" value={report.processed} max={Math.max(1, report.total)} className="mt-1 h-1 w-full" />

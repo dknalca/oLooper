@@ -13,13 +13,46 @@ const document = (overrides = {}) => JSON.stringify({
 });
 
 describe("MIDI map presets", () => {
-  it("ships three empty templates and migrates the existing mapping to Custom_map", () => {
+  it("ships the Rane 72 mapping and migrates the existing mapping to Custom_map", () => {
     const empty = readMidiMaps(storage({}));
     expect(empty.presets.map((preset) => preset.name)).toEqual(["Custom_map", "pioneerS11_map", "Rane72map"]);
-    expect(empty.presets.every((preset) => Object.keys(preset.bindings).length === 0)).toBe(true);
+    expect(Object.keys(empty.presets[0].bindings)).toHaveLength(0);
+    expect(Object.keys(empty.presets[1].bindings)).toHaveLength(0);
+    expect(empty.presets[2].bindings).toEqual({
+      "play-pause": { inputId: "", inputName: "Unassigned input", kind: "note", channel: 14, number: 0 },
+      previous: { inputId: "", inputName: "Unassigned input", kind: "note", channel: 14, number: 1 },
+      next: { inputId: "", inputName: "Unassigned input", kind: "note", channel: 14, number: 2 },
+      "random-loop": { inputId: "", inputName: "Unassigned input", kind: "note", channel: 14, number: 3 },
+      "cue-1": { inputId: "", inputName: "Unassigned input", kind: "note", channel: 14, number: 4 },
+      "cue-2": { inputId: "", inputName: "Unassigned input", kind: "note", channel: 14, number: 5 },
+      "cue-3": { inputId: "", inputName: "Unassigned input", kind: "note", channel: 14, number: 6 },
+      "cue-4": { inputId: "", inputName: "Unassigned input", kind: "note", channel: 14, number: 7 },
+      "library-encoder": { inputId: "", inputName: "Unassigned input", kind: "cc", channel: 16, number: 0 },
+      "library-intro": { inputId: "", inputName: "Unassigned input", kind: "note", channel: 16, number: 3 },
+      "library-back": { inputId: "", inputName: "Unassigned input", kind: "note", channel: 16, number: 7 },
+    });
     const migrated = readMidiMaps(storage({ "olooper.midi.bindings": JSON.stringify(bindings) }));
     expect(migrated.bindings).toEqual(bindings);
     expect(migrated.presets[0].bindings).toEqual(bindings);
+  });
+
+  it("refreshes a saved empty built-in template without replacing user presets", () => {
+    const saved = {
+      version: 1,
+      activeName: "Rane72map",
+      presets: [
+        { name: "Custom_map", bindings: {} },
+        { name: "pioneerS11_map", bindings: {} },
+        { name: "Rane72map", bindings: {} },
+        { name: "Rane72", bindings },
+      ],
+      bindings: {},
+    };
+    const restored = readMidiMaps(storage({ [MIDI_MAP_STORAGE_KEY]: JSON.stringify(saved) }));
+    expect(restored.presets[2].bindings).toEqual(readMidiMaps(storage({})).presets[2].bindings);
+    expect(restored.presets[3].bindings).toEqual(bindings);
+    expect(restored.activeName).toBe("Rane72map");
+    expect(restored.bindings).toEqual({});
   });
 
   it("restores saved snapshots independently of current edits across restarts", () => {

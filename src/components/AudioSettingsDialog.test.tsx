@@ -23,7 +23,7 @@ beforeEach(() => {
   vi.mocked(audioSetOutput).mockResolvedValue(status);
   vi.mocked(audioTestOutput).mockResolvedValue(status);
 });
-afterEach(() => { cleanup(); vi.resetAllMocks(); });
+afterEach(() => { cleanup(); vi.useRealTimers(); vi.resetAllMocks(); });
 
 it("applies the selected output settings and persists them", async () => {
   const onSelectionChange = vi.fn();
@@ -71,4 +71,61 @@ it("does not persist a rejected output change", async () => {
   expect(screen.getByRole("alert").textContent).toContain("device unavailable");
   expect(onSelectionChange).not.toHaveBeenCalled();
   expect(localStorage.getItem("olooper.audio.output")).toBeNull();
+});
+
+it("stops active playback for routing and resumes it on close", async () => {
+  vi.mocked(playerStatus).mockResolvedValue({ ...status, loaded: true, playing: true });
+  const onPlayerStatusChange = vi.fn();
+  const view = render(<AudioSettingsDialog {...props} onPlayerStatusChange={onPlayerStatusChange} />);
+  await act(async () => {});
+  expect(playerStop).toHaveBeenCalledOnce();
+  view.rerender(<AudioSettingsDialog {...props} open={false} onPlayerStatusChange={onPlayerStatusChange} />);
+  await act(async () => {});
+  expect(playerPlay).toHaveBeenCalledOnce();
+  expect(onPlayerStatusChange).toHaveBeenCalledWith(status);
+});
+
+it("does not resume playback after an output test fails", async () => {
+  vi.mocked(playerStatus).mockResolvedValue({ ...status, loaded: true, playing: true });
+  vi.mocked(audioTestOutput).mockRejectedValue(new Error("test failed"));
+  const onSelectionChange = vi.fn();
+  const view = render(<AudioSettingsDialog {...props} onSelectionChange={onSelectionChange} />);
+  await act(async () => {});
+  await act(async () => { fireEvent.click(screen.getByRole("button", { name: "Test L/R" })); });
+  expect(screen.getByRole("alert").textContent).toContain("test failed");
+  expect(onSelectionChange).not.toHaveBeenCalled();
+  view.rerender(<AudioSettingsDialog {...props} open={false} onSelectionChange={onSelectionChange} />);
+  await act(async () => {});
+  expect(playerPlay).not.toHaveBeenCalled();
+});
+
+it("shows left then right test feedback and clears the timers when closed", async () => {
+  vi.useFakeTimers();
+  const onOutputTestStarted = vi.fn();
+  const view = render(<AudioSettingsDialog {...props} onOutputTestStarted={onOutputTestStarted} />);
+  await act(async () => {});
+  await act(async () => { fireEvent.click(screen.getByRole("button", { name: "Test L/R" })); });
+  expect(screen.getByText("Testing left channel…")).toBeTruthy();
+  expect(onOutputTestStarted).toHaveBeenCalledOnce();
+  await act(async () => { await vi.advanceTimersByTimeAsync(400); });
+  expect(screen.getByText("Testing right channel…")).toBeTruthy();
+  view.rerender(<AudioSettingsDialog {...props} open={false} onOutputTestStarted={onOutputTestStarted} />);
+  await act(async () => { await vi.advanceTimersByTimeAsync(1000); });
+  view.rerender(<AudioSettingsDialog {...props} onOutputTestStarted={onOutputTestStarted} />);
+  await act(async () => {});
+  expect(screen.queryByText(/Testing (left|right) channel/)).toBeNull();
+  expect((screen.getByRole("button", { name: "Test L/R" }) as HTMLButtonElement).disabled).toBe(false);
+});
+
+it("ignores an in-flight level poll after the dialog closes", async () => {
+  let finishPoll!: (value: PlayerStatus) => void;
+  vi.mocked(playerStatus).mockResolvedValueOnce(status)
+    .mockImplementationOnce(() => new Promise((resolve) => { finishPoll = resolve; }));
+  const onPlayerStatusChange = vi.fn();
+  const view = render(<AudioSettingsDialog {...props} onPlayerStatusChange={onPlayerStatusChange} />);
+  await act(async () => {});
+  const countBeforeClose = onPlayerStatusChange.mock.calls.length;
+  view.rerender(<AudioSettingsDialog {...props} open={false} onPlayerStatusChange={onPlayerStatusChange} />);
+  await act(async () => { finishPoll({ ...status, playing: true, output_left_level_pct: 90 }); });
+  expect(onPlayerStatusChange).toHaveBeenCalledTimes(countBeforeClose);
 });

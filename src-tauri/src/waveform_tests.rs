@@ -27,6 +27,159 @@ fn approx(a: f32, b: f32) -> bool {
     (a - b).abs() < 1e-5
 }
 
+/// Algorithm-v2 reference before cooperative chunking. Keep the arithmetic and
+/// reduction order independent from the production checked/unchecked wrappers.
+fn reference_peak_bits(buf: &LoopBuffer, buckets: usize) -> Vec<u32> {
+    let buckets = clamp_buckets(buckets);
+    let frames = buf.frames();
+    let ch = buf.channels.max(1) as usize;
+    let mut peaks = vec![0f32; buckets];
+    if frames != 0 {
+        for (i, bucket) in peaks.iter_mut().enumerate() {
+            let start = i * frames / buckets;
+            let end = ((i + 1) * frames / buckets).max(start + 1).min(frames);
+            let mut max = 0f32;
+            for frame in start..end {
+                let mut mix = 0f32;
+                for channel in 0..ch {
+                    mix += buf.samples.get(frame * ch + channel).copied().unwrap_or(0) as f32
+                        / 32768.0;
+                }
+                max = max.max((mix / ch as f32).abs());
+            }
+            *bucket = max;
+        }
+        let global = peaks.iter().copied().fold(0f32, f32::max);
+        if global > 0.0 {
+            for peak in &mut peaks {
+                *peak /= global;
+            }
+        }
+    }
+    peaks.into_iter().map(f32::to_bits).collect()
+}
+
+#[test]
+fn checked_waveforms_preserve_algorithm_v2_peak_bits_across_layouts_and_chunks() {
+    for channels in [0u16, 1, 2, 8] {
+        for frames in [0, 1, 17, 97, CHECK_INTERVAL_FRAMES + 19] {
+            let samples = (0..frames * usize::from(channels.max(1)))
+                .map(|index| (index.wrapping_mul(7919).wrapping_add(12345) as u16) as i16)
+                .collect();
+            let buf = LoopBuffer {
+                samples,
+                channels,
+                rate: if frames == 17 { 0 } else { 44_100 },
+            };
+            for buckets in [0, 64, 127, MAX_BUCKETS, usize::MAX] {
+                let checked = from_buffer_checked(&buf, buckets, || Ok::<(), ()>(())).unwrap();
+                let unchecked = from_buffer(&buf, buckets);
+                let expected = reference_peak_bits(&buf, buckets);
+                assert_eq!(
+                    checked
+                        .peaks
+                        .iter()
+                        .map(|peak| peak.to_bits())
+                        .collect::<Vec<_>>(),
+                    expected
+                );
+                assert_eq!(
+                    unchecked
+                        .peaks
+                        .iter()
+                        .map(|peak| peak.to_bits())
+                        .collect::<Vec<_>>(),
+                    expected
+                );
+                assert_eq!(checked.buckets, clamp_buckets(buckets));
+                assert_eq!(checked.duration_ms, buf.duration_ms());
+            }
+        }
+    }
+}
+
+#[test]
+fn checked_waveforms_can_stop_before_scanning_or_allocating_peaks() {
+    let buf = LoopBuffer {
+        samples: vec![1000; CHECK_INTERVAL_FRAMES * 4],
+        channels: 1,
+        rate: 44_100,
+    };
+    let mut checks = 0;
+    let result = from_buffer_checked(&buf, MAX_BUCKETS, || {
+        checks += 1;
+        Err("obsolete")
+    });
+    assert_eq!(result.unwrap_err(), "obsolete");
+    assert_eq!(checks, 1);
+}
+
+#[test]
+fn checked_waveforms_stop_at_a_mid_scan_or_final_checkpoint() {
+    for frames in [CHECK_INTERVAL_FRAMES * 4, 31] {
+        let buf = LoopBuffer {
+            samples: vec![1000; frames],
+            channels: 1,
+            rate: 44_100,
+        };
+        let mut checks = 0;
+        let result = from_buffer_checked(&buf, MIN_BUCKETS, || {
+            checks += 1;
+            if checks == 2 {
+                Err("obsolete")
+            } else {
+                Ok(())
+            }
+        });
+        assert_eq!(result.unwrap_err(), "obsolete");
+        assert_eq!(checks, 2);
+    }
+}
+
+#[test]
+fn waveform_checkpoint_cost_is_bounded_by_visited_frames_not_buckets() {
+    for frames in [
+        0,
+        1,
+        CHECK_INTERVAL_FRAMES,
+        CHECK_INTERVAL_FRAMES + 1,
+        CHECK_INTERVAL_FRAMES * 2 + 1,
+    ] {
+        let buf = LoopBuffer {
+            samples: vec![1000; frames],
+            channels: 1,
+            rate: 44_100,
+        };
+        for buckets in [MIN_BUCKETS, MAX_BUCKETS] {
+            let mut checks = 0;
+            from_buffer_checked(&buf, buckets, || {
+                checks += 1;
+                Ok::<(), ()>(())
+            })
+            .unwrap();
+            let expected = if frames == 0 {
+                1
+            } else {
+                2 + (frames.max(buckets) - 1) / CHECK_INTERVAL_FRAMES
+            };
+            assert_eq!(checks, expected, "frames={frames}, buckets={buckets}");
+        }
+    }
+}
+
+#[test]
+fn cancelled_empty_waveform_does_not_return_a_successful_flat_result() {
+    let empty = LoopBuffer {
+        samples: vec![],
+        channels: 1,
+        rate: 44_100,
+    };
+    assert_eq!(
+        from_buffer_checked(&empty, MIN_BUCKETS, || Err("obsolete")).unwrap_err(),
+        "obsolete"
+    );
+}
+
 #[test]
 fn mono_buckets_are_exact() {
     // 256-frame ramp, 64 buckets → bucket i holds frames 4i..4i+4,

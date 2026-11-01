@@ -2,7 +2,7 @@
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import TopBar from "./TopBar";
-import { getAppStatus, libraryDefaultRoot, libraryInit, libraryRestore } from "../tauri";
+import { getAppStatus, libraryDefaultRoot, libraryInit, libraryRestore, playerSetMetronome, type PlayerStatus } from "../tauri";
 
 vi.mock("../tauri", () => ({
   getAppStatus: vi.fn(), libraryDefaultRoot: vi.fn(), libraryInit: vi.fn(),
@@ -61,4 +61,15 @@ it("ignores an older restore failure while the newer selection is pending", asyn
   await act(async () => { manual.resolve("/new"); });
   expect(onLibraryReady).toHaveBeenCalledOnce();
   expect(onLibraryReady).toHaveBeenCalledWith("/new");
+});
+
+it("connects the metronome to the current track BPM and the MIDI toggle event", async () => {
+  vi.mocked(libraryRestore).mockResolvedValue(null);
+  vi.mocked(playerSetMetronome).mockResolvedValue({} as PlayerStatus);
+  const view = render(<TopBar onLibraryReady={vi.fn()} playing={false} trackBpm={110} onAudioOptions={vi.fn()} onMidiOptions={vi.fn()} onShortcuts={vi.fn()} onPreferences={vi.fn()} />);
+  await act(async () => { window.dispatchEvent(new Event("olooper:metronome-toggle")); });
+  expect(playerSetMetronome).toHaveBeenCalledExactlyOnceWith(true, 110);
+  view.rerender(<TopBar onLibraryReady={vi.fn()} playing={false} trackBpm={125} onAudioOptions={vi.fn()} onMidiOptions={vi.fn()} onShortcuts={vi.fn()} onPreferences={vi.fn()} />);
+  await act(async () => {});
+  expect(playerSetMetronome).toHaveBeenLastCalledWith(true, 125);
 });

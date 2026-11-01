@@ -1,27 +1,24 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { startPolling } from "../poll";
-import { createRandomPlayback, type RandomSwitchOptions } from "../randomPlayback";
+import { startPlayerStatusPolling } from "../playerStatusPolling";
+import type { RandomSwitchOptions } from "../randomPlayback";
+import { useRandomPlayback } from "../hooks/useRandomPlayback";
+import { usePlayerCues } from "../hooks/usePlayerCues";
+import { usePlayerLoopEditor } from "../hooks/usePlayerLoopEditor";
 import {
-  libraryGetSeratoMetadata,
-  librarySetSeratoCue,
-  librarySyncSeratoMetadata,
   playerPause,
   playerPlay,
-  playerSeek,
-  playerAutoLoop,
   playerSetLoopEnabled,
-  playerSetLoopSnapped,
   playerSetSpeed,
   playerSetVolume,
-  playerStatus,
   playerStop,
   type PlayerStatus,
-  type SeratoCue,
-  type SeratoMetadata,
 } from "../tauri";
 import { exposePlayerState } from "../hooks/useKeyboardShortcuts";
 import CueControls from "./CueControls";
 import PlayerAudioControls from "./PlayerAudioControls";
+import RandomPlaybackControls from "./RandomPlaybackControls";
+import LoopEditingControls from "./LoopEditingControls";
+import PlayerScrubBar from "./PlayerScrubBar";
 
 function fmt(ms: number): string {
   const s = Math.floor(ms / 1000);
@@ -49,72 +46,13 @@ interface Props {
 export default function Player({ status: st, trackId, audioStorage, playbackPath, trackOpenGeneration, canRandom, onRandomTrack, canNavigateTracks, onPreviousTrack, onNextTrack, loopEditing, onToggleLoopEditing, onStatusChange }: Props) {
   const matchesPlayback = !playbackPath || st?.path === playbackPath;
   const [error, setError] = useState<string | null>(null);
-  const scrubRef = useRef<HTMLDivElement>(null);
-  const loopStartRef = useRef<HTMLInputElement>(null);
-  const loopEndRef = useRef<HTMLInputElement>(null);
-  const [loopStart, setLoopStart] = useState("0");
-  const [loopEnd, setLoopEnd] = useState("");
-  const [isScrubbing, setIsScrubbing] = useState(false);
-  const [randomEnabled, setRandomEnabled] = useState(false);
-  const [randomInterval, setRandomInterval] = useState<"2" | "5" | "custom">("2");
-  const [customMinutes, setCustomMinutes] = useState("10");
-  const [randomRemaining, setRandomRemaining] = useState<number | null>(null);
-  const randomActionRef = useRef(onRandomTrack);
-  randomActionRef.current = onRandomTrack;
-  const [randomPlayback] = useState(() => createRandomPlayback({
-    action: (request) => randomActionRef.current(request),
-    onRemaining: setRandomRemaining,
-    onSuccess: () => setError(null),
-    onError: (cause) => setError(`Random track: ${String(cause)}`),
-  }));
-  const minutes = randomInterval === "custom" ? Number(customMinutes) : Number(randomInterval);
-  const validInterval = Number.isFinite(minutes) && minutes >= 1 && minutes <= 1440;
+  const random = useRandomPlayback(st, canRandom, onRandomTrack, setError);
 
-  useEffect(() => {
-    randomPlayback.configure(randomEnabled && canRandom && validInterval ? minutes * 60_000 : null);
-    return () => randomPlayback.configure(null);
-  }, [randomEnabled, canRandom, validInterval, minutes, randomPlayback]);
-
-  useEffect(() => { randomPlayback.updatePlayback(st); }, [st, randomPlayback]);
-
-  useEffect(() => {
-    const random = () => { if (canRandom) void randomPlayback.trigger(); };
-    window.addEventListener("olooper:random-loop", random);
-    return () => window.removeEventListener("olooper:random-loop", random);
-  }, [canRandom, randomPlayback]);
-
-  // Managed audio tags own editable CUEs; embedded tracks only expose fixed CUE 1.
-  const [cues, setCues] = useState<SeratoCue[]>([]);
-  const [metadataTrackId, setMetadataTrackId] = useState<number | null>(null);
-  const [activeCueSlot, setActiveCueSlot] = useState<number | null>(null);
-  const [seratoSyncing, setSeratoSyncing] = useState(false);
-  const [seratoSyncMessage, setSeratoSyncMessage] = useState<string | null>(null);
-  const [seratoSyncError, setSeratoSyncError] = useState(false);
   const statusRef = useRef(st);
   const metadataOwner = useRef("");
   metadataOwner.current = `${trackId}:${trackOpenGeneration}:${st?.generation ?? 0}:${st?.path ?? ""}`;
 
   statusRef.current = st;
-
-  useEffect(() => {
-    setSeratoSyncMessage(null);
-    setSeratoSyncError(false);
-    setSeratoSyncing(false);
-  }, [trackId]);
-
-  useEffect(() => {
-    if (!st?.loaded) {
-      setLoopStart("0");
-      setLoopEnd("");
-      return;
-    }
-    if (document.activeElement !== loopStartRef.current) setLoopStart(String(st.loop_start_ms));
-    if (document.activeElement !== loopEndRef.current) setLoopEnd(String(st.loop_end_ms));
-  }, [st?.path, st?.loaded, st?.loop_start_ms, st?.loop_end_ms]);
-
-  useEffect(() => {
-    window.dispatchEvent(new CustomEvent<SeratoCue[]>("olooper:cues", { detail: cues }));
-  }, [cues]);
 
   useEffect(() => {
     setError(st?.output_error ? `Audio output: ${st.output_error}` : null);
@@ -131,21 +69,25 @@ export default function Player({ status: st, trackId, audioStorage, playbackPath
     },
     [onStatusChange],
   );
+  const { cues, metadataTrackId, activeCueSlot, seratoSyncing, seratoSyncMessage, seratoSyncError, loadCue, saveCue, clearCue, syncSeratoMetadata } = usePlayerCues({
+    trackId, trackOpenGeneration, audioStorage, status: st, matchesPlayback,
+    statusRef, ownerRef: metadataOwner, setError, run,
+  });
+  const loop = usePlayerLoopEditor(st, statusRef, metadataOwner, setError, run);
 
-  const playNextRandom = randomPlayback.trigger;
+  const playNextRandom = random.trigger;
 
-  // Poll native position at 4 Hz while playing, and also while a
+  // Request native position at 4 Hz while playing, and also while a
   // background job (decode/stretch) is pending so progress and async
   // errors surface without new event plumbing.
   useEffect(() => {
     if (!st?.playing && !st?.loading && !st?.pitch_preparing) return;
-    let active = true;
-    const stop = startPolling(async () => {
+    return startPlayerStatusPolling(() => {
       const owner = metadataOwner.current;
-      const status = await playerStatus();
-      if (active && owner === metadataOwner.current) onStatusChange(status);
+      return (status) => {
+        if (owner === metadataOwner.current) onStatusChange(status);
+      };
     }, 250, false);
-    return () => { active = false; stop(); };
   }, [st?.playing, st?.loading, st?.pitch_preparing, onStatusChange]);
 
   // Expose state to keyboard shortcuts hook.
@@ -161,170 +103,6 @@ export default function Player({ status: st, trackId, audioStorage, playbackPath
     } else exposePlayerState({ position_ms: 0, playing: false, loaded: false, loop_enabled: false, duration_ms: 0 });
   }, [st, matchesPlayback]);
 
-  // Read markers from the audio file every time a track is opened.
-  useEffect(() => {
-    let cancelled = false;
-    setCues([]);
-    setMetadataTrackId(null);
-    setActiveCueSlot(null);
-    if (!trackId || !st?.loaded || !matchesPlayback) {
-      return () => { cancelled = true; };
-    }
-    libraryGetSeratoMetadata(trackId)
-      .then((metadata) => {
-        if (cancelled) return;
-        setCues(metadata.cues);
-        setMetadataTrackId(trackId);
-        setError(null);
-        if (metadata.bpm !== null) {
-          window.dispatchEvent(new CustomEvent("olooper:track-bpm", {
-            detail: { trackId, bpm: metadata.bpm, source: metadata.bpm_source, confidence: metadata.bpm_confidence } satisfies import("../tauri").TrackBpmUpdate,
-          }));
-        }
-      })
-      .catch((cause) => {
-        if (!cancelled) setError(`Cannot read CUEs from audio file: ${String(cause)}`);
-      });
-    return () => { cancelled = true; };
-  }, [trackId, trackOpenGeneration, st?.generation, st?.path, st?.loaded, matchesPlayback]);
-
-  const scrub = (e: React.MouseEvent<HTMLDivElement>) => {
-    if (!scrubRef.current || !st?.loaded || st.loading || !matchesPlayback || st.duration_ms <= 0) return;
-    const rect = scrubRef.current.getBoundingClientRect();
-    const frac = Math.min(1, Math.max(0, (e.clientX - rect.left) / rect.width));
-    playerSeek(Math.round(frac * st.duration_ms)).catch((e) => setError(String(e)));
-  };
-
-  const onScrubDown = (e: React.MouseEvent<HTMLDivElement>) => {
-    setIsScrubbing(true);
-    scrub(e);
-  };
-
-  useEffect(() => {
-    if (!isScrubbing) return;
-    const owner = metadataOwner.current;
-    const onMove = (e: MouseEvent) => {
-      if (owner !== metadataOwner.current || statusRef.current?.loading) return;
-      if (!scrubRef.current || !st?.loaded || st.duration_ms <= 0) return;
-      const rect = scrubRef.current.getBoundingClientRect();
-      const frac = Math.min(1, Math.max(0, (e.clientX - rect.left) / rect.width));
-      playerSeek(Math.round(frac * st.duration_ms)).catch(() => {});
-    };
-    const onUp = () => setIsScrubbing(false);
-    window.addEventListener("mousemove", onMove);
-    window.addEventListener("mouseup", onUp);
-    return () => {
-      window.removeEventListener("mousemove", onMove);
-      window.removeEventListener("mouseup", onUp);
-    };
-  }, [isScrubbing, st?.loaded, st?.duration_ms]);
-
-  const applyMetadata = (metadata: SeratoMetadata) => {
-    setCues(metadata.cues);
-    if (metadata.bpm !== null && trackId !== null) {
-      window.dispatchEvent(new CustomEvent("olooper:track-bpm", {
-        detail: { trackId, bpm: metadata.bpm, source: metadata.bpm_source, confidence: metadata.bpm_confidence } satisfies import("../tauri").TrackBpmUpdate,
-      }));
-    }
-  };
-
-  const saveCue = (slot: number) => {
-    if (!trackId || metadataTrackId !== trackId || st?.loading || !matchesPlayback) return;
-    const cueMs = statusRef.current?.position_ms ?? 0;
-    const owner = metadataOwner.current;
-    librarySetSeratoCue(trackId, slot, cueMs)
-      .then((metadata) => {
-        if (owner !== metadataOwner.current) return;
-        applyMetadata(metadata);
-        setActiveCueSlot(slot);
-      })
-      .catch((cause) => { if (owner === metadataOwner.current) setError(String(cause)); });
-  };
-
-  const syncSeratoMetadata = useCallback(async (id: number) => {
-    const owner = metadataOwner.current;
-    setSeratoSyncing(true);
-    setSeratoSyncError(false);
-    setSeratoSyncMessage("Writing CUEs and BPM to the audio file…");
-    try {
-      await librarySyncSeratoMetadata(id);
-      if (owner !== metadataOwner.current) return;
-      setSeratoSyncMessage("Serato metadata synced. Reload this file in Serato to refresh it.");
-    } catch (cause) {
-      if (owner !== metadataOwner.current) return;
-      setSeratoSyncError(true);
-      setSeratoSyncMessage(`Data is saved in oLooper, but Serato sync failed: ${String(cause)}`);
-    } finally {
-      if (owner === metadataOwner.current) setSeratoSyncing(false);
-    }
-  }, []);
-
-  const loadCue = (slot: number) => {
-    if (metadataTrackId !== trackId || st?.loading || !matchesPlayback) return;
-    const cue = cues.find((saved) => saved.slot === slot);
-    if (!cue) return;
-    setActiveCueSlot(slot);
-    run(playerSeek(cue.position_ms));
-  };
-
-  const clearCue = (slot: number) => {
-    if (!trackId || metadataTrackId !== trackId || slot === 1 || st?.loading || !matchesPlayback) return;
-    const owner = metadataOwner.current;
-    librarySetSeratoCue(trackId, slot, null)
-      .then((metadata) => {
-        if (owner !== metadataOwner.current) return;
-        applyMetadata(metadata);
-        if (activeCueSlot === slot) setActiveCueSlot(null);
-      })
-      .catch((cause) => { if (owner === metadataOwner.current) setError(String(cause)); });
-  };
-
-  const applyManualLoop = () => {
-    const start = Number(loopStart);
-    const end = Number(loopEnd);
-    if (!Number.isFinite(start) || !Number.isFinite(end)) {
-      setError("Loop boundaries must be valid times in milliseconds.");
-      return;
-    }
-    run(playerSetLoopSnapped(start, end, statusRef.current?.generation));
-  };
-
-  const detectLoop = () => {
-    const owner = metadataOwner.current;
-    const generation = statusRef.current?.generation;
-    run(playerAutoLoop().then((result) => {
-      if (owner !== metadataOwner.current) throw new Error("Track changed during analysis");
-      if (!result.candidate) throw new Error("No suitable loop found");
-      return playerSetLoopSnapped(
-        Math.round(result.candidate.start_frame * 1000 / result.sample_rate),
-        Math.round(result.candidate.end_frame * 1000 / result.sample_rate),
-        generation,
-      );
-    }));
-  };
-
-  useEffect(() => {
-    const handleCueShortcut = (event: Event) => {
-      const { slot, clear } = (event as CustomEvent<{ slot: number; clear: boolean }>).detail;
-      if (!trackId || !st?.loaded || st.loading || !matchesPlayback || !Number.isInteger(slot) || slot < 1 || slot > 4) return;
-      if (audioStorage === "embedded" && slot !== 1) return;
-      if (slot === 1) {
-        loadCue(1);
-      } else if (clear) {
-        clearCue(slot);
-      } else if (metadataTrackId !== trackId) {
-        return;
-      } else if (cues.some((cue) => cue.slot === slot)) {
-        loadCue(slot);
-      } else {
-        saveCue(slot);
-      }
-    };
-    window.addEventListener("olooper:cue-shortcut", handleCueShortcut);
-    return () => window.removeEventListener("olooper:cue-shortcut", handleCueShortcut);
-  }, [audioStorage, trackId, st?.loaded, metadataTrackId, cues, clearCue, loadCue, saveCue]);
-
-  const posFrac = st?.loaded && st.duration_ms > 0 ? st.position_ms / st.duration_ms : 0;
   const loaded = (st?.loaded ?? false) && !st?.loading && matchesPlayback;
   const playing = st?.playing ?? false;
   // Async job errors arrive via status polling, not via the invoke that
@@ -333,51 +111,8 @@ export default function Player({ status: st, trackId, audioStorage, playbackPath
 
   return (
     <div className="mx-3 mb-3 flex shrink-0 flex-col gap-3 rounded-xl border border-border/70 bg-surface px-4 py-3 shadow-lg">
-      {/* Scrub bar */}
-      <div
-        ref={scrubRef}
-        role="slider"
-        tabIndex={loaded ? 0 : -1}
-        aria-label="Playback position"
-        aria-valuemin={0}
-        aria-valuemax={st?.duration_ms ?? 0}
-        aria-valuenow={st?.position_ms ?? 0}
-        aria-disabled={!loaded}
-        onKeyDown={(event) => {
-          if (!loaded) return;
-          const position = st?.position_ms ?? 0;
-          const target = event.key === "Home" ? 0 : event.key === "End" ? st?.duration_ms ?? 0
-            : event.key === "ArrowLeft" ? position - 1000 : event.key === "ArrowRight" ? position + 1000 : null;
-          if (target !== null) { event.preventDefault(); event.stopPropagation(); run(playerSeek(Math.max(0, Math.min(st?.duration_ms ?? 0, target)))); }
-        }}
-        onMouseDown={onScrubDown}
-        className={`relative h-2 overflow-hidden rounded-full cursor-pointer group ${loaded ? "bg-border" : "bg-border/50"}`}
-      >
-        {loaded && (
-          <svg
-            viewBox="0 0 100 10"
-            preserveAspectRatio="none"
-            className="absolute inset-0 h-full w-full overflow-hidden pointer-events-none"
-            aria-hidden="true"
-          >
-            <line
-              x1="0"
-              y1="5"
-              x2={posFrac * 100}
-              y2="5"
-              className="stroke-accent"
-              strokeWidth="10"
-              strokeLinecap="round"
-            />
-            <circle
-              cx={posFrac * 100}
-              cy="5"
-              r="4"
-              className="fill-accent opacity-0 group-hover:opacity-100 transition-opacity"
-            />
-          </svg>
-        )}
-      </div>
+      <PlayerScrubBar status={st} matchesPlayback={matchesPlayback} loaded={loaded} statusRef={statusRef}
+        ownerRef={metadataOwner} setError={setError} run={run} />
 
       {/* Transport row */}
       <div className="flex flex-wrap items-center gap-3">
@@ -455,98 +190,17 @@ export default function Player({ status: st, trackId, audioStorage, playbackPath
           className={`rounded px-2 py-1 text-[10px] font-medium transition-colors disabled:opacity-30 ${loopEditing ? "bg-accent/20 text-accent" : "bg-border text-text-secondary hover:text-text"}`}
         >{loopEditing ? "Loop controls ▲" : "Loop controls ▼"}</button>
 
-        <div className="flex items-center gap-1.5">
-          <button
-            onClick={() => setRandomEnabled((enabled) => !enabled)}
-            disabled={!canRandom || (!randomEnabled && !validInterval)}
-            aria-pressed={randomEnabled}
-            title="Change at the loop ending closest to this interval; manual Random remains immediate"
-            className={`rounded px-2 py-1 text-[10px] font-medium transition-colors disabled:opacity-30 ${randomEnabled ? "bg-success/20 text-success" : "bg-border text-text-secondary hover:text-text"}`}
-          >
-            {randomEnabled ? "Random ON" : "Random OFF"}
-          </button>
-          <select
-            aria-label="Random track interval"
-            value={randomInterval}
-            onChange={(event) => setRandomInterval(event.target.value as "2" | "5" | "custom")}
-            className="rounded border border-border bg-elevated px-1.5 py-1 text-[10px] text-text"
-          >
-            <option value="2">2 min</option>
-            <option value="5">5 min</option>
-            <option value="custom">Custom</option>
-          </select>
-          {randomInterval === "custom" && (
-            <input
-              type="number"
-              min={1}
-              max={1440}
-              step={1}
-              value={customMinutes}
-              onChange={(event) => setCustomMinutes(event.target.value)}
-              aria-label="Custom random interval in minutes"
-              className="w-12 rounded border border-border bg-elevated px-1.5 py-1 text-center text-[10px] text-text"
-            />
-          )}
-          {randomEnabled && randomRemaining !== null && (
-            <span className="min-w-8 font-mono text-[10px] tabular-nums text-success" aria-live="polite">
-              {Math.floor(randomRemaining / 60)}:{String(randomRemaining % 60).padStart(2, "0")}
-            </span>
-          )}
-        </div>
+        <RandomPlaybackControls enabled={random.enabled} canRandom={canRandom} validInterval={random.validInterval}
+          interval={random.interval} customMinutes={random.customMinutes} remaining={random.remaining}
+          onToggle={() => random.setEnabled((enabled) => !enabled)} onIntervalChange={random.setInterval} onCustomMinutesChange={random.setCustomMinutes} />
 
         <div className="flex-1" />
       </div>
       {loopEditing && (
-        <div id="loop-edit-controls" className="flex flex-wrap items-center gap-2 border-t border-border pt-2">
-          <button
-            onClick={() => run(playerSetLoopEnabled(!st?.loop_enabled))}
-            disabled={!loaded}
-            aria-pressed={st?.loop_enabled ?? false}
-            className={`rounded px-2 py-1 text-[10px] font-medium disabled:opacity-40 ${st?.loop_enabled ? "bg-success/20 text-success" : "bg-border text-text-secondary hover:text-text"}`}
-          >{st?.loop_enabled ? "LOOP ON" : "LOOP OFF"}</button>
-          <button
-            onClick={detectLoop}
-            disabled={!loaded}
-            className="rounded bg-border px-2 py-1 text-[10px] text-text-secondary hover:text-text disabled:opacity-40"
-          >AUTO</button>
-          <label className="flex items-center gap-1 text-[10px] text-text-secondary">
-            Start
-            <input
-              ref={loopStartRef}
-              type="number"
-              min={0}
-              max={st?.duration_ms ?? 0}
-              value={loopStart}
-              onChange={(event) => setLoopStart(event.target.value)}
-              disabled={!loaded}
-              aria-label="Loop start in milliseconds"
-              className="w-20 rounded border border-border bg-elevated px-1.5 py-1 text-center font-mono text-text disabled:opacity-40"
-            />
-            ms
-          </label>
-          <span className="text-[10px] text-text-secondary">–</span>
-          <label className="flex items-center gap-1 text-[10px] text-text-secondary">
-            End
-            <input
-              ref={loopEndRef}
-              type="number"
-              min={0}
-              max={st?.duration_ms ?? 0}
-              value={loopEnd}
-              onChange={(event) => setLoopEnd(event.target.value)}
-              disabled={!loaded}
-              aria-label="Loop end in milliseconds"
-              className="w-20 rounded border border-border bg-elevated px-1.5 py-1 text-center font-mono text-text disabled:opacity-40"
-            />
-            ms
-          </label>
-          <button
-            onClick={applyManualLoop}
-            disabled={!loaded}
-            className="rounded bg-accent/15 px-2.5 py-1 text-[10px] font-medium text-accent hover:bg-accent/25 disabled:opacity-40"
-          >Apply</button>
-          <span className="text-[10px] text-text-secondary">Drag a loop edge on the waveform to adjust it.</span>
-        </div>
+        <LoopEditingControls loaded={loaded} loopEnabled={st?.loop_enabled ?? false} durationMs={st?.duration_ms ?? 0}
+          start={loop.start} end={loop.end} startRef={loop.startRef} endRef={loop.endRef}
+          onToggleLoop={() => run(playerSetLoopEnabled(!st?.loop_enabled))} onDetect={loop.detect}
+          onStartChange={loop.setStart} onEndChange={loop.setEnd} onApply={loop.apply} />
       )}
       {(shownError || seratoSyncMessage) && (
         <div className="flex flex-col gap-1 border-t border-border pt-2 text-[11px] leading-relaxed break-words">

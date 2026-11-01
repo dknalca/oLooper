@@ -2,5 +2,17 @@
   "format": "olooper-midi-map",
   "version": 1,
   "name": "Rane72map",
-  "bindings": {}
+  "bindings": {
+    "play-pause": { "kind": "note", "channel": 14, "number": 0 },
+    "previous": { "kind": "note", "channel": 14, "number": 1 },
+    "next": { "kind": "note", "channel": 14, "number": 2 },
+    "random-loop": { "kind": "note", "channel": 14, "number": 3 },
+    "cue-1": { "kind": "note", "channel": 14, "number": 4 },
+    "cue-2": { "kind": "note", "channel": 14, "number": 5 },
+    "cue-3": { "kind": "note", "channel": 14, "number": 6 },
+    "cue-4": { "kind": "note", "channel": 14, "number": 7 },
+    "library-encoder": { "kind": "cc", "channel": 16, "number": 0 },
+    "library-intro": { "kind": "note", "channel": 16, "number": 3 },
+    "library-back": { "kind": "note", "channel": 16, "number": 7 }
+  }
 }

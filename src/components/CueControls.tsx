@@ -14,7 +14,7 @@ interface Props {
   onSync: () => void;
 }
 
-/** Render fixed CUE slots; mutations and ownership checks remain in Player. */
+/** Render fixed CUE slots; usePlayerCues owns mutations and ownership checks. */
 export default function CueControls({ cues, ready, audioStorage, activeCueSlot, syncing, onLoad, onSave, onClear, onSync }: Props) {
   return <div className="flex items-center gap-1">
     <span className="mr-1 text-[9px] font-semibold uppercase tracking-wide text-text-secondary">CUE</span>

@@ -57,14 +57,67 @@ cover hook and overlay still own wake-event handling and animation lifecycle.
 `src/libraryTrackLoad.ts` waits for a sidebar load and validates its playback
 path; Sidebar must check selection and library ownership after the async handoff.
 Library empty/deletion dialogs and player CUE/audio controls are presentation
-components: the Sidebar and Player retain ownership of catalog and audio writes.
+components; their parent workflows own catalog and audio writes.
 `src/audioDeviceOptions.ts` and `AudioOutputControls` derive and display output
 capabilities; `AudioSettingsDialog` remains responsible for applying a route.
+`useAudioRoutingSession` manages playback stop/resume and digital level polling;
+`useAudioOutputTest` owns the test-channel timers and `AudioOutputMeter` displays
+the levels. Player and the audio session share periodic reads through
+`src/playerStatusPolling.ts`/`src/sharedPolling.ts`, at the fastest active cadence.
+Receiver ownership is captured before each read; one-shot status reads and native
+commands are not cached or serialized by that stream (spec 330, ADR 0032).
+ImportBar delegates job identity, cancellation, progress subscription
+and elapsed time to `useImportJobs`; `ImportProgressPanel` only displays results.
+The job wait helpers still subscribe before enqueueing and are responsible for
+recognizing completion, independently of the UI progress subscription.
+`LibraryTrackToolbar`, `RandomPlaybackControls` and the Tablist header/row
+components render controls; their parent components retain the relevant filter,
+playback and import state.
+`MetronomeControls` owns the metronome's native commands, MIDI toggle event and
+visual beat timer, independently of TopBar's library and practice state.
+`useTablistSearch` owns debounced pages and downloaded counts; `useTablistImport`
+owns import job progress and cancellation. The import wait helper still owns
+completion and subscribes before enqueueing.
+`LibraryTrackHeader` and `LoopEditingControls` similarly delegate sorting and
+loop actions. `src/idleCoverState.ts` computes cover ownership and
+eligibility; `useIdleCover` still handles wake events and lifecycle.
+`useLibraryFilters` persists filter choices. `libraryCoverCache` and
+`useLibraryCover` share bounded, generation/revision-owned cover reads between
+the active cover and visible `LibraryCoverThumbnail` consumers.
+`useRandomPlayback` owns the Random timer and event subscription, while
+`PlayerScrubBar`/`usePlayerScrub`
+own the position control and its drag listeners; Player supplies playback
+ownership and command/error handling.
+`src/libraryTrackView.ts` derives filtered, sorted and grouped tracks while
+preserving playlist order. `usePlayerCues` owns marker reads, writes, sync
+feedback and shortcuts; `usePlayerLoopEditor` owns loop drafts and analysis.
+Both use Player's current playback owner for asynchronous results.
+`src/midiActions.ts` dispatches mapped MIDI actions; App still owns MIDI
+subscriptions, navigation state and playback updates. `src/randomTrackLoad.ts`
+performs scoped Random loading and checks the caller's shared load generation;
+App retains candidate prefetch and commits the selected track. Waveform peak
+requests live in `useWaveformPeaks`, drawing and zoom-window geometry in
+`src/waveformRender.ts`; `Waveform` retains the playback/track ownership checks
+and pointer interaction.
+`useWaveformDrawing`/`waveformAnimation` schedule dirty frames and stop visual
+animation while paused, hidden or fully covered. Peak resolutions are cached
+for the native audio generation, including embedded playback; catalog refreshes
+do not invalidate PCM-derived views. `useTablistSearch` reuses up to eight public
+pages briefly, separately from library-owned download counts. Bounds, tests and
+deferred native optimizations are specified in `specs/300-lightweight-derived-ui.md`
+and ADR 0029.
 
 Track IDs are local to a library. A root change can reuse the same numeric ID;
 asynchronous work must retain and check the owning root/generation, not just the
 ID. Player loads, CUE operations, catalog refreshes and BPM progress use
 different ownership checks; preserve them when changing their effects.
+
+Background playback/prefetch decode transfers encoded vectors through
+`player::decode_owned_bytes`; callers that retain bytes keep `decode_bytes`.
+Both preserve the transient-work guard and decoder behavior. Embedded sound
+frames transfer ownership too. AAC edge trimming reuses the PCM allocation;
+decoded-cache accounting includes retained vector capacity. Common-rate MP3
+conversion borrows encoder input (spec 310, ADR 0030).
 
 ### Import and persistence
 
@@ -83,6 +136,12 @@ audio. Extracted/custom tracks use managed audio files; source-backed tracks use
 original external file or an opt-in managed copy. Load library tracks by ID so
 the backend can resolve the correct source.
 
+Catalog reads share bounded file-availability observations only within the current
+operation (`library/availability.rs`). Random reads scoped ID/path candidates,
+then checks drawn paths and hydrates selected metadata rather than all rows. A
+new read and playback admission recheck availability; source/path/hash checks
+are unchanged (spec 320, ADR 0031).
+
 For managed audio, file tags are the source of truth for editable CUEs. CUE 1
 is fixed at the beginning, and existing Serato saved loops must be preserved;
 source-backed tracks expose only fixed CUE 1. Metadata writes, conversion and
@@ -99,6 +158,12 @@ work, and generation checks prevent obsolete results from replacing newer loads.
 The native loop source, not a UI timer, commits a prepared timed-Random switch at
 the boundary. Waveform computation uses decoded snapshots and a bounded
 persistent cache under `<library>/.olooper-cache/waveforms/`.
+
+Loaded-waveform misses capture owner identity before compute admission and clone
+PCM only after revalidation. `waveform::from_buffer_checked` cooperatively stops
+obsolete scans at bounded visited-frame checkpoints; contended snapshot writes
+are not waited on during scanning. Peak arithmetic and the persistent-hit fast
+path remain unchanged (spec 340, ADR 0033).
 
 `memory.rs` supplies adaptive cache budgets and a shared gate for heavy work.
 Cache budgets are not a limit on the total process memory: active playback,

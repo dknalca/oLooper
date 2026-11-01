@@ -1,34 +1,25 @@
 import { useEffect, useRef, useState } from "react";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { ownSubscription } from "../subscription";
+import { useImportJobs } from "../hooks/useImportJobs";
 import { libraryLinkFolder, libraryLinkedFolders, librarySourceFolders, libraryRescanFolder, importLinkedFileAndWait, type LinkedFolder } from "../tauri";
 import {
   importCustomAndWait,
-  cancelImport,
   importExeAndWait,
-  newImportJobId,
   importSwfAndWait,
-  listenImportProgress,
   type AppMenuCommand,
-  type ImportProgress,
   pickFiles,
   pickDirectory,
   scanLooperFolder,
   type ImportReport,
 } from "../tauri";
-import { copySourcePreference, elapsedLabel, fileName, importKindForPath, type ContainerImportOptions } from "../importFlow";
+import { copySourcePreference, importKindForPath, type ContainerImportOptions } from "../importFlow";
 import { importMixedFiles } from "../mixedImport";
 import { containerImportMessages, importContainerFiles, importRescannedFiles } from "../containerImport";
+import ImportProgressPanel from "./ImportProgressPanel";
 
 interface Props {
   onImported: () => void;
-}
-
-interface ImportFileState {
-  path: string;
-  stage: string;
-  done: boolean;
-  error: string | null;
 }
 
 function importContainer(path: string, jobId: string, options: ContainerImportOptions): Promise<ImportReport> {
@@ -42,20 +33,11 @@ export default function ImportBar({ onImported }: Props) {
   const [modePrompt, setModePrompt] = useState<{ count: number; folder?: string; resolve: (options: ContainerImportOptions | null) => void } | null>(null);
   const [promptCopySource, setPromptCopySource] = useState(false);
   const [folders, setFolders] = useState<LinkedFolder[] | null>(null);
-  const [busy, setBusy] = useState(false);
   const [dragging, setDragging] = useState(false);
   const [report, setReport] = useState<ImportReport | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [dragCount, setDragCount] = useState<number | null>(null);
-  const [progress, setProgress] = useState<ImportProgress | null>(null);
-  const [files, setFiles] = useState<ImportFileState[]>([]);
-  const [startedAt, setStartedAt] = useState<number | null>(null);
-  const [elapsed, setElapsed] = useState(0);
   const [notice, setNotice] = useState<string | null>(null);
-  const cancelQueue = useRef(false);
-  const busyRef = useRef(false);
-  const activeJobIdRef = useRef<string | null>(null);
-  const activePathRef = useRef<string | null>(null);
   const internalTrackDrag = useRef(false);
   const modeDialogRef = useRef<HTMLDivElement>(null);
 
@@ -65,6 +47,7 @@ export default function ImportBar({ onImported }: Props) {
     modeDialogRef.current?.querySelector<HTMLButtonElement>("button")?.focus();
     return () => previousFocus?.focus();
   }, [modePrompt]);
+  const { busy, busyRef, setImportBusy, progress, setProgress, files, elapsed, cancelQueue, runOwnedJob, beginImport, requestCancel, finishProgress } = useImportJobs(setError);
 
   const chooseContainerMode = (paths: string[], folder?: string): Promise<ContainerImportOptions | null> => {
     const count = paths.filter((path) => ["swf", "exe"].includes(importKindForPath(path))).length;
@@ -74,74 +57,29 @@ export default function ImportBar({ onImported }: Props) {
     return new Promise((resolve) => setModePrompt({ count, folder, resolve }));
   };
 
-  const setImportBusy = (value: boolean) => {
-    busyRef.current = value;
-    setBusy(value);
-  };
-
-  const runOwnedJob = async <T,>(path: string, run: (jobId: string) => Promise<T>): Promise<T> => {
-    const jobId = newImportJobId();
-    activeJobIdRef.current = jobId;
-    activePathRef.current = path;
-    setFiles((current) => current.map((file) => file.path === path
-      ? { ...file, stage: "Preparing", done: false, error: null }
-      : file));
-    try {
-      return await run(jobId);
-    } finally {
-      if (activeJobIdRef.current === jobId) {
-        activeJobIdRef.current = null;
-        activePathRef.current = null;
-      }
-    }
-  };
-
-  const startProgress = (detail: string) => setProgress({
-    job_id: "pending",
-    stage: "preparing import",
-    current: 0,
-    total: 0,
-    detail,
-    done: false,
-    error: null,
-    report: null,
-    custom_report: null,
-  });
-
-  const beginImport = (paths: string[]) => {
-    cancelQueue.current = false;
-    setFiles(paths.map((path) => ({ path, stage: "Queued", done: false, error: null })));
-    setStartedAt(Date.now());
-    setElapsed(0);
-    startProgress(`${paths.length} file(s) ready`);
-  };
-
-  const requestCancel = () => {
-    cancelQueue.current = true;
-    const activeJobId = activeJobIdRef.current;
-    if (activeJobId) cancelImport(activeJobId).catch((e) => setError(String(e)));
-    setFiles((current) => current.map((file) => file.stage === "Queued" ? { ...file, stage: "Cancelled", done: true } : file));
-  };
-
-  const finishProgress = (error: string | null = null) => {
-    setProgress((current) => current && { ...current, stage: error ? "failed" : "complete", done: true, error });
-  };
-
   const showNotice = (message: string) => {
     setNotice(message);
     window.setTimeout(() => setNotice(null), 4000);
   };
 
-  useEffect(() => {
-    return ownSubscription(listenImportProgress((next) => {
-      if (activeJobIdRef.current !== next.job_id) return;
-      setProgress(next);
-      const activePath = activePathRef.current;
-      setFiles((current) => current.map((file) => file.path === next.detail || file.path === activePath
-        ? { ...file, stage: next.stage, done: next.done, error: next.error }
-        : file));
-    }), (e) => setError(`Import progress unavailable: ${String(e)}`));
-  }, []);
+  const runMixedImport = async (paths: string[], options: ContainerImportOptions, failureLabel: string, refreshBeforeRelease: boolean) => {
+    const { added, existing, failed, firstError } =
+      await importMixedFiles(paths, options, runOwnedJob, () => cancelQueue.current, failureLabel);
+    if (failed > 0) {
+      setError(`${failed} file(s) failed: ${firstError}`);
+      finishProgress(firstError);
+    } else {
+      finishProgress(cancelQueue.current ? "import cancelled" : null);
+    }
+    if (existing > 0) showNotice(`${existing} existing track${existing === 1 ? "" : "s"} already in library`);
+    if (added > 0) {
+      setDragCount(added);
+      setTimeout(() => setDragCount(null), 3000);
+    }
+    if (refreshBeforeRelease) onImported();
+    setImportBusy(false);
+    if (!refreshBeforeRelease) onImported();
+  };
 
   useEffect(() => {
     let releaseTimer = 0;
@@ -162,12 +100,6 @@ export default function ImportBar({ onImported }: Props) {
       window.removeEventListener("olooper:library-internal-drag-end", trackDragEnded);
     };
   }, []);
-
-  useEffect(() => {
-    if (startedAt === null || progress?.done) return;
-    const interval = window.setInterval(() => setElapsed(Math.floor((Date.now() - startedAt) / 1000)), 1000);
-    return () => window.clearInterval(interval);
-  }, [progress?.done, startedAt]);
 
   // Webview drag&drop
   useEffect(() => {
@@ -191,21 +123,7 @@ export default function ImportBar({ onImported }: Props) {
             const containerMode = await chooseContainerMode(paths);
             if (!containerMode) { setImportBusy(false); return; }
             beginImport(paths);
-            const { added: totalAdded, existing: totalExisting, failed: totalFailed, firstError } =
-              await importMixedFiles(paths, containerMode, runOwnedJob, () => cancelQueue.current, "import failed");
-            if (totalFailed > 0) {
-              setError(`${totalFailed} file(s) failed: ${firstError}`);
-              finishProgress(firstError);
-            } else {
-              finishProgress(cancelQueue.current ? "import cancelled" : null);
-            }
-            if (totalExisting > 0) showNotice(`${totalExisting} existing track${totalExisting === 1 ? "" : "s"} already in library`);
-            if (totalAdded > 0) {
-              setDragCount(totalAdded);
-              setTimeout(() => setDragCount(null), 3000);
-            }
-            onImported();
-            setImportBusy(false);
+            await runMixedImport(paths, containerMode, "import failed", true);
           })();
         } else {
           setDragging(false);
@@ -396,21 +314,7 @@ export default function ImportBar({ onImported }: Props) {
     beginImport(paths);
     setError(null);
     setReport(null);
-    const { added, existing, failed, firstError } =
-      await importMixedFiles(paths, containerMode, runOwnedJob, () => cancelQueue.current, "audio import failed");
-    if (failed > 0) {
-      setError(`${failed} file(s) failed: ${firstError}`);
-      finishProgress(firstError);
-    } else {
-      finishProgress(cancelQueue.current ? "import cancelled" : null);
-    }
-    if (existing > 0) showNotice(`${existing} existing track${existing === 1 ? "" : "s"} already in library`);
-    if (added > 0) {
-      setDragCount(added);
-      setTimeout(() => setDragCount(null), 3000);
-    }
-    setImportBusy(false);
-    onImported();
+    await runMixedImport(paths, containerMode, "audio import failed", false);
   };
 
   useEffect(() => {
@@ -541,41 +445,7 @@ export default function ImportBar({ onImported }: Props) {
         )}
       </div>
 
-      {progress && files.length > 0 && (
-        <div className="fixed right-3 top-12 z-[80] w-[min(28rem,calc(100vw-1.5rem))] rounded-lg border border-border bg-surface px-4 py-2 shadow-xl">
-          <div className="flex items-center justify-between mb-1.5">
-            <div className="flex items-center gap-2">
-              <span className="text-[10px] text-text-secondary">Importing</span>
-              {progress.total > 0 && (
-                <div className="w-24 h-1 overflow-hidden rounded-full bg-border">
-                  <div className="h-full bg-accent rounded-full transition-all" style={{ width: `${Math.min(100, (progress.current / progress.total) * 100)}%` }} />
-                </div>
-              )}
-              {progress.total > 0 && (
-                <span className="text-[10px] text-text-secondary">{Math.round((progress.current / progress.total) * 100)}%</span>
-              )}
-              <span className="font-mono text-[10px] text-text-secondary">{elapsedLabel(elapsed)}</span>
-            </div>
-            <div className="flex items-center gap-2">
-              {progress.error && (
-                <span className="text-[10px] text-danger">{progress.error}</span>
-              )}
-              {progress.done && (
-                <button onClick={() => setProgress(null)} className="text-[10px] text-text-secondary hover:text-text transition-colors">Dismiss</button>
-              )}
-            </div>
-          </div>
-          <div className="max-h-24 overflow-y-auto rounded border border-border/30">
-            {files.map((file) => (
-              <div key={file.path} className="flex items-center gap-2 border-b border-border/20 px-2 py-1 text-[10px] last:border-b-0">
-                <span className={`h-1 w-1 rounded-full shrink-0 ${file.error ? "bg-danger" : file.done ? "bg-success" : "bg-accent"}`} />
-                <span className="min-w-0 flex-1 truncate text-text" title={file.path}>{fileName(file.path)}</span>
-                <span className="shrink-0 text-text-secondary">{file.error ?? file.stage}</span>
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
+      <ImportProgressPanel progress={progress} files={files} elapsed={elapsed} onDismiss={() => setProgress(null)} />
 
     </>
   );

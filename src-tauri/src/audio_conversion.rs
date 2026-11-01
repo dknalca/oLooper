@@ -16,15 +16,21 @@ pub fn wav_pcm_to_mp3_320(buffer: &LoopBuffer) -> Result<Vec<u8>, String> {
     } else {
         44_100
     };
-    let samples = if output_rate == buffer.rate {
-        buffer.samples.clone()
+    let samples: std::borrow::Cow<'_, [i16]> = if output_rate == buffer.rate {
+        std::borrow::Cow::Borrowed(&buffer.samples)
     } else {
         let source =
             rodio::buffer::SamplesBuffer::new(buffer.channels, buffer.rate, buffer.samples.clone());
-        rodio::source::UniformSourceIterator::<_, i16>::new(source, buffer.channels, output_rate)
-            .collect::<Vec<_>>()
+        std::borrow::Cow::Owned(
+            rodio::source::UniformSourceIterator::<_, i16>::new(
+                source,
+                buffer.channels,
+                output_rate,
+            )
+            .collect::<Vec<_>>(),
+        )
     };
-    if samples.is_empty() || samples.len() % buffer.channels as usize != 0 {
+    if samples.is_empty() || !samples.len().is_multiple_of(buffer.channels as usize) {
         return Err("WAV could not be prepared for MP3 encoding".to_string());
     }
 

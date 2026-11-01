@@ -1,12 +1,9 @@
 import { useEffect, useRef, useState } from "react";
-import { startPolling } from "../poll";
+import { useAudioOutputTest } from "../hooks/useAudioOutputTest";
+import { useAudioRoutingSession } from "../hooks/useAudioRoutingSession";
 import {
   audioOutputDevices,
   audioSetOutput,
-  audioTestOutput,
-  playerStatus,
-  playerPlay,
-  playerStop,
   type AudioOutputDevice,
   type AudioOutputSelection,
   type PlayerStatus,
@@ -19,6 +16,7 @@ import {
 } from "../audioOutputPreferences";
 import { audioDeviceOptions } from "../audioDeviceOptions";
 import AudioOutputControls from "./AudioOutputControls";
+import AudioOutputMeter from "./AudioOutputMeter";
 
 interface Props {
   open: boolean;
@@ -53,17 +51,11 @@ export default function AudioSettingsDialog({
   );
   const [loading, setLoading] = useState(false);
   const [busy, setBusy] = useState(false);
-  const [testing, setTesting] = useState(false);
-  const [testChannel, setTestChannel] = useState<"left" | "right" | null>(null);
-  const [outputLevels, setOutputLevels] = useState({ left: 0, right: 0 });
   const [error, setError] = useState<string | null>(null);
-  const testTimers = useRef<number[]>([]);
   const resumeFromBeginningOnClose = useRef(false);
-
-  const clearTestTimers = () => {
-    for (const timer of testTimers.current) window.clearTimeout(timer);
-    testTimers.current = [];
-  };
+  const { testing, testChannel, setTestChannel, clearTestTimers, resetTest, testPair } = useAudioOutputTest(
+    setBusy, setError, resumeFromBeginningOnClose, onOutputTestStarted,
+  );
 
   const refreshDevices = async () => {
     setLoading(true);
@@ -90,57 +82,14 @@ export default function AudioSettingsDialog({
     setPairSelections(remembered);
     localStorage.setItem("olooper.audio.output-pairs", JSON.stringify(remembered));
     setBusy(false);
-    setTesting(false);
-    setTestChannel(null);
+    resetTest();
     void refreshDevices();
     return clearTestTimers;
   // Refresh once per open; selection changes are made in this dialog.
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open]);
 
-  useEffect(() => {
-    if (open) {
-      setBusy(true);
-      setError(null);
-      const stopForRoutingChange = async () => {
-        try {
-          const current = await playerStatus();
-          resumeFromBeginningOnClose.current = current.loaded && current.playing;
-          onPlayerStatusChange(current);
-          // Stop (rather than pause) so a later resume starts at the loop start.
-          if (current.loaded) onPlayerStatusChange(await playerStop());
-        } catch (cause) {
-          setError(String(cause));
-        } finally {
-          setBusy(false);
-        }
-      };
-      void stopForRoutingChange();
-      return;
-    }
-    const shouldResume = resumeFromBeginningOnClose.current;
-    resumeFromBeginningOnClose.current = false;
-    if (shouldResume) playerPlay().then(onPlayerStatusChange).catch(() => {});
-  // Capture only whether playback was active; never retain its position.
-  }, [open, onPlayerStatusChange]);
-
-  useEffect(() => {
-    if (!open) return;
-    let active = true;
-    const stop = startPolling(async () => {
-      const status = await playerStatus();
-      if (!active) return;
-      setOutputLevels({
-        left: status.playing || testing ? status.output_left_level_pct : 0,
-        right: status.playing || testing ? status.output_right_level_pct : 0,
-      });
-      onPlayerStatusChange(status);
-    }, 100);
-    return () => {
-      active = false;
-      stop();
-    };
-  }, [open, onPlayerStatusChange, testing]);
+  const outputLevels = useAudioRoutingSession(open, testing, resumeFromBeginningOnClose, setBusy, setError, onPlayerStatusChange);
 
   const deviceOptions = audioDeviceOptions(devices, deviceName);
   const { systemDefault, selectedAvailable, channelCount } = deviceOptions;
@@ -173,34 +122,6 @@ export default function AudioSettingsDialog({
       resumeFromBeginningOnClose.current = false;
       setError(String(cause));
     } finally {
-      setBusy(false);
-    }
-  };
-
-  const testPair = async () => {
-    setBusy(true);
-    setTesting(true);
-    setError(null);
-    clearTestTimers();
-    setTestChannel(null);
-    const next = currentSelection();
-    try {
-      await audioTestOutput(next);
-      onOutputTestStarted();
-      saveSelection(next);
-      setTestChannel("left");
-      testTimers.current = [
-        window.setTimeout(() => setTestChannel("right"), 400),
-        window.setTimeout(() => {
-          setTestChannel(null);
-          setTesting(false);
-          setBusy(false);
-        }, 900),
-      ];
-    } catch (cause) {
-      resumeFromBeginningOnClose.current = false;
-      setError(String(cause));
-      setTesting(false);
       setBusy(false);
     }
   };
@@ -273,37 +194,7 @@ export default function AudioSettingsDialog({
         <p className="mt-3 text-[10px] text-text-secondary">
           Test plays a 440 Hz tone on L, then 660 Hz on R. The device opens with the selected sample rate and buffer size; “Device default” leaves those choices to the audio device.
         </p>
-        <div className="mt-3 space-y-1.5" aria-label="Digital output levels">
-          {([ ["L", outputLevels.left], ["R", outputLevels.right] ] as const).map(([channel, level]) => {
-            const percent = Math.max(0, Math.min(100, level));
-            return (
-              <div key={channel} className="grid grid-cols-[1rem_1fr_2.5rem] items-center gap-2 text-[10px]">
-                <span className="font-mono text-text-secondary">{channel}</span>
-                <div
-                  role="meter"
-                  aria-label={`${channel} digital output level`}
-                  aria-valuemin={0}
-                  aria-valuemax={100}
-                  aria-valuenow={Math.round(percent)}
-                  className="h-2 overflow-hidden rounded bg-border"
-                >
-                  <div className="h-full rounded bg-accent transition-[width] duration-75" style={{ width: `${percent}%` }} />
-                </div>
-                <span className="text-right tabular-nums text-text-secondary">{Math.round(percent)}%</span>
-              </div>
-            );
-          })}
-        </div>
-        <p className="mt-1 text-[9px] text-text-secondary">Digital signal sent by oLooper before the audio interface; this is not a hardware loopback meter.</p>
-        {testChannel && (
-          <div className="mt-3 flex items-center gap-2 rounded border border-border bg-elevated px-3 py-2 text-[10px]" role="status" aria-live="polite">
-            <span className={`h-2 w-2 rounded-full ${testChannel === "left" ? "bg-accent" : "bg-border"}`} />
-            <span className="text-text-secondary">L</span>
-            <span className={`h-2 w-2 rounded-full ${testChannel === "right" ? "bg-accent" : "bg-border"}`} />
-            <span className="text-text-secondary">R</span>
-            <span className="ml-1 text-text">Testing {testChannel === "left" ? "left" : "right"} channel…</span>
-          </div>
-        )}
+        <AudioOutputMeter levels={outputLevels} testChannel={testChannel} />
         {(error || startupError) && <p className="mt-3 text-xs text-danger" role="alert">{error || startupError}</p>}
 
         <footer className="mt-5 flex items-center justify-between">
@@ -311,7 +202,7 @@ export default function AudioSettingsDialog({
             {loading ? "Refreshing…" : "Refresh devices"}
           </button>
           <div className="flex items-center gap-2">
-            <button onClick={() => void testPair()} disabled={loading || busy || !selectedAvailable || channelCount < 2 || firstChannel + 2 > channelCount} className="rounded bg-accent/15 px-3 py-2 text-[10px] text-accent hover:bg-accent/25 disabled:opacity-40">
+            <button onClick={() => void testPair(currentSelection(), saveSelection)} disabled={loading || busy || !selectedAvailable || channelCount < 2 || firstChannel + 2 > channelCount} className="rounded bg-accent/15 px-3 py-2 text-[10px] text-accent hover:bg-accent/25 disabled:opacity-40">
               {testing ? "Testing…" : "Test L/R"}
             </button>
             <button onClick={() => void apply()} disabled={loading || busy || !selectedAvailable || channelCount < 2 || firstChannel + 2 > channelCount} className="rounded bg-accent px-4 py-2 text-[10px] font-medium text-white disabled:opacity-40">

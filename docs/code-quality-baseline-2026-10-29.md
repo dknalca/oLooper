@@ -208,6 +208,133 @@ a 20 porque la lógica se ha repartido en nuevas unidades; no se deduce que se
 hayan reducido todas las rutas ni que estén revisados todos los comportamientos.
 Las pruebas DOM simuladas no prueban WebKit, hardware de audio o MIDI.
 
+### Seguimiento: segunda pasada de componentes principales
+
+Se separaron las opciones de filtrado/reanálisis de biblioteca en
+`LibraryTrackToolbar`, los controles visuales de Random en
+`RandomPlaybackControls`, y la cabecera y filas del catálogo en
+`TablistCatalogHeader`/`TablistLooperRow`. `Sidebar` conserva los filtros y el
+catálogo; `Player` conserva el temporizador; `TablistCatalog` conserva búsquedas,
+cancelación y propiedad de importaciones. Las pruebas cubren ámbitos de BPM,
+intervalos Random, selección de catálogo, eventos y resultados asíncronos
+obsoletos. Las comprobaciones no sustituyen pruebas en WebKit o dispositivos.
+
+En la heurística local las funciones principales `Sidebar`, `Player` y
+`TablistCatalog` pasan de 82/48/33 a 77/41/20 decisiones, respectivamente, y
+el número de funciones/callbacks sobre el umbral orientativo pasa de 20 a 19.
+Son comparaciones de componentes individuales; parte de la lógica se ha movido,
+no se ha demostrado una reducción equivalente de las rutas totales.
+
+### Seguimiento: cabecera, editor de loop y estado de portada
+
+`LibraryTrackHeader` presenta las columnas y delega la ordenación a `Sidebar`;
+se comprueban orden alfabético, BPM ascendente/descendente y orden de playlist.
+`LoopEditingControls` presenta el editor sin asumir la propiedad de sus refs,
+el borrador ni los comandos nativos, que permanecen en `Player`. Las pruebas
+comprueban también que un campo con foco conserve su borrador al llegar estado.
+
+`src/idleCoverState.ts` separa la pertenencia de la portada y las reglas de
+entrada/permanencia del hook y de la animación. Se probaron biblioteca y ruta
+propietarias, carga, error, pausa y cambio pendiente con datos sintéticos; no se
+modificaron los eventos de despertar ni se validó WebKit nativo.
+
+La heurística de `Sidebar` y `Player` pasa de 77/41 a 68/38. La condición de
+portada, antes incluida en `IdleCoverScreensaver` (33), está ahora en funciones
+separadas; `idleCoverEligibility` marca 21. El número de funciones/callbacks
+por encima del umbral orientativo sigue en 19, no es evidencia de una reducción
+equivalente del número total de rutas ni de ausencia de errores.
+
+### Seguimiento: ciclos de vida de biblioteca y reproducción
+
+`useLibraryFilters` conserva y persiste las opciones de filtrado;
+`useLibraryCovers` agrupa la caché, los límites de concurrencia y la cancelación
+de cargas de portadas. `useRandomPlayback` reúne el temporizador Random y su
+suscripción; `PlayerScrubBar` y `usePlayerScrub` agrupan el control de posición,
+el teclado y el ciclo de vida del arrastre. Las pruebas comprueban la limpieza
+de eventos, el cambio de propietario durante el arrastre, los límites de teclado,
+la persistencia de filtros y las cargas de portada canceladas o fallidas.
+
+En esta pasada la heurística de `Sidebar`/`Player` pasa de 68/38 a 65/28.
+**El objetivo de menos de 20 en cada función sigue pendiente**. El medidor
+excluye funciones anidadas: extraer un efecto completo puede mejorar su
+organización sin cambiar la cifra del componente. Tampoco suma la complejidad
+trasladada a los nuevos hooks o componentes.
+
+### Seguimiento: CUEs, editor de loop y vista del catálogo
+
+`usePlayerCues` reúne lectura y escritura de marcadores, sincronización Serato y
+atajos; `usePlayerLoopEditor` reúne el borrador y el análisis de loop. Ambos
+utilizan la misma propiedad de pista/generación que el reproductor. Se añadieron
+pruebas para lecturas y sincronizaciones tardías, restricciones de CUEs
+embebidos y análisis de loop al cambiar de pista.
+
+`src/libraryTrackView.ts` reúne filtrado, ordenación y agrupación del catálogo;
+las pruebas fijan el orden de playlists, el orden guardado de loopers y los
+límites existentes de filtros. En particular, los filtros «mid» actuales usan
+un límite superior, no un intervalo exclusivo: este refactor no lo cambia.
+
+La heurística local de las funciones principales continúa en 65/28, ya que
+excluye las funciones y efectos anidados extraídos; su longitud pasa de
+1526/331 a 1491/173 líneas. El objetivo orientativo de menos de 20 sigue sin
+alcanzarse y estas cifras no representan la complejidad total de los flujos.
+
+### Seguimiento: opciones de audio e importación
+
+`AudioSettingsDialog` delega la sesión de enrutamiento y el sondeo de niveles a
+`useAudioRoutingSession`, la prueba de canales a `useAudioOutputTest` y la
+presentación de niveles a `AudioOutputMeter`. La aplicación de la configuración
+permanece en el diálogo. Las pruebas cubren parada/reanudación, errores de prueba,
+temporizadores y sondeos que terminan tras cerrar.
+
+`ImportBar` comparte el procesamiento de selecciones mixtas y delega identidad,
+cancelación, suscripción y progreso a `useImportJobs`; `ImportProgressPanel` es
+solo presentación. Las pruebas cubren eventos de otros trabajos, finalizaciones
+fuera de orden, cancelación, liberación tardía de suscripciones y cancelación del
+diálogo. La espera de los trabajos sigue usando los helpers que se suscriben
+antes de encolar. El foco se comprobó en DOM simulado, no en WebKit nativo.
+
+La heurística local de `AudioSettingsDialog` pasa de 27 a 23 decisiones y la de
+`ImportBar` de 24 a 18; sus funciones pasan de 291/542 a 184/421 líneas. Parte
+de la lógica se ha trasladado a hooks y vistas con sus propias decisiones; estas
+cifras no miden la complejidad total ni garantizan comportamiento en hardware.
+
+### Seguimiento: App y forma de onda
+
+El despacho MIDI vive en `src/midiActions.ts`; `src/randomTrackLoad.ts` reúne la
+selección Random y la espera de carga, conservando la generación compartida y
+la cancelación de cambios en el límite del loop. `App` sigue siendo responsable
+de las suscripciones MIDI, la precarga y la confirmación de la pista activa.
+Las pruebas cubren acciones MIDI, candidatos precargados, selecciones obsoletas,
+cancelación y rutas de reproducción que no coinciden.
+
+`useWaveformPeaks` conserva la carga demorada y el descarte de resultados
+obsoletos; `src/waveformRender.ts` aísla el dibujo y la geometría de zoom.
+`Waveform` sigue controlando la interacción y la pertenencia de los picos a la
+pista. Se añadieron pruebas de respuestas tardías, posición de CUEs y límites de
+loop, además de arrastre de bordes sobre DOM simulado.
+
+El archivo `App.tsx` pasa de 761 a 667 líneas y `Waveform` de 379 a 337 líneas
+en su función principal. La heurística de `Waveform` sigue en 20; las funciones
+extraídas de MIDI, carga Random y dibujo marcan 25, 24 y 21. Se han separado
+responsabilidades, no eliminado sus decisiones. Estas pruebas no validan MIDI,
+audio o renderizado con hardware ni WebKit nativo.
+
+### Seguimiento: TopBar y catálogo Tablist
+
+`MetronomeControls` reúne los controles, comandos, evento MIDI y temporizador
+visual del metrónomo, sin asumir la inicialización de biblioteca ni el reloj de
+práctica. Las pruebas cubren validación de BPM, cambios de pista, errores nativos
+y limpieza del evento. `useTablistSearch` separa búsquedas y recuentos del
+catálogo; `useTablistImport` mantiene la propiedad, progreso y cancelación de los
+trabajos, conservando el helper de espera que se suscribe antes de encolar. Las
+pruebas incluyen recuentos obsoletos y eventos de otros trabajos.
+
+La heurística local de `TopBar` pasa de 20 a 10 decisiones y la de
+`TablistCatalog` permanece en 20; sus funciones pasan de 298/236 a 193/122
+líneas. Los efectos y callbacks anidados no se incluyen en la cifra del padre y
+las decisiones extraídas siguen existiendo. La cobertura simulada no sustituye
+pruebas en WebKit, con dispositivos MIDI ni con audio real.
+
 ## Verificación y límites
 
 - 271 pruebas Rust correctas y cuatro ignoradas por fixtures; 119 frontend.

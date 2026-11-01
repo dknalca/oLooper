@@ -18,18 +18,18 @@
 <p align="center"><strong>▶ <a href="https://github.com/dknalca/oLooper/releases/download/v0.7.1/oLooper-FreeScratch.mp4">Watch the 79-second oLooper film</a></strong></p>
 
 <p align="center">
-  <a href="https://github.com/dknalca/oLooper/releases/tag/v0.8.0"><strong>Download oLooper v0.8.0</strong></a>
+  <a href="https://github.com/dknalca/oLooper/releases/tag/v0.8.1"><strong>Download oLooper v0.8.1</strong></a>
   · <a href="https://github.com/dknalca/oLooper/releases">All releases</a>
   · <a href="#what-olooper-does">Explore features</a>
 </p>
 
 <p align="center"><strong>macOS 12+ · Windows 11</strong> · Native desktop app · Your library stays on your machine</p>
 
-Release v0.8.0 includes linked-folder rescans, duration-aware BPM editing and
-reanalysis, compact library navigation and configurable idle-cover preferences.
-The promotional film remains hosted with v0.7.1. The library migrates to schema
-v11; older app versions cannot reopen an upgraded catalog. Release fixes and
-remaining device checks are recorded in [`docs/release-0.8.0.md`](docs/release-0.8.0.md).
+Release v0.8.1 includes bounded UI/catalog work, more cooperative waveform scans,
+decode allocation improvements, component-level regression coverage and a
+portable Rane 72 MIDI preset. The catalog remains at schema v11; older app
+versions cannot reopen an upgraded catalog. Release details and validation limits
+are recorded in [`docs/release-0.8.1.md`](docs/release-0.8.1.md).
 
 ## Made for scratch practice
 
@@ -93,7 +93,7 @@ It is designed for **scratch DJs, beat jugglers, and turntablists** who want to 
 
 ### macOS — Intel and Apple silicon
 
-Download the [macOS v0.8.0 release](https://github.com/dknalca/oLooper/releases/tag/v0.8.0). Its Universal 2 DMG contains native Intel (`x86_64`) and Apple silicon (`arm64`) versions; Rosetta is not required.
+Download the [macOS v0.8.1 release](https://github.com/dknalca/oLooper/releases/tag/v0.8.1). Its Universal 2 DMG contains native Intel (`x86_64`) and Apple silicon (`arm64`) versions; Rosetta is not required.
 
 1. Open the downloaded `.dmg` and drag **oLooper** into **Applications**.
 2. Eject the oLooper disk image.
@@ -102,11 +102,11 @@ Download the [macOS v0.8.0 release](https://github.com/dknalca/oLooper/releases/
 
 The DMG is intentionally unsigned and unnotarized. macOS displays this first-launch warning because oLooper is not distributed with an Apple Developer ID signature; follow the steps above for this app only. The release does not disable Gatekeeper.
 
-The v0.8.0 DMG is built with a **macOS 11.0 (Big Sur) minimum deployment target**. CI verifies the Universal 2 binary and bundle metadata; runtime testing on a Big Sur machine is still pending. No additional runtime or developer tools are needed to install the DMG.
+The v0.8.1 DMG is built with a **macOS 11.0 (Big Sur) minimum deployment target**. CI verifies the Universal 2 binary and bundle metadata; runtime testing on a Big Sur machine is still pending. No additional runtime or developer tools are needed to install the DMG.
 
 ### Windows 11 — x64
 
-Download the [Windows v0.8.0 release](https://github.com/dknalca/oLooper/releases/tag/v0.8.0) and run `oLooper-0.8.0-windows-x64-setup.exe`. Windows 11 includes WebView2 in most installations. If it is missing, install the [Microsoft Edge WebView2 Evergreen Runtime](https://developer.microsoft.com/microsoft-edge/webview2/); the NSIS installer can also bootstrap it when needed. The Windows package is x64.
+Download the [Windows v0.8.1 release](https://github.com/dknalca/oLooper/releases/tag/v0.8.1) and run `oLooper-0.8.1-windows-x64-setup.exe`. Windows 11 includes WebView2 in most installations. If it is missing, install the [Microsoft Edge WebView2 Evergreen Runtime](https://developer.microsoft.com/microsoft-edge/webview2/); the NSIS installer can also bootstrap it when needed. The Windows package is x64.
 
 The unsigned installer may prompt Windows SmartScreen. The app's library and preferences remain in your user profile; installing or removing the app does not delete the selected library.
 
@@ -119,7 +119,7 @@ pnpm tauri dev
 
 The project uses Node.js 24, pnpm 12.9.1 and Rust 1.89 or newer. For a bundled macOS app, run `./scripts/build.sh`; see the [macOS release notes](docs/macos-release.md). Building on macOS also requires [Xcode](https://developer.apple.com/xcode/) (or a [compatible older version](https://developer.apple.com/download/all/?q=Xcode)), [Node.js](https://nodejs.org/en/download/), [pnpm](https://pnpm.io/installation), and [Rust](https://www.rust-lang.org/tools/install).
 
-On Windows, install [App Installer (winget)](https://apps.microsoft.com/detail/9nblggh4nns1) if it is not present. Open PowerShell as Administrator and run `scripts/install-windows.ps1`; it installs Node.js, pnpm, Rust MSVC, Visual Studio C++ Build Tools, and WebView2. Restart PowerShell, then run `scripts/build.ps1` to create `dist/installers/oLooper-0.8.0-windows-x64-setup.exe` (the name follows the version in `src-tauri/tauri.conf.json`). Use `scripts/build.ps1 -Dev` for an unbundled debug executable. The setup script's prerequisites can also be installed individually: [Node.js](https://nodejs.org/en/download/), [pnpm](https://pnpm.io/installation), [Rust](https://www.rust-lang.org/tools/install), and [Visual Studio C++ Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/).
+On Windows, install [App Installer (winget)](https://apps.microsoft.com/detail/9nblggh4nns1) if it is not present. Open PowerShell as Administrator and run `scripts/install-windows.ps1`; it installs Node.js, pnpm, Rust MSVC, Visual Studio C++ Build Tools, and WebView2. Restart PowerShell, then run `scripts/build.ps1` to create `dist/installers/oLooper-0.8.1-windows-x64-setup.exe` (the name follows the version in `src-tauri/tauri.conf.json`). Use `scripts/build.ps1 -Dev` for an unbundled debug executable. The setup script's prerequisites can also be installed individually: [Node.js](https://nodejs.org/en/download/), [pnpm](https://pnpm.io/installation), [Rust](https://www.rust-lang.org/tools/install), and [Visual Studio C++ Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/).
 
 ## Checks
 

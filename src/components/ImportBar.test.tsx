@@ -177,6 +177,23 @@ it("focuses source playback by default and leaves source copying unchecked", asy
   expect(libraryLinkFolder).toHaveBeenCalledWith("/sources", false, false);
 });
 
+it("cancels the mode dialog with Escape, restores focus and permits a subsequent import", async () => {
+  vi.mocked(pickFiles).mockResolvedValue(["/sources/one.swf"]);
+  vi.mocked(importSwfAndWait).mockResolvedValue({ looper: "One", added: 1, already_there: 0, failed: [], track_ids: [1] });
+  render(<><button>Previous focus</button><ImportBar onImported={vi.fn()} /></>);
+  const browse = screen.getByRole("button", { name: "SWF / EXE" });
+  const previous = screen.getByRole("button", { name: "Previous focus" });
+  previous.focus();
+  await act(async () => { window.dispatchEvent(new CustomEvent("olooper:import-command", { detail: "import-loopers" })); });
+  fireEvent.keyDown(screen.getByRole("dialog"), { key: "Escape" });
+  await act(async () => {});
+  expect(importSwfAndWait).not.toHaveBeenCalled();
+  expect(document.activeElement).toBe(previous);
+  await act(async () => { fireEvent.click(browse); });
+  await act(async () => { fireEvent.click(screen.getByRole("button", { name: "Play from source (no extraction)" })); });
+  expect(importSwfAndWait).toHaveBeenCalledOnce();
+});
+
 it("retains partial folder imports and stops before using a changed library", async () => {
   vi.mocked(pickDirectory).mockResolvedValue("/sources");
   vi.mocked(scanLooperFolder).mockResolvedValue(["/sources/one.swf", "/sources/two.exe"]);

@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+## 0.8.1
+
+- Reduce redundant catalog, cover, polling and waveform work with bounded caches,
+  scoped file checks and cooperative cancellation. Preserve audio samples,
+  playback ownership and existing cache/security bounds.
+- Reuse owned decode buffers where possible, avoid unnecessary PCM copies and
+  retain current DSP and output behavior.
+- Split complex UI workflows into focused components and hooks, with regression
+  coverage for playback, imports, device routing, library navigation and waveforms.
+- Add a portable built-in Rane 72 MIDI preset from the recovered 11-control map.
+  Existing empty templates refresh automatically; customized maps are preserved.
+- Add the standalone FreeScratch promotional preview and rendering sources.
+- Keep catalog schema v11; no database migration or library compatibility change.
+
 ## 0.8.0
 
 - Align automatic Random changes to the complete loop ending nearest the chosen

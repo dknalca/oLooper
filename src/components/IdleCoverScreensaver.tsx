@@ -3,13 +3,8 @@ import { createPortal } from "react-dom";
 import useIdleCover, { type IdleCoverPhase } from "../hooks/useIdleCover";
 import type { PlayerStatus, Track } from "../tauri";
 import { coverOriginTransform, fitCover } from "../coverGeometry";
-
-export interface ActiveCoverState {
-  sourceHash: string;
-  generation: number;
-  src: string | null;
-  pending: boolean;
-}
+import { idleCoverContext, idleCoverEligibility, type ActiveCoverState } from "../idleCoverState";
+export type { ActiveCoverState } from "../idleCoverState";
 
 interface CoverImage {
   src: string;
@@ -21,6 +16,7 @@ interface CoverImage {
 }
 
 interface Props {
+  onVisibilityChange?: (visible: boolean) => void;
   enabled: boolean;
   delayMs: number;
   ready: boolean;
@@ -31,16 +27,12 @@ interface Props {
   originRef: RefObject<HTMLDivElement>;
 }
 
-export default function IdleCoverScreensaver({ enabled, delayMs, ready, libraryGeneration, track, status, cover, originRef }: Props) {
+export default function IdleCoverScreensaver({ enabled, delayMs, ready, libraryGeneration, track, status, cover, originRef, onVisibilityChange }: Props) {
   const [image, setImage] = useState<CoverImage | null>(null);
   const [loadedKey, setLoadedKey] = useState<string | null>(null);
   const [failedKey, setFailedKey] = useState<string | null>(null);
-  const committed = !!track && status?.path === track.playback_path;
-  const ownedCover = cover?.generation === libraryGeneration && cover.sourceHash === track?.source_hash ? cover : null;
-  const src = ownedCover && !ownedCover.pending ? ownedCover.src : null;
-  const path = track?.playback_path ?? null;
-  const title = track?.title ?? "Looper";
-  const key = src && path ? `${libraryGeneration}|${path}|${src}` : null;
+  const context = idleCoverContext(track, status, cover, libraryGeneration);
+  const { committed, src, path, title, key } = context;
 
   useEffect(() => {
     if (!key || !src || !path || !committed) return;
@@ -57,18 +49,17 @@ export default function IdleCoverScreensaver({ enabled, delayMs, ready, libraryG
   }, [key, src, path, committed, libraryGeneration, title]);
 
   const currentImage = image?.generation === libraryGeneration ? image : null;
-  const valid = !!key && loadedKey === key && failedKey !== key && committed;
-  const loadingImage = !!key && loadedKey !== key && failedKey !== key;
-  const waitingForCover = committed && track?.source_type !== "custom" && (!ownedCover || ownedCover.pending);
-  const switching = status?.loading || (!!track && !committed && !status?.load_error);
-  const playing = ready && status?.loaded === true && status.playing;
+  const { canEnter, canRemain } = idleCoverEligibility(context, track, status, ready, loadedKey, failedKey, !!currentImage);
   const { phase, dismiss, finishTransition } = useIdleCover({
     enabled,
     delayMs,
-    canEnter: playing && !switching && valid,
-    canRemain: playing && !!currentImage && (valid || loadingImage || waitingForCover || !!switching),
+    canEnter,
+    canRemain,
     scopeKey: libraryGeneration,
   });
+  const visible = !!currentImage && phase === "visible";
+  useEffect(() => { onVisibilityChange?.(visible); }, [visible, onVisibilityChange]);
+  useEffect(() => () => onVisibilityChange?.(false), [onVisibilityChange]);
   if (!currentImage || phase === "hidden") return null;
   return <IdleCoverOverlay image={currentImage} phase={phase} originRef={originRef} onClose={dismiss} onTransitionEnd={finishTransition} />;
 }

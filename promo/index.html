@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#080d15">
+    <title>oLooper — Promo</title>
+    <link rel="stylesheet" href="promo.css">
+  </head>
+  <body>
+    <main class="page">
+      <header class="masthead">
+        <div class="brand-lockup"><span class="brand-mark" aria-hidden="true">◉</span><span>oLooper</span><span class="tag">FREESCRATCH EDITION</span></div>
+        <p>Loop culture. Nuevo workflow.</p>
+      </header>
+
+      <section class="player" aria-label="Reproductor del video promocional">
+        <canvas id="promo-canvas" width="1920" height="1080" aria-label="Animación promocional de oLooper"></canvas>
+        <div class="playback-status"><span id="status">Listo para reproducir</span><span id="chapter">IDENTIDAD</span><span id="timecode">00:00 / 01:19</span></div>
+      </section>
+
+      <label class="timeline-label" for="timeline">Recorrer el montaje</label>
+      <input id="timeline" class="timeline" type="range" min="0" max="79.5" step="0.01" value="0" aria-label="Posición del video">
+
+      <section class="actions" aria-label="Controles">
+        <button id="preview" class="button button-primary" type="button">▶ Reproducir</button>
+        <button id="stop" class="button button-secondary" type="button">■ Reiniciar</button>
+        <button id="export" class="button button-secondary" type="button">↓ Exportar video</button>
+        <button id="fullscreen" class="button button-secondary" type="button">⛶ Pantalla completa</button>
+        <label class="mute-label"><input id="mute" type="checkbox"> Silenciar escucha</label>
+        <label id="file-label" class="button button-secondary" hidden>Cargar música<input id="music-file" type="file" accept="audio/*" hidden></label>
+        <a id="download" class="button button-primary" hidden>Descargar video</a>
+      </section>
+      <p id="message" class="message" role="status">1920 × 1080 · pista completa · animación reactiva al audio</p>
+
+      <footer><span id="audio-info">FreeScratch.mp3 · la pista se analiza al reproducir</span><span>La exportación incluye la música aunque silencies la escucha.</span></footer>
+    </main>
+    <script src="audio-analysis.js"></script>
+    <script src="promo.js"></script>
+  </body>
+</html>

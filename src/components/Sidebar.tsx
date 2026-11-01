@@ -1,7 +1,6 @@
 import { memo, useEffect, useMemo, useRef, useState } from "react";
 import {
   libraryList,
-  libraryGroupCover,
   libraryMarkPlayed,
   libraryGroupDirectory,
   libraryExportTracks,
@@ -36,15 +35,22 @@ import {
 import { recordTempoTap } from "../tapTempo";
 import { prepareTrackMetadata } from "../trackMetadata";
 import { waitForLibraryTrack } from "../libraryTrackLoad";
+import { createLibraryCoverCache, type LibraryCoverCache } from "../libraryCoverCache";
+import LibraryCoverThumbnail from "./LibraryCoverThumbnail";
+import { useLibraryFilters } from "../hooks/useLibraryFilters";
+import { collectionTracks, filterLibraryTracks, libraryLooperGroups, sortLibraryTracks } from "../libraryTrackView";
 import { bpmOptions, formatBpm, validBpm, type BpmBase } from "../bpmOptions";
 import { requestBpmReanalysis } from "../bpmReanalysis";
-import { IMPORTED_AUDIO_GROUP_KEY, libraryGroupKey, libraryGroupName } from "../libraryGroups";
+import { libraryGroupKey, libraryGroupName } from "../libraryGroups";
 import { navigateMidiLibrary, type MidiLibraryNavigationAction, type MidiLibraryNavigationState } from "../midiLibraryNavigation";
 import LibraryViewTabs, { type LibraryView } from "./LibraryViewTabs";
 import LibraryEmptyState from "./LibraryEmptyState";
 import DeleteLooperDialog from "./DeleteLooperDialog";
+import LibraryTrackToolbar from "./LibraryTrackToolbar";
+import LibraryTrackHeader from "./LibraryTrackHeader";
 
 interface Props {
+  coverCache?: LibraryCoverCache;
   libraryReady: boolean;
   libraryGeneration: number;
   refreshKey: number;
@@ -87,16 +93,13 @@ type LibraryDropTarget =
   | { kind: "looper"; sourceHash: string; element: HTMLElement }
   | null;
 
-function Sidebar({ libraryReady, libraryGeneration, refreshKey, activeTrackId, onLibraryViewChange, onRegisterTrackNavigation, onRegisterRandomScope, onRegisterMidiLibraryNavigation, onTrackLoading, onTrackSelected }: Props) {
+function Sidebar({ libraryReady, libraryGeneration, refreshKey, activeTrackId, onLibraryViewChange, onRegisterTrackNavigation, onRegisterRandomScope, onRegisterMidiLibraryNavigation, onTrackLoading, onTrackSelected, coverCache: sharedCoverCache }: Props) {
   const [tracks, setTracks] = useState<Track[]>([]);
   const [playlists, setPlaylists] = useState<Playlist[]>([]);
   const [looperOrder, setLooperOrder] = useState<string[]>([]);
   const [catalogLoaded, setCatalogLoaded] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [search, setSearch] = useState(() => localStorage.getItem("olooper.library.search") ?? "");
-  const [sourceFilter, setSourceFilter] = useState(() => localStorage.getItem("olooper.library.source") ?? "all");
-  const [bpmFilter, setBpmFilter] = useState(() => localStorage.getItem("olooper.library.bpm") ?? "all");
-  const [durationFilter, setDurationFilter] = useState(() => localStorage.getItem("olooper.library.duration") ?? "all");
+  const { search, setSearch, sourceFilter, setSourceFilter, bpmFilter, setBpmFilter, durationFilter, setDurationFilter, hasFilters, clearFilters } = useLibraryFilters();
   const [sort, setSort] = useState<"alphabetical" | "bpm">(() => localStorage.getItem("olooper.library.sort")?.startsWith("bpm") ? "bpm" : "alphabetical");
   const [bpmDescending, setBpmDescending] = useState(() => localStorage.getItem("olooper.library.sort") === "bpm-desc");
   const [looperPaneWidth, setLooperPaneWidth] = useState(() => {
@@ -107,13 +110,6 @@ function Sidebar({ libraryReady, libraryGeneration, refreshKey, activeTrackId, o
   });
   const [selectedGroup, setSelectedGroup] = useState(() => localStorage.getItem("olooper.library.selectedGroup") ?? ALL_GROUP);
   const [midiNavigationState, setMidiNavigationState] = useState<MidiLibraryNavigationState>({ level: "collections", collectionIndex: 0 });
-  const hasFilters = search !== "" || sourceFilter !== "all" || bpmFilter !== "all" || durationFilter !== "all";
-  const clearFilters = () => {
-    setSearch("");
-    setSourceFilter("all");
-    setBpmFilter("all");
-    setDurationFilter("all");
-  };
   const [activeId, setActiveId] = useState<number | null>(null);
   const [contextMenu, setContextMenu] = useState<number | null>(null);
   const [groupMenu, setGroupMenu] = useState<string | null>(null);
@@ -150,8 +146,8 @@ function Sidebar({ libraryReady, libraryGeneration, refreshKey, activeTrackId, o
   const [loadingId, setLoadingId] = useState<number | null>(null);
   const [convertingId, setConvertingId] = useState<number | null>(null);
   const [libraryRevealGeneration, setLibraryRevealGeneration] = useState(0);
-  const [covers, setCovers] = useState<Record<string, string>>({});
-  const coverCache = useRef(new Map<string, string>());
+  const [localCoverCache] = useState(createLibraryCoverCache);
+  const coverCache = sharedCoverCache ?? localCoverCache;
   const trackNavigationRef = useRef<(direction: -1 | 1) => void>(() => {});
   const nextPrefetchGeneration = useRef(0);
   const looperResizeStart = useRef<{ pointerX: number; width: number } | null>(null);
@@ -249,8 +245,6 @@ function Sidebar({ libraryReady, libraryGeneration, refreshKey, activeTrackId, o
     tapTempoTimes.current = [];
     setTapTempoCount(0);
     setTapTempoEstimate(null);
-    setCovers({});
-    coverCache.current.clear();
     setError(null);
   }, [libraryGeneration, onTrackLoading]);
 
@@ -311,49 +305,12 @@ function Sidebar({ libraryReady, libraryGeneration, refreshKey, activeTrackId, o
   }, [activeId, libraryRevealGeneration, selectedGroup]);
 
   useEffect(() => {
-    if (!libraryReady) return;
-    const sourceHashes = [...new Set(tracks
-      .filter((track) => track.source_type !== "custom")
-      .map((track) => track.source_hash))];
-    const liveHashes = new Set(sourceHashes);
-    for (const hash of coverCache.current.keys()) {
-      if (!liveHashes.has(hash)) coverCache.current.delete(hash);
-    }
-    setCovers(Object.fromEntries(coverCache.current));
-    const missing = sourceHashes.filter((sourceHash) => !coverCache.current.has(sourceHash));
-    if (missing.length === 0) return;
-    let cancelled = false;
-    let nextIndex = 0;
-    const load = async () => {
-      while (!cancelled && nextIndex < missing.length) {
-        const sourceHash = missing[nextIndex++];
-        try {
-          const cover = await libraryGroupCover(sourceHash);
-          if (!cancelled && libraryGeneration === refreshOwner.current && cover) coverCache.current.set(sourceHash, cover);
-        } catch {
-          // A missing cover must not prevent the remaining groups from loading.
-        }
-      }
-    };
-    // Bound image reads/base64 IPC instead of issuing one command per looper.
-    Promise.all(Array.from({ length: Math.min(4, missing.length) }, load)).then(() => {
-      if (cancelled) return;
-      setCovers(Object.fromEntries(coverCache.current));
-    });
-    return () => { cancelled = true; };
-  }, [libraryReady, tracks, libraryGeneration]);
-
-  useEffect(() => {
     if (contextMenu === null && groupMenu === null && playlistMenu === null) return;
     const close = () => { setContextMenu(null); setGroupMenu(null); setPlaylistMenu(null); };
     window.addEventListener("click", close);
     return () => window.removeEventListener("click", close);
   }, [contextMenu, groupMenu, playlistMenu]);
 
-  useEffect(() => { localStorage.setItem("olooper.library.search", search); }, [search]);
-  useEffect(() => { localStorage.setItem("olooper.library.source", sourceFilter); }, [sourceFilter]);
-  useEffect(() => { localStorage.setItem("olooper.library.bpm", bpmFilter); }, [bpmFilter]);
-  useEffect(() => { localStorage.setItem("olooper.library.duration", durationFilter); }, [durationFilter]);
   useEffect(() => {
     localStorage.setItem("olooper.library.sort", sort === "bpm" ? (bpmDescending ? "bpm-desc" : "bpm") : "alphabetical");
   }, [sort, bpmDescending]);
@@ -362,38 +319,9 @@ function Sidebar({ libraryReady, libraryGeneration, refreshKey, activeTrackId, o
   }, [looperPaneWidth]);
   useEffect(() => { localStorage.setItem("olooper.library.selectedGroup", selectedGroup); }, [selectedGroup]);
 
-  const looperPositions = useMemo(() => new Map(looperOrder.map((hash, index) => [hash, index])), [looperOrder]);
-  const looperGroups = useMemo(() => Object.values(tracks.reduce<Record<string, Track[]>>((result, track) => {
-    (result[groupKey(track)] ??= []).push(track);
-    return result;
-  }, {})).sort((left, right) => {
-    const leftHash = groupKey(left[0]);
-    const rightHash = groupKey(right[0]);
-    if (leftHash === IMPORTED_AUDIO_GROUP_KEY) return rightHash === IMPORTED_AUDIO_GROUP_KEY ? 0 : 1;
-    if (rightHash === IMPORTED_AUDIO_GROUP_KEY) return -1;
-    const leftPosition = looperPositions.get(leftHash) ?? -1;
-    const rightPosition = looperPositions.get(rightHash) ?? -1;
-    if (leftPosition < 0 && rightPosition < 0) return left[0].id - right[0].id;
-    if (leftPosition < 0) return 1;
-    if (rightPosition < 0) return -1;
-    return leftPosition - rightPosition;
-  }), [tracks, looperPositions]);
-  const filtered = useMemo(() => tracks.filter((track) => {
-    const needle = search.toLowerCase();
-    const matchesSearch = !search || track.title.toLowerCase().includes(needle) || groupName(track).toLowerCase().includes(needle) || track.tags.toLowerCase().includes(needle);
-    const matchesSource = sourceFilter === "all" || track.source_type === sourceFilter;
-    const matchesBpm = bpmFilter === "all" || (track.bpm !== null && (bpmFilter === "low" ? track.bpm < 100 : bpmFilter === "mid" ? track.bpm <= 130 : track.bpm > 130));
-    const matchesDuration = durationFilter === "all" || (durationFilter === "short" ? track.duration_ms < 10_000 : durationFilter === "mid" ? track.duration_ms <= 30_000 : track.duration_ms > 30_000);
-    return matchesSearch && matchesSource && matchesBpm && matchesDuration;
-  }), [tracks, search, sourceFilter, bpmFilter, durationFilter]);
-  const sorted = useMemo(() => [...filtered].sort((a, b) => {
-    if (sort === "bpm" && a.bpm !== b.bpm) {
-      if (a.bpm === null) return 1;
-      if (b.bpm === null) return -1;
-      return (a.bpm - b.bpm) * (bpmDescending ? -1 : 1);
-    }
-    return a.title.localeCompare(b.title);
-  }), [filtered, sort, bpmDescending]);
+  const looperGroups = useMemo(() => libraryLooperGroups(tracks, looperOrder), [tracks, looperOrder]);
+  const filtered = useMemo(() => filterLibraryTracks(tracks, { search, sourceFilter, bpmFilter, durationFilter }), [tracks, search, sourceFilter, bpmFilter, durationFilter]);
+  const sorted = useMemo(() => sortLibraryTracks(filtered, sort, bpmDescending), [filtered, sort, bpmDescending]);
   const selectedPlaylistId = selectedGroup.startsWith(PLAYLIST_PREFIX)
     ? Number(selectedGroup.slice(PLAYLIST_PREFIX.length))
     : null;
@@ -401,13 +329,7 @@ function Sidebar({ libraryReady, libraryGeneration, refreshKey, activeTrackId, o
     ? undefined
     : playlists.find((playlist) => playlist.id === selectedPlaylistId);
   const filteredById = useMemo(() => new Map(filtered.map((track) => [track.id, track])), [filtered]);
-  const selectedTracks = useMemo(() => selectedPlaylist
-    ? selectedPlaylist.track_ids.flatMap((id) => {
-      const track = filteredById.get(id);
-      return track ? [track] : [];
-    })
-    : sorted.filter((track) => selectedGroup === ALL_GROUP
-       || (selectedGroup === FAVORITES_GROUP ? track.favorite : groupKey(track) === selectedGroup)), [selectedPlaylist, filteredById, sorted, selectedGroup]);
+  const selectedTracks = useMemo(() => collectionTracks(selectedPlaylist, filteredById, sorted, selectedGroup, ALL_GROUP, FAVORITES_GROUP), [selectedPlaylist, filteredById, sorted, selectedGroup]);
   const tracksById = useMemo(() => new Map(tracks.map((track) => [track.id, track])), [tracks]);
   visibleTracksRef.current = selectedTracks;
   const firstVisible = Math.max(0, Math.min(Math.floor(viewport.top / TRACK_ROW_HEIGHT) - 6, selectedTracks.length - 1));
@@ -561,7 +483,8 @@ function Sidebar({ libraryReady, libraryGeneration, refreshKey, activeTrackId, o
       const finalStatus = resumeAfterLoad ? await playerPlay() : await playerStatus();
       if (!isCurrent() || finalStatus.path !== track.playback_path) return;
       onTrackSelected(track, finalStatus);
-      if (resumeAfterLoad) libraryMarkPlayed(track.id).then(refresh).catch(() => {});
+      // This only persists playback history; it cannot change the visible catalog.
+      if (resumeAfterLoad) libraryMarkPlayed(track.id).catch(() => {});
     } catch (e) {
       if (!isCurrent()) return;
       setLoadingId(null);
@@ -1241,9 +1164,7 @@ function Sidebar({ libraryReady, libraryGeneration, refreshKey, activeTrackId, o
                     aria-current={isSelected ? "page" : undefined}
                     className="flex min-w-0 flex-1 items-center gap-2 px-2 py-2 text-left"
                   >
-                    {covers[sourceHash]
-                      ? <img src={covers[sourceHash]} alt="" className="h-8 w-8 shrink-0 rounded object-cover" />
-                      : <span aria-hidden="true" className="flex h-8 w-8 shrink-0 items-center justify-center rounded bg-border text-sm text-text-secondary">♫</span>}
+                    <LibraryCoverThumbnail cache={coverCache} scope={{ generation: libraryGeneration, revision: refreshKey }} sourceHash={customAudio || !libraryReady ? null : sourceHash} />
                     <span className="min-w-0 flex-1">
                       <span className="block truncate text-xs font-medium">{groupName(entries[0])}</span>
                       <span className="block truncate text-[9px] uppercase opacity-70">{customAudio ? "Audio" : entries[0].source_type}</span>
@@ -1304,44 +1225,15 @@ function Sidebar({ libraryReady, libraryGeneration, refreshKey, activeTrackId, o
         />
 
         <section className="flex min-w-0 flex-1 flex-col">
-          <div className="flex flex-wrap items-center gap-2 border-b border-border px-3 py-2">
-            <h2 className="mr-auto min-w-0 truncate text-xs font-semibold text-text">
-              {selectedGroup === ALL_GROUP ? "All tracks" : selectedPlaylist ? selectedPlaylist.name : selectedGroup === FAVORITES_GROUP ? "Favorites" : selectedLooper ? groupName(selectedLooper) : "Library"}
-            </h2>
-            <input type="search" aria-label="Search tracks" placeholder="Search tracks, loopers or tags…" value={search} onChange={(e) => setSearch(e.target.value)} className="min-w-24 flex-1 rounded-lg border border-border bg-app px-3 py-2 text-xs text-text placeholder:text-text-secondary focus:border-accent" />
-            {hasFilters && <button onClick={clearFilters} className="toolbar-button">Clear filters</button>}
-            <button onClick={() => requestBpmReanalysis({ kind: "library" }, "All tracks")} title="Reanalyze automatic BPMs across the entire library, ignoring filters; confirmed BPMs are preserved" className="toolbar-button">Reanalyze all BPM</button>
-            {selectedPlaylist && <button onClick={() => requestBpmReanalysis({ kind: "playlist", playlist_id: selectedPlaylist.id }, selectedPlaylist.name)} className="toolbar-button">Reanalyze playlist BPM</button>}
-            {selectedLooper && selectedLooper.source_type !== "custom" && <button onClick={() => requestBpmReanalysis({ kind: "looper", source_hash: selectedLooper.source_hash }, groupName(selectedLooper))} className="toolbar-button">Reanalyze looper BPM</button>}
-            <select value={sourceFilter} onChange={(e) => setSourceFilter(e.target.value)} aria-label="Filter source" className="rounded border border-border bg-elevated px-2 py-1 text-[10px] text-text"><option value="all">Source</option><option value="swf">SWF</option><option value="exe">EXE</option><option value="custom">Audio</option><option value="tablist">Tablist</option></select>
-            <select value={bpmFilter} onChange={(e) => setBpmFilter(e.target.value)} aria-label="Filter BPM" className="rounded border border-border bg-elevated px-2 py-1 text-[10px] text-text"><option value="all">BPM</option><option value="low">&lt;100</option><option value="mid">100–130</option><option value="high">&gt;130</option></select>
-            <select value={durationFilter} onChange={(e) => setDurationFilter(e.target.value)} aria-label="Filter duration" className="rounded border border-border bg-elevated px-2 py-1 text-[10px] text-text"><option value="all">Length</option><option value="short">&lt;10s</option><option value="mid">10–30s</option><option value="long">&gt;30s</option></select>
-            <button disabled={selectedIds.length === 0} onClick={exportSelected} className="rounded bg-accent px-2 py-1 text-[10px] font-medium text-white disabled:opacity-40">Export {selectedIds.length || ""}</button>
-          </div>
-          <div className={`grid ${showLooperColumn ? TRACK_COLUMNS_WITH_LOOPER : TRACK_COLUMNS} gap-2 border-b border-border bg-elevated/50 px-3 py-1.5 text-[10px] font-medium uppercase tracking-wider text-text-secondary`}>
-            {selectedPlaylist
-              ? <span>Playlist order</span>
-              : <button
-                onClick={() => { setSort("alphabetical"); setBpmDescending(false); }}
-                aria-sort={sort === "alphabetical" ? "ascending" : "none"}
-                className="truncate text-left hover:text-text"
-                title="Sort loops alphabetically"
-              >Loop{sort === "alphabetical" ? " ↑" : ""}</button>}
-            {showLooperColumn && <span className="truncate text-left">Looper</span>}
-            {selectedPlaylist
-              ? <span className="text-right">BPM</span>
-              : <button
-                onClick={() => {
-                  if (sort === "bpm") setBpmDescending((descending) => !descending);
-                  else { setSort("bpm"); setBpmDescending(false); }
-                }}
-                aria-sort={sort === "bpm" ? (bpmDescending ? "descending" : "ascending") : "none"}
-                className="text-right hover:text-text"
-                title="Sort loops by BPM"
-              >BPM{sort === "bpm" ? (bpmDescending ? " ↓" : " ↑") : ""}</button>}
-            <span className="text-right">Length</span>
-            <span className="text-right">Actions</span>
-          </div>
+          <LibraryTrackToolbar title={selectedGroup === ALL_GROUP ? "All tracks" : selectedPlaylist ? selectedPlaylist.name : selectedGroup === FAVORITES_GROUP ? "Favorites" : selectedLooper ? groupName(selectedLooper) : "Library"}
+            search={search} sourceFilter={sourceFilter} bpmFilter={bpmFilter} durationFilter={durationFilter}
+            hasFilters={hasFilters} selectedCount={selectedIds.length} playlist={selectedPlaylist} looper={selectedLooper}
+            onSearch={setSearch} onSourceFilter={setSourceFilter} onBpmFilter={setBpmFilter} onDurationFilter={setDurationFilter}
+            onClear={clearFilters} onExport={exportSelected} />
+          <LibraryTrackHeader columns={showLooperColumn ? TRACK_COLUMNS_WITH_LOOPER : TRACK_COLUMNS}
+            playlistSelected={!!selectedPlaylist} showLooperColumn={showLooperColumn} sort={sort} bpmDescending={bpmDescending}
+            onSortAlphabetically={() => { setSort("alphabetical"); setBpmDescending(false); }}
+            onSortBpm={() => { if (sort === "bpm") setBpmDescending((descending) => !descending); else { setSort("bpm"); setBpmDescending(false); } }} />
           <div ref={listRef} onScroll={(event) => setViewport({ top: event.currentTarget.scrollTop, height: event.currentTarget.clientHeight })} className="min-h-0 flex-1 overflow-y-auto">
             <LibraryEmptyState libraryReady={libraryReady} catalogLoaded={catalogLoaded} trackCount={tracks.length}
               selectedTrackCount={selectedTracks.length} hasFilters={hasFilters} favoritesSelected={selectedGroup === FAVORITES_GROUP}

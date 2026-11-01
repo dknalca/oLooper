@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 /// Bounds for client-requested bucket counts (allocation safety).
 pub const MIN_BUCKETS: usize = 64;
 pub const MAX_BUCKETS: usize = 8192;
+const CHECK_INTERVAL_FRAMES: usize = 65_536;
 const CACHE_ALGORITHM_VERSION: u8 = 2;
 const MAX_CACHE_ENTRY_BYTES: u64 = 512 * 1024;
 const MAX_CACHE_BYTES: u64 = 64 * 1024 * 1024;
@@ -28,27 +29,52 @@ pub fn clamp_buckets(n: usize) -> usize {
 
 /// Peak computation over already-decoded audio. Pure and hardware-free.
 pub fn from_buffer(buf: &crate::player::LoopBuffer, buckets: usize) -> WaveformData {
+    match from_buffer_checked(buf, buckets, || Ok::<(), std::convert::Infallible>(())) {
+        Ok(waveform) => waveform,
+        Err(never) => match never {},
+    }
+}
+
+/// Cooperatively stop obsolete derived work without changing sample arithmetic.
+/// Checks are bounded by visited frames, not bucket count or per-frame locks.
+pub(crate) fn from_buffer_checked<E>(
+    buf: &crate::player::LoopBuffer,
+    buckets: usize,
+    mut check: impl FnMut() -> Result<(), E>,
+) -> Result<WaveformData, E> {
+    check()?;
     let buckets = clamp_buckets(buckets);
     let frames = buf.frames();
     let ch = buf.channels.max(1) as usize;
     let mut peaks = vec![0f32; buckets];
     if frames == 0 {
-        return WaveformData {
+        return Ok(WaveformData {
             peaks,
             duration_ms: 0,
             buckets,
-        };
+        });
     }
+    let mut remaining = CHECK_INTERVAL_FRAMES;
     for (i, bucket) in peaks.iter_mut().enumerate() {
         let start = i * frames / buckets;
         let end = ((i + 1) * frames / buckets).max(start + 1).min(frames);
         let mut max = 0f32;
-        for f in start..end {
-            let mut mix = 0f32;
-            for c in 0..ch {
-                mix += buf.samples.get(f * ch + c).copied().unwrap_or(0) as f32 / 32768.0;
+        let mut frame = start;
+        while frame < end {
+            if remaining == 0 {
+                check()?;
+                remaining = CHECK_INTERVAL_FRAMES;
             }
-            max = max.max((mix / ch as f32).abs());
+            let chunk_end = frame.saturating_add(remaining).min(end);
+            for f in frame..chunk_end {
+                let mut mix = 0f32;
+                for c in 0..ch {
+                    mix += buf.samples.get(f * ch + c).copied().unwrap_or(0) as f32 / 32768.0;
+                }
+                max = max.max((mix / ch as f32).abs());
+            }
+            remaining -= chunk_end - frame;
+            frame = chunk_end;
         }
         *bucket = max;
     }
@@ -58,11 +84,12 @@ pub fn from_buffer(buf: &crate::player::LoopBuffer, buckets: usize) -> WaveformD
             *p /= global;
         }
     }
-    WaveformData {
+    check()?;
+    Ok(WaveformData {
         peaks,
         duration_ms: buf.duration_ms(),
         buckets,
-    }
+    })
 }
 
 /// Decode bytes and compute peaks in one step.

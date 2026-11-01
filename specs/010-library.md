@@ -99,7 +99,10 @@ slots.
 - Library paths are stored with track metadata; missing files are flagged rather
   than silently removed. Changing the library root does not migrate its contents.
 - Single-track lookups query by primary key instead of loading/stat-ing the full
-  catalog. Scoped random selection filters the source hash in SQLite.
+  catalog. Scoped random selection filters the source hash in SQLite, reads
+  lightweight ID/path candidates and hydrates metadata only after checking a
+  drawn candidate. Repeated paths share bounded availability observations within
+  a catalog operation, never across calls or playback admission (spec 320).
 - Cover loading uses at most four concurrent requests per batch. Cancelled
   batches stop scheduling work and cannot repopulate another library's cache;
   removed groups release cached covers.

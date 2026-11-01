@@ -12,7 +12,8 @@ computation; rendering is canvas-only (no audio decoding per frame).
    the track name in the upper-left corner, loop region shaded, and a fixed
    center playhead.
 2. During playback the waveform scrolls; position display stays in sync
-   (native position polled at 4 Hz, UI interpolates between polls).
+   (normally polled at 4 Hz, faster while sharing the audio-dialog stream;
+   UI interpolates between polls — spec 330).
 3. Click (or tap) on the waveform seeks there; looping continues per the
    enabled flag. When Loop controls are expanded, dragging either loop edge
    adjusts that boundary and applies it on pointer release. AUTO loop changes
@@ -31,15 +32,22 @@ computation; rendering is canvas-only (no audio decoding per frame).
 8. Contention-free protocol: the request first tries the persistent disk
    cache (no engine lock at all on a hit). On a miss it clones the player's
    `Arc<LoopBuffer>` under a short read lock, releases the lock immediately,
-   and computes peaks off-lock. Each job is tagged with path + load
-   generation; after computing, the job re-checks the current generation and
-   discards its result (`"track changed …"` error) if the user already
-   selected another track. Peak computation never blocks track loading or
-   transport.
+   and computes peaks off-lock. Each miss captures path + load generation before
+   compute admission, without retaining PCM while waiting. It rechecks after
+   admission, at bounded nonblocking scan checkpoints and before storage/return,
+   discarding obsolete work (`"track changed …"` error). The scan never holds an
+   audio-state lock while traversing PCM; contended checkpoints do not wait for
+   writers. Check opportunities and cancellation limits are specified in
+   [340](340-cooperative-waveform-cancellation.md).
 9. Paint at most 30 frames per second during playback and skip unchanged paused
    frames and hidden documents. Position interpolation respects playback speed.
    Round physical canvas dimensions before comparing them to avoid repeated
-   backing-buffer allocation at fractional display scale factors.
+    backing-buffer allocation at fractional display scale factors.
+10. Stop scheduling frames when paused with no pending invalidation, when the
+    document is hidden or when the idle-cover overlay is fully visible. Redraw
+    on return, resize and visual changes without suspending native playback.
+    Reuse bounded in-memory peak resolutions by native load generation, not
+    general catalog refresh; see [300](300-lightweight-derived-ui.md).
 
 ## Supported inputs
 

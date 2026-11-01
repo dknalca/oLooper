@@ -9,7 +9,9 @@ import MidiSettingsDialog from "./components/MidiSettingsDialog";
 import AudioSettingsDialog from "./components/AudioSettingsDialog";
 import BpmReanalysisPanel from "./components/BpmReanalysisPanel";
 import AppPreferencesDialog from "./components/AppPreferencesDialog";
-import IdleCoverScreensaver, { type ActiveCoverState } from "./components/IdleCoverScreensaver";
+import IdleCoverScreensaver from "./components/IdleCoverScreensaver";
+import { createLibraryCoverCache } from "./libraryCoverCache";
+import { useLibraryCover } from "./hooks/useLibraryCover";
 import { readIdleCoverEnabled, readIdleCoverDelayMinutes, saveIdleCoverEnabled, saveIdleCoverDelayMinutes, idleCoverDelayMs } from "./appPreferences";
 import StartupIntro from "./components/StartupIntro";
 import useKeyboardShortcuts from "./hooks/useKeyboardShortcuts";
@@ -18,7 +20,6 @@ import useModalFocus from "./hooks/useModalFocus";
 import {
   libraryRandomTrack,
   libraryList,
-  libraryGroupCover,
   libraryMarkPlayed,
   audioSetOutput,
   listenAppMenuCommand,
@@ -29,14 +30,10 @@ import {
   midiDisconnect,
   midiSetLed,
   playerLoadTrack,
-  playerCancelBoundaryLoad,
-  playerPause,
   playerPlay,
   playerPrefetch,
-  playerSetVolume,
   playerSetDiagnostics,
   playerStatus as getPlayerStatus,
-  playerStop,
   type MidiAction,
   type MidiBinding,
   type MidiMessage,
@@ -47,8 +44,9 @@ import {
 import { firstMidiStartTrack } from "./midiPlayback";
 import { readAudioSelection } from "./audioOutputPreferences";
 import { copySourcePreference } from "./importFlow";
-import { midiEncoderDirection } from "./midiLibraryNavigation";
-import { takeRandomCandidate, type RandomCandidate } from "./randomCandidate";
+import { executeMidiAction } from "./midiActions";
+import type { RandomCandidate } from "./randomCandidate";
+import { loadRandomTrack } from "./randomTrackLoad";
 import type { RandomSwitchOptions } from "./randomPlayback";
 import { MIDI_MAP_STORAGE_KEY, readMidiMaps, type MidiBindings } from "./midiMaps";
 
@@ -72,9 +70,12 @@ export default function App() {
   const [activeTrackId, setActiveTrackId] = useState<number | null>(null);
   const [trackOpenGeneration, setTrackOpenGeneration] = useState(0);
   const [activeTrack, setActiveTrack] = useState<Track | null>(null);
-  const [activeCoverState, setActiveCoverState] = useState<ActiveCoverState | null>(null);
+  const [coverCache] = useState(createLibraryCoverCache);
+  const activeCoverState = useLibraryCover(coverCache, { generation: libraryGeneration, revision: refreshKey },
+    playerStatus?.loaded && activeTrack?.source_type !== "custom" ? activeTrack?.source_hash ?? null : null);
   const activeCover = activeCoverState?.generation === libraryGeneration && activeCoverState.sourceHash === activeTrack?.source_hash ? activeCoverState.src : null;
   const coverRef = useRef<HTMLDivElement>(null);
+  const [coverOverlayVisible, setCoverOverlayVisible] = useState(false);
   const [preferencesOpen, setPreferencesOpen] = useState(false);
   const [idleCoverEnabled, setIdleCoverEnabled] = useState(readIdleCoverEnabled);
   const [idleCoverDelayMinutes, setIdleCoverDelayMinutes] = useState(readIdleCoverDelayMinutes);
@@ -127,7 +128,6 @@ export default function App() {
     randomLoadGeneration.current += 1;
     setActiveTrackId(null);
     setActiveTrack(null);
-    setActiveCoverState(null);
     setTrackOpenGeneration((generation) => generation + 1);
     setPlayerStatus(null);
     setLibraryView("local");
@@ -190,20 +190,6 @@ export default function App() {
     return () => window.removeEventListener("olooper:track-bpm", updateActiveBpm);
   }, [activeTrackId]);
 
-  useEffect(() => {
-    if (!playerStatus?.loaded || !activeTrack || activeTrack.source_type === "custom") {
-      setActiveCoverState(null);
-      return;
-    }
-    let cancelled = false;
-    const owner = { sourceHash: activeTrack.source_hash, generation: libraryGeneration };
-    setActiveCoverState({ ...owner, src: null, pending: true });
-    libraryGroupCover(activeTrack.source_hash)
-      .then((cover) => { if (!cancelled) setActiveCoverState({ ...owner, src: cover, pending: false }); })
-      .catch(() => { if (!cancelled) setActiveCoverState({ ...owner, src: null, pending: false }); });
-    return () => { cancelled = true; };
-  }, [activeTrack?.source_hash, activeTrack?.source_type, playerStatus?.loaded, libraryGeneration]);
-
   const registerTrackNavigator = useCallback((navigate: TrackNavigator | null) => {
     setTrackNavigator(() => navigate);
   }, []);
@@ -221,44 +207,10 @@ export default function App() {
     setPlayerStatus((current) => current ? { ...current, loading: true } : current);
   }, []);
 
-  const playRandomTrack = useCallback(async (request?: RandomSwitchOptions) => {
-    if (request?.signal?.aborted) return;
-    const generation = ++randomLoadGeneration.current;
-    let admitted = false;
-    const cancelQueued = () => { if (admitted) void playerCancelBoundaryLoad().catch(() => {}); };
-    request?.signal?.addEventListener("abort", cancelQueued);
-    try {
-      const scope = libraryView === "local" ? randomScopeHash : null;
-      const key = `${libraryGeneration}|${libraryView}|${scope ?? ""}`;
-      const prepared = randomCandidate.current;
-      randomCandidate.current = null;
-      const track = takeRandomCandidate(prepared, key, activeTrackId)
-        ?? await libraryRandomTrack(activeTrackId, scope);
-      if (!track) throw new Error("No playable tracks in the current selection");
-      if (generation !== randomLoadGeneration.current || request?.signal?.aborted) return;
-
-      let status = request?.atLoopEnd ? await playerLoadTrack(track.id, true) : await playerLoadTrack(track.id);
-      admitted = true;
-      if (request?.signal?.aborted) status = await playerCancelBoundaryLoad();
-      if (generation !== randomLoadGeneration.current) return;
-      setPlayerStatus(status);
-      const deadline = Date.now() + 120_000;
-      while ((status.loading || status.boundary_pending) && Date.now() < deadline) {
-        await new Promise((resolve) => window.setTimeout(resolve, 150));
-        if (generation !== randomLoadGeneration.current) return;
-        status = await getPlayerStatus();
-        if (generation !== randomLoadGeneration.current) return;
-        setPlayerStatus(status);
-      }
-      if (generation !== randomLoadGeneration.current) return;
-      if (status.loading || status.boundary_pending) {
-        if (request?.atLoopEnd) await playerCancelBoundaryLoad();
-        throw new Error("Random track load timed out");
-      }
-      if (status.load_error) throw new Error(status.load_error);
-      if (status.path !== track.playback_path) return false;
-      const playing = request?.atLoopEnd ? status : await playerPlay();
-      if (generation !== randomLoadGeneration.current) return;
+  const playRandomTrack = useCallback((request?: RandomSwitchOptions) => loadRandomTrack({
+    activeTrackId, libraryGeneration, libraryView, randomScopeHash, loadGeneration: randomLoadGeneration,
+    candidate: randomCandidate, onStatus: setPlayerStatus,
+    onCommit: (track, playing) => {
       setActiveTrackId(track.id);
       setActiveTrack(track);
       setPlayerStatus(playing);
@@ -266,8 +218,8 @@ export default function App() {
       window.dispatchEvent(new CustomEvent("olooper:reveal-library-track", {
         detail: { trackId: track.id, sourceHash: track.source_hash, preserveCollection: true },
       }));
-    } finally { request?.signal?.removeEventListener("abort", cancelQueued); }
-  }, [activeTrackId, libraryGeneration, libraryView, randomScopeHash]);
+    },
+  }, request), [activeTrackId, libraryGeneration, libraryView, randomScopeHash]);
 
   // Prepare the next random target while the current loop plays, so button,
   // timer and MIDI presses can consume a decoded buffer immediately.
@@ -323,68 +275,11 @@ export default function App() {
     libraryMarkPlayed(track.id).then(onImported).catch(() => {});
   }, [onImported, onTrackSelected]);
 
-  const executeMidiAction = useCallback((action: MidiAction, message?: MidiMessage) => {
-    if (action === "library-encoder") {
-      if (message?.kind !== "cc") return;
-      const direction = midiEncoderDirection(message.value);
-      if (direction !== 0) midiLibraryNavigatorRef.current(direction > 0 ? "down" : "up");
-      return;
-    }
-    if (action === "library-up") {
-      midiLibraryNavigatorRef.current("up");
-      return;
-    }
-    if (action === "library-down") {
-      midiLibraryNavigatorRef.current("down");
-      return;
-    }
-    if (action === "library-intro") {
-      midiLibraryNavigatorRef.current("intro");
-      return;
-    }
-    if (action === "library-back") {
-      midiLibraryNavigatorRef.current("back");
-      return;
-    }
-    if (action === "metronome-toggle") {
-      window.dispatchEvent(new Event("olooper:metronome-toggle"));
-      return;
-    }
-    if (action === "volume-down" || action === "volume-up") {
-      const currentVolume = playerStatus?.volume_pct ?? 80;
-      const volume = action === "volume-down" ? Math.max(0, currentVolume - 5) : Math.min(100, currentVolume + 5);
-      playerSetVolume(volume).then(setPlayerStatus).catch(() => {});
-      return;
-    }
-    if (action === "random-loop") {
-      window.dispatchEvent(new Event("olooper:random-loop"));
-      return;
-    }
-    if (action === "play-pause" && !playerStatus?.loaded) {
-      playFirstLibraryTrack().catch(() => {});
-      return;
-    }
-    if (!playerStatus?.loaded) return;
-    const publishStatus = (request: Promise<PlayerStatus>) => {
-      request.then(setPlayerStatus).catch(() => {});
-    };
-    if (action === "play-pause") {
-      publishStatus(playerStatus.playing ? playerPause() : playerPlay());
-    } else if (action === "stop") {
-      publishStatus(playerStop());
-    } else if (action === "previous") {
-      trackNavigator?.(-1);
-    } else if (action === "next") {
-      trackNavigator?.(1);
-    } else if (action.startsWith("clear-cue-")) {
-      const slot = Number(action.slice("clear-cue-".length));
-      window.dispatchEvent(new CustomEvent("olooper:cue-shortcut", { detail: { slot, clear: true } }));
-    } else if (action.startsWith("cue-")) {
-      const slot = Number(action.slice("cue-".length));
-      window.dispatchEvent(new CustomEvent("olooper:cue-shortcut", { detail: { slot, clear: false } }));
-    }
-  }, [playerStatus, playFirstLibraryTrack, trackNavigator]);
-  midiActionHandlerRef.current = executeMidiAction;
+  const dispatchMidiAction = useCallback((action: MidiAction, message?: MidiMessage) => executeMidiAction(action, message, {
+    status: playerStatus, navigateLibrary: (command) => midiLibraryNavigatorRef.current(command),
+    navigateTrack: trackNavigator, playFirstTrack: playFirstLibraryTrack, onStatus: setPlayerStatus,
+  }), [playerStatus, playFirstLibraryTrack, trackNavigator]);
+  midiActionHandlerRef.current = dispatchMidiAction;
 
   // Listen for olooper:imported events from keyboard shortcut handler.
   useEffect(() => {
@@ -583,7 +478,7 @@ export default function App() {
           }}
         />
         <div className="h-1/5 min-h-36 shrink-0 p-3">
-          <Waveform refreshKey={refreshKey} status={playerStatus} trackTitle={activeTrack?.title ?? null} trackCover={activeCover} coverRef={coverRef} trackId={activeTrack?.id ?? null} playbackPath={activeTrack?.playback_path} showCover={playerStatus?.loaded === true && activeTrack !== null} loopEditing={loopEditing} onStatusChange={setPlayerStatus} />
+          <Waveform status={playerStatus} trackTitle={activeTrack?.title ?? null} trackCover={activeCover} coverRef={coverRef} trackId={activeTrack?.id ?? null} playbackPath={activeTrack?.playback_path} showCover={playerStatus?.loaded === true && activeTrack !== null} loopEditing={loopEditing} onStatusChange={setPlayerStatus} renderingPaused={coverOverlayVisible} />
         </div>
               <Player
                 status={playerStatus}
@@ -604,6 +499,7 @@ export default function App() {
           <div id="library-panel" role="tabpanel" aria-labelledby={`view-${libraryView}`} className="flex min-h-0 flex-1 flex-col">
             {libraryView === "local" ? (
               <Sidebar
+                coverCache={coverCache}
                 libraryReady={libraryReady}
                 libraryGeneration={libraryGeneration}
                 refreshKey={refreshKey}
@@ -738,6 +634,7 @@ export default function App() {
         onClose={() => setPreferencesOpen(false)}
       />
       <IdleCoverScreensaver
+        onVisibilityChange={setCoverOverlayVisible}
         enabled={idleCoverEnabled}
         delayMs={idleCoverDelayMs(idleCoverDelayMinutes)}
         ready={libraryReady && startupIntroDone}

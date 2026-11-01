@@ -51,7 +51,8 @@ impl LoopBuffer {
     }
 
     fn memory_bytes(&self) -> usize {
-        self.samples.len() * std::mem::size_of::<i16>()
+        // In-place trimming keeps the allocation, including its spare capacity.
+        self.samples.capacity() * std::mem::size_of::<i16>()
     }
 }
 
@@ -980,20 +981,35 @@ fn output_selection_matches_device(
 
 /// Decode any rodio-supported bytes into a buffer. Hardware-free.
 pub fn decode_bytes(data: &[u8]) -> Result<LoopBuffer, String> {
+    crate::check_cancelled()?;
     let _work = crate::memory::work_guard();
+    crate::check_cancelled()?;
+    decode_buffer(data.to_vec())
+}
+
+/// Transfer already-owned input to the decoder without copying its encoded bytes.
+/// Keep admission here too: this must never bypass the shared transient-work cap.
+pub(crate) fn decode_owned_bytes(data: Vec<u8>) -> Result<LoopBuffer, String> {
+    crate::check_cancelled()?;
+    let _work = crate::memory::work_guard();
+    crate::check_cancelled()?;
+    decode_buffer(data)
+}
+
+fn decode_buffer(data: Vec<u8>) -> Result<LoopBuffer, String> {
     // rodio 0.20's Symphonia adapter panics when its MP4 reader requests a
     // seek during initialization for Tablist's M4A files. Decode ISO BMFF
     // directly through Symphonia instead of letting that adapter panic.
     if data.get(4..8) == Some(b"ftyp") {
         return decode_isomp4(data).map(trim_aac_edge_silence);
     }
-    decode_owned(data.to_vec())
+    decode_owned(data)
 }
 
 /// Tablist AAC/M4A files can omit encoder pre-roll/padding metadata while
 /// retaining short near-zero regions at the file edges. Trim only bounded
 /// near-silence from the playback buffer; the downloaded source stays intact.
-fn trim_aac_edge_silence(buffer: LoopBuffer) -> LoopBuffer {
+fn trim_aac_edge_silence(mut buffer: LoopBuffer) -> LoopBuffer {
     const WINDOW_MS: usize = 10;
     const MAX_PRIMING_MS: usize = 150;
     const SILENCE_PEAK: i32 = 64;
@@ -1039,20 +1055,22 @@ fn trim_aac_edge_silence(buffer: LoopBuffer) -> LoopBuffer {
         return buffer;
     }
 
-    LoopBuffer {
-        samples: buffer.samples[trim_start * channels..trim_end * channels].to_vec(),
-        channels: buffer.channels,
-        rate: buffer.rate,
-    }
+    // Move the retained interleaved frames in place. Do not allocate a second
+    // full PCM buffer merely to remove short regions from its edges.
+    let start_sample = trim_start * channels;
+    let end_sample = trim_end * channels;
+    buffer.samples.copy_within(start_sample..end_sample, 0);
+    buffer.samples.truncate(end_sample - start_sample);
+    buffer
 }
 
-fn decode_isomp4(data: &[u8]) -> Result<LoopBuffer, String> {
+fn decode_isomp4(data: Vec<u8>) -> Result<LoopBuffer, String> {
     use symphonia::core::{
         audio::SampleBuffer, codecs::DecoderOptions, errors::Error as SymphoniaError,
         formats::FormatOptions, io::MediaSourceStream, meta::MetadataOptions, probe::Hint,
     };
 
-    let source = MediaSourceStream::new(Box::new(Cursor::new(data.to_vec())), Default::default());
+    let source = MediaSourceStream::new(Box::new(Cursor::new(data)), Default::default());
     let mut hint = Hint::new();
     hint.with_extension("m4a");
     let format_options = FormatOptions {
@@ -1268,6 +1286,43 @@ fn waveform_snapshot_current(loaded: &LoadedSnapshot, path: &str, generation: u6
     loaded
         .as_ref()
         .is_some_and(|(p, g, _)| p == path && *g == generation)
+}
+
+const WAVEFORM_CHANGED: &str = "track changed before waveform analysis";
+
+/// Identity captured before waiting for waveform admission. Do not pin PCM here:
+/// obsolete queued requests must not keep their former track buffers alive.
+#[derive(Debug)]
+struct WaveformOwner {
+    path: String,
+    generation: u64,
+}
+
+impl WaveformOwner {
+    fn capture(loaded: &LoadedSnapshot, path: &str) -> Result<Self, String> {
+        let (loaded_path, generation, _) = loaded.as_ref().ok_or("nothing loaded")?;
+        if loaded_path != path {
+            return Err(WAVEFORM_CHANGED.into());
+        }
+        Ok(Self {
+            path: loaded_path.clone(),
+            generation: *generation,
+        })
+    }
+
+    fn current(&self, loaded: &LoadedSnapshot) -> bool {
+        waveform_snapshot_current(loaded, &self.path, self.generation)
+    }
+
+    fn check(&self, loaded: &std::sync::RwLock<LoadedSnapshot>) -> Result<(), String> {
+        match loaded.try_read() {
+            Ok(snapshot) if self.current(&snapshot) => Ok(()),
+            // Never wait on an audio-state writer at a scan checkpoint. Retry
+            // later; the final blocking validation still precedes cache storage.
+            Err(std::sync::TryLockError::WouldBlock) => Ok(()),
+            _ => Err(WAVEFORM_CHANGED.into()),
+        }
+    }
 }
 
 /// A pitch completion applies only if nothing superseded it: same track
@@ -1882,7 +1937,7 @@ fn stretch_job(buffer: &LoopBuffer, tempo: f32) -> Result<LoopBuffer, String> {
 
 /// Worker entry point: decode with panics converted to job errors.
 fn decode_job(data: Vec<u8>) -> Result<LoopBuffer, String> {
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| decode_bytes(&data)))
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| decode_owned_bytes(data)))
         .map_err(|_| "cannot decode audio: decoder failed".to_string())?
 }
 
@@ -3872,7 +3927,7 @@ impl EngineClient {
         buckets: usize,
         cache_dir: &std::path::Path,
     ) -> Result<crate::waveform::WaveformData, String> {
-        use crate::waveform::{cache_lookup, cache_store, clamp_buckets, from_buffer};
+        use crate::waveform::{cache_lookup, cache_store, clamp_buckets, from_buffer_checked};
         let buckets = clamp_buckets(buckets);
         let req_path = std::path::Path::new(path);
         // Fast path: the persistent disk cache needs no engine lock at all,
@@ -3887,11 +3942,28 @@ impl EngineClient {
             );
             return Ok(cached);
         }
+        let owner = {
+            let loaded = self
+                .loaded_buffer
+                .read()
+                .map_err(|error| error.to_string())?;
+            WaveformOwner::capture(&loaded, path)?
+        };
         let _compute = self
             .waveform_compute_lock
             .lock()
             .map_err(|e| e.to_string())?;
-        // Another request may have populated the cache while this one waited.
+        // Reject an obsolete waiter before more disk work or cloning any PCM.
+        {
+            let loaded = self
+                .loaded_buffer
+                .read()
+                .map_err(|error| error.to_string())?;
+            if !owner.current(&loaded) {
+                return Err(WAVEFORM_CHANGED.into());
+            }
+        }
+        // Another current request may have populated the cache while we waited.
         if let Some(cached) = cache_lookup(cache_dir, req_path, buckets) {
             return Ok(cached);
         }
@@ -3899,21 +3971,31 @@ impl EngineClient {
         // Cheap `Arc` clone under a short read lock; the heavy peak
         // computation below runs with no lock held.
         let snap_waited = std::time::Instant::now();
-        let (snap_path, snap_gen, buffer) = {
+        let buffer = {
             let guard = self.loaded_buffer.read().map_err(|e| e.to_string())?;
             let locked_ms = snap_waited.elapsed().as_millis();
-            let (loaded_path, generation, buf) = guard.as_ref().ok_or("nothing loaded")?;
-            if loaded_path != path {
-                return Err("track changed before waveform analysis".to_string());
+            let (_, _, buf) = guard.as_ref().ok_or(WAVEFORM_CHANGED)?;
+            if !owner.current(&guard) {
+                return Err(WAVEFORM_CHANGED.into());
             }
-            let snapshot = (loaded_path.clone(), *generation, buf.clone());
             eprintln!(
                 "[olooper:metrics] op=waveform_lock stage=snapshot lock_wait_ms={locked_ms} path={path}",
             );
-            snapshot
+            buf.clone()
         };
         let computed = std::time::Instant::now();
-        let waveform = from_buffer(&buffer, buckets);
+        let waveform = match from_buffer_checked(&buffer, buckets, || {
+            owner.check(&self.loaded_buffer)
+        }) {
+            Ok(waveform) => waveform,
+            Err(error) => {
+                eprintln!(
+                    "[olooper:metrics] op=waveform result=stale compute_ms={} buckets={buckets} path={path}",
+                    computed.elapsed().as_millis(),
+                );
+                return Err(error);
+            }
+        };
         let compute_ms = computed.elapsed().as_millis();
         // Discard stale results: if the user selected another track (or
         // reloaded this one) while computing, the newer job owns the path.
@@ -3922,14 +4004,14 @@ impl EngineClient {
             .loaded_buffer
             .read()
             .map_err(|e| e.to_string())
-            .map(|guard| waveform_snapshot_current(&guard, &snap_path, snap_gen))
+            .map(|guard| owner.current(&guard))
             .unwrap_or(false);
         let recheck_ms = rechecked.elapsed().as_millis();
         if !current {
             eprintln!(
                 "[olooper:metrics] op=waveform result=stale compute_ms={compute_ms} buckets={buckets} path={path}",
             );
-            return Err("track changed before waveform analysis".to_string());
+            return Err(WAVEFORM_CHANGED.into());
         }
         let stored = std::time::Instant::now();
         cache_store(cache_dir, req_path, buckets, &waveform);

@@ -2,12 +2,13 @@
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import Sidebar from "./Sidebar";
-import { libraryList, libraryPlaylists, libraryRemoveLooper, playerPrefetch, type Track } from "../tauri";
+import { libraryList, libraryMarkPlayed, libraryPlaylists, libraryRemoveLooper, playerLoadTrack, playerPlay, playerPrefetch, type PlayerStatus, type Track } from "../tauri";
 
 vi.mock("../tauri", async (original) => ({
   ...await original<typeof import("../tauri")>(),
   libraryList: vi.fn(), libraryPlaylists: vi.fn().mockResolvedValue([]), libraryLooperOrder: vi.fn().mockResolvedValue([]),
   playerPrefetch: vi.fn().mockResolvedValue(true), libraryRemoveLooper: vi.fn(),
+  libraryMarkPlayed: vi.fn().mockResolvedValue(undefined), playerLoadTrack: vi.fn(), playerPlay: vi.fn(),
 }));
 beforeEach(() => {
   localStorage.clear();
@@ -43,6 +44,21 @@ it("does not repopulate another library with a stale catalog response", async ()
   await act(async () => { finishOld([track(1, "Old library loop")]); });
   expect(screen.queryByText("Old library loop")).toBeNull();
   expect(screen.getByText("New library loop")).toBeTruthy();
+});
+
+it("persists playback history without fetching the whole catalog again", async () => {
+  const selected = track(1, "Beat");
+  const status = { loaded: true, loading: false, path: "Beat", playing: true } as PlayerStatus;
+  vi.mocked(libraryList).mockResolvedValue([selected]);
+  vi.mocked(playerLoadTrack).mockResolvedValue(status);
+  vi.mocked(playerPlay).mockResolvedValue(status);
+  render(<Sidebar {...props} />);
+  await act(async () => {});
+  await act(async () => { fireEvent.click(screen.getByRole("button", { name: "Play Beat" })); });
+  expect(libraryMarkPlayed).toHaveBeenCalledExactlyOnceWith(1);
+  expect(props.onTrackSelected).toHaveBeenCalledWith(selected, status);
+  expect(libraryList).toHaveBeenCalledOnce();
+  expect(libraryPlaylists).toHaveBeenCalledOnce();
 });
 
 it("shows which looper each track comes from in All, Favorites and playlists", async () => {
@@ -92,6 +108,22 @@ it("hides the looper column while a single looper is selected", async () => {
   render(<Sidebar {...props} />);
   await act(async () => {});
   expect(screen.queryByText("Looper")).toBeNull();
+});
+
+it("sorts the library by BPM in both directions and returns to alphabetical order", async () => {
+  vi.mocked(libraryList).mockResolvedValue([
+    { ...track(1, "Alpha"), bpm: 150 }, { ...track(2, "Beta"), bpm: 90 },
+  ]);
+  render(<Sidebar {...props} />);
+  await act(async () => {});
+  const ids = () => Array.from(document.querySelectorAll("[data-library-track-id]")).map((row) => row.getAttribute("data-library-track-id"));
+  expect(ids()).toEqual(["1", "2"]);
+  fireEvent.click(screen.getByTitle("Sort loops by BPM"));
+  expect(ids()).toEqual(["2", "1"]);
+  fireEvent.click(screen.getByTitle("Sort loops by BPM"));
+  expect(ids()).toEqual(["1", "2"]);
+  fireEvent.click(screen.getByTitle("Sort loops alphabetically"));
+  expect(ids()).toEqual(["1", "2"]);
 });
 
 it("prefetches the loop that the Next button will play", async () => {

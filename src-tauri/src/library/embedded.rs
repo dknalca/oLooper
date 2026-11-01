@@ -180,10 +180,10 @@ pub(crate) fn decode_embedded_sound_file(
         .map_err(|error| crate::import::swf::user_message(&error))?;
     let sound = parsed
         .sounds
-        .iter()
+        .into_iter()
         .find(|sound| sound.id == sound_id)
         .ok_or_else(|| format!("embedded sound {sound_id} was not found in the source"))?;
-    let buffer = crate::player::decode_bytes(&sound.frames)?;
+    let buffer = crate::player::decode_owned_bytes(sound.frames)?;
     if sound.codec == "mp3" {
         if let Some(trimmed) =
             super::Library::trim_mp3_buffer(&buffer, sound.seek_samples, sound.sample_count)
