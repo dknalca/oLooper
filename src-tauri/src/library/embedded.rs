@@ -230,9 +230,20 @@ mod tests {
             assert!(source(path, "unsupported", &hash).is_err());
             let _warm = source(path, kind, &hash).unwrap();
             // Same-size modification must not reuse the verified container.
+            let original_modified = std::fs::metadata(path).unwrap().modified().unwrap();
             let mut changed = data.clone();
             changed[0] ^= 1;
             std::fs::write(path, changed).unwrap();
+            // Filesystem timestamp resolution varies; make the key change explicit on Windows.
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_times(
+                    std::fs::FileTimes::new()
+                        .set_modified(original_modified + std::time::Duration::from_secs(10)),
+                )
+                .unwrap();
             assert!(source(path, kind, &hash)
                 .err()
                 .unwrap()
